@@ -1,0 +1,13 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python scripts/local_grain_smoke.py:*)",
+      "Bash(python scripts/test_tokenization.py:*)",
+      "Bash(python scripts/test_tokenization_standalone.py:*)",
+      "Bash(uv pip install:*)",
+      "Bash(python:*)",
+      "Bash(.venv/bin/python:*)",
+      "Bash(ls:*)"
+    ]
+  }
+}

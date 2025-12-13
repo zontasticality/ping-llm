@@ -1,0 +1,92 @@
+# MaxText Run Config: Latency measurement training
+#
+# This config specifies data loading, training hyperparameters, and runtime settings
+# for training on the network measurement dataset.
+#
+# Data: 100M rows split into train/val/test shards
+# Expected location: data/sharded/{train,val,test}/*.parquet
+#
+# To run locally (CPU smoke test):
+#   export DECOUPLE_GCLOUD=TRUE
+#   python -m MaxText.train maxtext/configs/latency_parquet.yml \
+#     run_name=local_test base_output_directory=/tmp/maxtext_out \
+#     hardware=cpu per_device_batch_size=1 steps=20
+#
+# To run on SLURM (GPU):
+#   See scripts/slurm_train_maxtext.sh
+
+# Import model config
+base_config: 'maxtext/configs/latency_model_100m.yml'
+
+# Run identification
+run_name: 'latency_model_default'
+base_output_directory: '/tmp/maxtext_latency'
+
+# Dataset
+dataset_type: 'grain'
+grain_file_type: 'parquet'
+grain_train_files: 'data/sharded/train/*.parquet'
+grain_eval_files: 'data/sharded/val/*.parquet'
+grain_worker_count: 4
+
+# Tokenization
+# Note: Actual tokenization integration with Grain requires custom DataSource
+# See tokenization.py for encode_measurement() implementation
+tokenizer_path: ''  # Not using standard tokenizer
+
+# Training hyperparameters
+learning_rate: 3.0e-4
+lr_schedule_type: 'cosine'
+warmup_steps: 1000
+steps: 200000
+log_period: 100
+eval_interval: 1000
+eval_steps: 100
+
+# Batch size
+# Adjust based on GPU memory and sequence packing
+per_device_batch_size: 8
+gradient_accumulation_steps: 1
+
+# Optimization
+optimizer: 'adamw'
+adam_b1: 0.9
+adam_b2: 0.999
+adam_eps: 1.0e-8
+weight_decay: 0.01
+grad_clip_threshold: 1.0
+
+# Checkpointing
+enable_checkpointing: true
+checkpoint_period: 5000
+max_checkpoints_to_keep: 5
+save_checkpoint_async: true
+
+# Evaluation
+compute_validation_loss: true
+
+# Hardware
+# Override via CLI: hardware=cpu or hardware=gpu
+hardware: 'gpu'
+
+# JAX/XLA settings
+enable_profiler: false
+profile_steps: 10
+skip_first_n_steps_for_profiler: 10
+
+# Logging
+tensorboard_dir: ''  # Auto-generated from base_output_directory
+enable_tensorboard: true
+
+# Random seed
+seed: 42
+
+# Mixed precision
+enable_checkpointing_mp: false
+
+# Parallelism (for multi-GPU/multi-node)
+# These will be auto-configured by MaxText based on hardware
+ici_tensor_parallelism: 1
+ici_fsdp_parallelism: 1
+dcn_tensor_parallelism: 1
+dcn_fsdp_parallelism: 1

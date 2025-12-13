@@ -1,0 +1,57 @@
+# MaxText Model Config: 100M parameter decoder-only Transformer
+# for network latency measurement modeling
+#
+# This config defines a small-ish model (~100M parameters) suitable for
+# initial training on the 100M-row measurement dataset (~5B tokens).
+#
+# Model architecture:
+# - Decoder-only (GPT-style)
+# - 12 layers, 768 embedding dim
+# - 12 attention heads (64 dim each)
+# - 3072 MLP hidden dim (4x embedding dim)
+#
+# Vocabulary:
+# - 266 tokens (10 role tokens + 256 byte tokens)
+# - See tokenization.py for details
+
+# Model architecture
+model_name: 'decoder_only'
+vocab_size: 266
+num_decoder_layers: 12
+emb_dim: 768
+num_query_heads: 12
+num_kv_heads: 12
+head_dim: 64
+mlp_dim: 3072
+
+# Sequence length
+# Each measurement: ~42-66 tokens (IPv4 vs IPv6)
+# Packing ~16-24 measurements per sequence
+max_target_length: 1024
+max_prefill_predict_length: 1024
+
+# Regularization
+dropout_rate: 0.1
+attention_dropout_rate: 0.1
+
+# Initialization
+init_weights_seed: 42
+kernel_init_method: 'xavier_uniform'
+bias_init_method: 'zeros'
+
+# Normalization
+normalization_layer_epsilon: 1.0e-6
+scan_layers: true
+
+# Attention
+attention_type: 'dot_product'
+use_bias: false
+
+# Position embeddings
+position_embedding_type: 'learned'
+
+# Activation
+mlp_activations: ['gelu']
+
+# Precision
+dtype: 'bfloat16'
