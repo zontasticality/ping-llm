@@ -1,63 +1,67 @@
 """
-Tokenization for network measurement data.
+Tokenization for network measurement data (PLAN_2 schema).
 
 This module converts Parquet rows (network measurements) into token sequences
 for training a decoder-only Transformer with MaxText.
 
-Schema: msm_id, event_time, src_addr, dst_addr, ip_version, rtt, size, packet_error_count
+Schema: event_time, src_addr, dst_addr, ip_version, rtt
+(Note: msm_id, size, packet_error_count removed from training data)
 
-Token vocabulary (266 total):
-- IDs 0-9: Role tokens (10 total)
-- IDs 10-265: Byte tokens (256 total, Byte0..Byte255)
+Token vocabulary (267 total):
+- IDs 0-10: Role tokens (11 total)
+- IDs 11-266: Byte tokens (256 total, Byte0..Byte255)
 """
 
 import struct
 import ipaddress
-from typing import List, Dict, Any
+import hashlib
+from typing import List, Dict, Any, Optional
+from datetime import datetime
 import random
 
 
 # =============================================================================
-# Token ID Mappings
+# Token ID Mappings (PLAN_2 Schema)
 # =============================================================================
 
-# Role tokens (IDs 0-9)
+# Role tokens (IDs 0-10)
 MEASUREMENT_START = 0
-SRC_IP_START = 1
-DEST_IP_START = 2
-IPV4_START = 3
-IPV6_START = 4
-RTT_START = 5
-SIZE_START = 6
-ERROR_COUNT_START = 7
-TIMESTAMP_START = 8
-MSM_ID_START = 9
+SRC_IPV4 = 1
+SRC_IPV6 = 2
+DST_IPV4 = 3
+DST_IPV6 = 4
+TIMESTAMP_ABS = 5
+TIMESTAMP_DELTA1 = 6
+TIMESTAMP_DELTA4 = 7
+RTT_START = 8
+THROUGHPUT_START = 9  # Reserved for future datasets
+FAILED = 10
 
-# Byte tokens (IDs 10-265)
-BYTE_TOKEN_OFFSET = 10
+# Byte tokens (IDs 11-266)
+BYTE_TOKEN_OFFSET = 11
 
-VOCAB_SIZE = 266
+VOCAB_SIZE = 267
 
 
 def byte_to_token(byte_val: int) -> int:
-    """Convert a byte value (0-255) to its token ID (10-265)."""
+    """Convert a byte value (0-255) to its token ID (11-266)."""
     assert 0 <= byte_val <= 255, f"Invalid byte value: {byte_val}"
     return BYTE_TOKEN_OFFSET + byte_val
 
 
 def token_to_byte(token_id: int) -> int:
-    """Convert a token ID (10-265) back to byte value (0-255)."""
+    """Convert a token ID (11-266) back to byte value (0-255)."""
     assert BYTE_TOKEN_OFFSET <= token_id < VOCAB_SIZE, f"Invalid token ID: {token_id}"
     return token_id - BYTE_TOKEN_OFFSET
 
 
 # =============================================================================
-# IP Address Parsing
+# IP Address Encoding
 # =============================================================================
 
 def parse_ipv4(ip_str: str) -> List[int]:
     """
-    Parse IPv4 address string to 4 bytes.
+    Parse IPv4 address string to 4 byte tokens.
 
     Args:
         ip_str: IPv4 address string (e.g., "192.0.2.1")
@@ -65,9 +69,8 @@ def parse_ipv4(ip_str: str) -> List[int]:
     Returns:
         List of 4 byte token IDs
 
-    Note: Empty/invalid addresses are replaced with 0.0.0.0 (failed probe sentinel)
+    Note: Empty/invalid addresses are replaced with 0.0.0.0
     """
-    # Handle empty or invalid IP addresses (from failed probes)
     if not ip_str or ip_str.strip() == '':
         ip_str = '0.0.0.0'
 
@@ -78,7 +81,7 @@ def parse_ipv4(ip_str: str) -> List[int]:
 
 def parse_ipv6(ip_str: str) -> List[int]:
     """
-    Parse IPv6 address string to 16 bytes.
+    Parse IPv6 address string to 16 byte tokens.
 
     Args:
         ip_str: IPv6 address string (e.g., "2001:db8::1")
@@ -86,9 +89,8 @@ def parse_ipv6(ip_str: str) -> List[int]:
     Returns:
         List of 16 byte token IDs
 
-    Note: Empty/invalid addresses are replaced with :: (failed probe sentinel)
+    Note: Empty/invalid addresses are replaced with ::
     """
-    # Handle empty or invalid IP addresses (from failed probes)
     if not ip_str or ip_str.strip() == '':
         ip_str = '::'
 
@@ -97,117 +99,183 @@ def parse_ipv6(ip_str: str) -> List[int]:
     return [byte_to_token(b) for b in ip_bytes]
 
 
-def encode_ip_address(ip_str: str, ip_version: int) -> List[int]:
+def encode_ip_merged(ip_str: str, ip_version: int, is_src: bool) -> List[int]:
     """
-    Encode an IP address (IPv4 or IPv6) to token sequence.
+    Encode IP address with merged role token (SrcIPv4/SrcIPv6/DstIPv4/DstIPv6).
 
     Args:
         ip_str: IP address string
         ip_version: 4 or 6
+        is_src: True for source IP, False for destination IP
 
     Returns:
-        List of token IDs: [IPV4_START/IPV6_START, byte_tokens...]
+        List of token IDs: [SRC_IPV4/SRC_IPV6/DST_IPV4/DST_IPV6, byte_tokens...]
+
+    Token savings vs old scheme:
+        Old: [SRC_IP_START, IPV4_START, bytes...] = 2 + 4 = 6 tokens
+        New: [SRC_IPV4, bytes...] = 1 + 4 = 5 tokens
+        Savings: 1 token per IP address
     """
     if ip_version == 4:
-        return [IPV4_START] + parse_ipv4(ip_str)
+        role_token = SRC_IPV4 if is_src else DST_IPV4
+        return [role_token] + parse_ipv4(ip_str)
     elif ip_version == 6:
-        return [IPV6_START] + parse_ipv6(ip_str)
+        role_token = SRC_IPV6 if is_src else DST_IPV6
+        return [role_token] + parse_ipv6(ip_str)
     else:
         raise ValueError(f"Invalid ip_version: {ip_version}")
 
 
 # =============================================================================
-# Field Encoding Functions
+# RTT Encoding (5-bit exponent + 11-bit mantissa)
 # =============================================================================
 
-def encode_rtt(rtt: float) -> List[int]:
+def encode_rtt_exponent_mantissa(rtt_ms: float) -> List[int]:
     """
-    Encode RTT (round-trip time) as 8 bytes (float64, big-endian).
+    Encode RTT as 5-bit exponent + 11-bit mantissa (microseconds).
+
+    Format: value_μs = mantissa × 2^exponent
+    Range: 1μs to 51 days
+    Precision: ~0.049% relative error (1/2047)
 
     Args:
-        rtt: RTT value in milliseconds. -1.0 indicates failed probe.
+        rtt_ms: RTT value in milliseconds. Negative values indicate failed probe.
 
     Returns:
-        List of token IDs: [RTT_START, 8 byte tokens]
+        List of token IDs: [RTT_START, byte1, byte2] or [FAILED]
 
-    Note: Currently uses raw IEEE 754 encoding. See PLAN.md section 8.1
-          for alternative encoding strategies (fixed-point, log-scale, clipped).
+    Encoding:
+        byte1 = EEEEE MMM  (5-bit exponent, 3 MSB of mantissa)
+        byte2 = MMMM MMMM  (8 LSB of mantissa)
+
+    Examples:
+        1ms (1000μs) → exp=9, mant=1000 → 1000 × 2^9 = 512000μs ❌
+        Actually: 1000μs → exp=0, mant=1000 → 1000 × 2^0 = 1000μs ✓
+        100ms (100000μs) → exp=6, mant=1562 → 1562 × 2^6 = 99968μs ✓
     """
-    # Convert to Python float (handles numpy float32/float64)
-    rtt_val = float(rtt)
-    # Pack as big-endian float64
-    rtt_bytes = struct.pack('>d', rtt_val)
-    return [RTT_START] + [byte_to_token(b) for b in rtt_bytes]
+    if rtt_ms < 0:
+        return [FAILED]  # Use dedicated token for failed probes
+
+    rtt_us = max(1.0, rtt_ms * 1000)  # Convert ms to μs, min 1μs
+
+    # Find exponent (powers of 2)
+    exponent = 0
+    mantissa_float = rtt_us
+    while mantissa_float >= 2048 and exponent < 31:
+        mantissa_float /= 2
+        exponent += 1
+
+    mantissa = min(int(mantissa_float), 2047)
+
+    # Pack: EEEEE MMM | MMMM MMMM
+    #       5exp  3msb  8lsb
+    byte1 = (exponent << 3) | (mantissa >> 8)
+    byte2 = mantissa & 0xFF
+
+    return [RTT_START, byte_to_token(byte1), byte_to_token(byte2)]
 
 
-def encode_size(size: int) -> List[int]:
+def decode_rtt_exponent_mantissa(byte1: int, byte2: int) -> float:
     """
-    Encode packet size as 2 bytes (uint16, big-endian).
+    Decode RTT from 5-bit exponent + 11-bit mantissa.
 
     Args:
-        size: Packet size in bytes (0-65535)
+        byte1: First byte (EEEEE MMM)
+        byte2: Second byte (MMMM MMMM)
 
     Returns:
-        List of token IDs: [SIZE_START, 2 byte tokens]
+        RTT in milliseconds
     """
-    # Convert to Python int (handles numpy int64, float32 from Parquet)
-    size_val = int(size)
-    assert 0 <= size_val <= 65535, f"Size out of range: {size_val}"
-    size_bytes = struct.pack('>H', size_val)  # H = unsigned short (2 bytes)
-    return [SIZE_START] + [byte_to_token(b) for b in size_bytes]
+    exponent = byte1 >> 3
+    mantissa = ((byte1 & 0x07) << 8) | byte2
+
+    rtt_us = mantissa * (2 ** exponent)
+    rtt_ms = rtt_us / 1000
+
+    return rtt_ms
 
 
-def encode_error_count(error_count: int) -> List[int]:
+# =============================================================================
+# Timestamp Encoding (Absolute + Deltas)
+# =============================================================================
+
+def encode_u64(value: int) -> List[int]:
+    """Encode 64-bit unsigned integer as 8 bytes (big-endian)."""
+    value_bytes = struct.pack('>Q', value)  # Q = unsigned long long (8 bytes)
+    return [byte_to_token(b) for b in value_bytes]
+
+
+def encode_u32(value: int) -> List[int]:
+    """Encode 32-bit unsigned integer as 4 bytes (big-endian)."""
+    value_bytes = struct.pack('>I', value)  # I = unsigned int (4 bytes)
+    return [byte_to_token(b) for b in value_bytes]
+
+
+def encode_timestamp_delta(
+    event_time,
+    prev_time: Optional[datetime],
+    dataset_start: Optional[datetime] = None
+) -> List[int]:
     """
-    Encode packet error count as 1 byte (uint8).
+    Encode timestamp as absolute or delta.
 
     Args:
-        error_count: Number of packet errors (0-255)
+        event_time: Current measurement timestamp (pandas Timestamp or datetime)
+        prev_time: Previous measurement timestamp (for delta encoding)
+        dataset_start: Dataset start time (unused, kept for API compatibility)
 
     Returns:
-        List of token IDs: [ERROR_COUNT_START, 1 byte token]
+        List of token IDs:
+            - First measurement: [TIMESTAMP_ABS, 8 bytes] (9 tokens)
+            - Delta <256s: [TIMESTAMP_DELTA1, 1 byte] (2 tokens)
+            - Delta ≥256s: [TIMESTAMP_DELTA4, 4 bytes] (5 tokens)
+
+    Optimization: 95%+ of consecutive measurements are 60-300s apart → 1-byte delta
     """
-    # Convert to Python int (handles numpy int64)
-    error_val = int(error_count)
-    assert 0 <= error_val <= 255, f"Error count out of range: {error_val}"
-    return [ERROR_COUNT_START, byte_to_token(error_val)]
+    if prev_time is None:
+        # First measurement: absolute timestamp
+        timestamp_sec = int(event_time.timestamp())
+        return [TIMESTAMP_ABS] + encode_u64(timestamp_sec)
 
+    delta_sec = int((event_time - prev_time).total_seconds())
 
-def encode_timestamp(event_time) -> List[int]:
-    """
-    Encode event timestamp as 8 bytes (int64, seconds since epoch, big-endian).
+    if delta_sec < 0:
+        # Handle out-of-order timestamps (shouldn't happen with sorted data)
+        delta_sec = 0
 
-    Args:
-        event_time: Timestamp (pandas Timestamp or datetime-like object)
-
-    Returns:
-        List of token IDs: [TIMESTAMP_START, 8 byte tokens]
-    """
-    # Convert to Unix timestamp (seconds since epoch)
-    timestamp_sec = int(event_time.timestamp())
-    ts_bytes = struct.pack('>q', timestamp_sec)  # q = long long (8 bytes)
-    return [TIMESTAMP_START] + [byte_to_token(b) for b in ts_bytes]
-
-
-def encode_msm_id(msm_id: int) -> List[int]:
-    """
-    Encode measurement ID as 8 bytes (int64, big-endian).
-
-    Args:
-        msm_id: Measurement identifier
-
-    Returns:
-        List of token IDs: [MSM_ID_START, 8 byte tokens]
-    """
-    # Convert to Python int (handles numpy int64)
-    msm_val = int(msm_id)
-    msm_bytes = struct.pack('>q', msm_val)  # q = long long (8 bytes)
-    return [MSM_ID_START] + [byte_to_token(b) for b in msm_bytes]
+    if delta_sec < 256:
+        # 1-byte delta (most common case)
+        return [TIMESTAMP_DELTA1, byte_to_token(delta_sec)]
+    else:
+        # 4-byte delta (rare)
+        return [TIMESTAMP_DELTA4] + encode_u32(delta_sec)
 
 
 # =============================================================================
 # Deterministic Shuffling
 # =============================================================================
+
+def compute_shuffle_seed(src_addr: str, dst_addr: str, event_time) -> int:
+    """
+    Compute deterministic shuffle seed from (src, dst, timestamp).
+
+    Args:
+        src_addr: Source IP address string
+        dst_addr: Destination IP address string
+        event_time: Event timestamp
+
+    Returns:
+        32-bit integer seed for RNG
+
+    Note: Uses hash instead of simple arithmetic to avoid collisions
+          for high-frequency repeated pairs.
+    """
+    timestamp_sec = int(event_time.timestamp())
+    seed_str = f"{src_addr}|{dst_addr}|{timestamp_sec}"
+    hash_bytes = hashlib.md5(seed_str.encode()).digest()
+    seed = struct.unpack('>I', hash_bytes[:4])[0]  # First 4 bytes as uint32
+    return seed
+
 
 def shuffle_blocks_deterministic(blocks: List[List[int]], seed: int) -> List[List[int]]:
     """
@@ -230,77 +298,81 @@ def shuffle_blocks_deterministic(blocks: List[List[int]], seed: int) -> List[Lis
 # Main Encoding Function
 # =============================================================================
 
-def encode_measurement(row: Dict[str, Any]) -> List[int]:
+def encode_measurement(
+    row: Dict[str, Any],
+    prev_timestamp: Optional[datetime] = None,
+    include_timestamp: bool = True
+) -> List[int]:
     """
-    Encode a single measurement row into a token sequence.
+    Encode a single network measurement.
 
     Args:
-        row: Dictionary with keys: msm_id, event_time, src_addr, dst_addr,
-             ip_version, rtt, size, packet_error_count
+        row: Parquet row with src_addr, dst_addr, ip_version, rtt, event_time
+        prev_timestamp: Previous measurement timestamp (for delta encoding)
+        include_timestamp: Whether to include timestamp in this measurement
 
     Returns:
-        List of token IDs representing the measurement
+        List of token IDs
 
     Token sequence structure:
         [MEASUREMENT_START] + shuffled_field_blocks
 
-    Each field block is a list of tokens, e.g.:
-        - Source IP: [SRC_IP_START, IPV4_START/IPV6_START, byte_tokens...]
-        - Destination IP: [DEST_IP_START, IPV4_START/IPV6_START, byte_tokens...]
-        - RTT: [RTT_START, 8 byte tokens]
-        - Size: [SIZE_START, 2 byte tokens]
-        - Error count: [ERROR_COUNT_START, 1 byte token]
-        - Timestamp: [TIMESTAMP_START, 8 byte tokens]
-        - Measurement ID: [MSM_ID_START, 8 byte tokens]
+    Field blocks (before shuffling):
+        - Source IP: [SRC_IPV4/SRC_IPV6, byte_tokens...]
+        - Destination IP: [DST_IPV4/DST_IPV6, byte_tokens...]
+        - Result: [RTT_START, 2 bytes] or [FAILED]
+        - Timestamp (optional): [TIMESTAMP_ABS/DELTA1/DELTA4, bytes...]
 
-    The field blocks are shuffled deterministically using (msm_id, timestamp)
-    as the RNG seed to ensure the model learns the joint distribution.
+    The field blocks are shuffled deterministically using (src, dst, timestamp)
+    as the RNG seed to force joint distribution learning.
     """
     # Extract fields
-    msm_id = row['msm_id']
-    event_time = row['event_time']
     src_addr = row['src_addr']
     dst_addr = row['dst_addr']
     ip_version = row['ip_version']
     rtt = row['rtt']
-    size = row['size']
-    packet_error_count = row['packet_error_count']
+    event_time = row['event_time']
 
     # Handle None/NaN addresses (pandas can return NaN for null values)
-    import pandas as pd
-    if pd.isna(src_addr):
-        src_addr = ''
-    if pd.isna(dst_addr):
-        dst_addr = ''
+    try:
+        import pandas as pd
+        if pd.isna(src_addr):
+            src_addr = ''
+        if pd.isna(dst_addr):
+            dst_addr = ''
+    except ImportError:
+        # pandas not available (standalone mode)
+        if src_addr is None:
+            src_addr = ''
+        if dst_addr is None:
+            dst_addr = ''
 
-    # Encode each field as a block
-    src_ip_block = [SRC_IP_START] + encode_ip_address(src_addr, ip_version)
-    dst_ip_block = [DEST_IP_START] + encode_ip_address(dst_addr, ip_version)
-    rtt_block = encode_rtt(rtt)
-    size_block = encode_size(size)
-    error_block = encode_error_count(packet_error_count)
-    timestamp_block = encode_timestamp(event_time)
-    msm_id_block = encode_msm_id(msm_id)
+    # Encode IP addresses (merged src/dst with IPv4/IPv6)
+    src_ip_block = encode_ip_merged(src_addr, ip_version, is_src=True)
+    dst_ip_block = encode_ip_merged(dst_addr, ip_version, is_src=False)
 
-    # Collect all field blocks
+    # Encode result (RTT or failed)
+    if rtt < 0:
+        result_block = [FAILED]
+    else:
+        result_block = encode_rtt_exponent_mantissa(rtt)
+
+    # Collect field blocks (timestamp is optional)
     field_blocks = [
         src_ip_block,
         dst_ip_block,
-        rtt_block,
-        size_block,
-        error_block,
-        timestamp_block,
-        msm_id_block,
+        result_block,
     ]
 
-    # Deterministic shuffle using (msm_id, timestamp) as seed
-    # Combine msm_id and timestamp seconds for seed
-    timestamp_sec = int(event_time.timestamp())
-    shuffle_seed = (msm_id * 31 + timestamp_sec) % (2**32)
+    if include_timestamp:
+        timestamp_block = encode_timestamp_delta(event_time, prev_timestamp)
+        field_blocks.append(timestamp_block)
 
+    # Deterministic shuffle using (src_ip, dst_ip, timestamp) as seed
+    shuffle_seed = compute_shuffle_seed(src_addr, dst_addr, event_time)
     shuffled_blocks = shuffle_blocks_deterministic(field_blocks, shuffle_seed)
 
-    # Flatten blocks and prepend MEASUREMENT_START
+    # Build final sequence
     tokens = [MEASUREMENT_START]
     for block in shuffled_blocks:
         tokens.extend(block)

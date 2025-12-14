@@ -25,30 +25,33 @@ import pyarrow.compute as pc
 def shard_parquet(
     input_file: str,
     output_dir: str,
-    train_ratio: float = 0.8,
-    val_ratio: float = 0.1,
+    train_ratio: float = 0.9,
     test_ratio: float = 0.1,
     shards_per_split: dict = None,
 ):
     """
-    Shard a large Parquet file into train/val/test splits.
+    Shard a large Parquet file into train/test splits (PLAN_2: no validation set).
 
     Args:
         input_file: Path to input Parquet file
         output_dir: Output directory for sharded files
-        train_ratio: Fraction of data for training (default 0.8)
-        val_ratio: Fraction of data for validation (default 0.1)
+        train_ratio: Fraction of data for training (default 0.9)
         test_ratio: Fraction of data for testing (default 0.1)
-        shards_per_split: Dict with shard counts, e.g., {'train': 200, 'val': 25, 'test': 25}
+        shards_per_split: Dict with shard counts, e.g., {'train': 180, 'test': 20}
+
+    Rationale for no validation set (per PLAN_2):
+    - Single training run with fixed architecture (not doing extensive hyperparameter search)
+    - Can evaluate on test set periodically during training for monitoring
+    - Validation set typically used for hyperparameter tuning and early stopping
+    - For this project, we'll train to completion and evaluate on held-out test set
     """
-    assert abs(train_ratio + val_ratio + test_ratio - 1.0) < 1e-6, \
+    assert abs(train_ratio + test_ratio - 1.0) < 1e-6, \
         "Ratios must sum to 1.0"
 
     if shards_per_split is None:
         shards_per_split = {
-            'train': 200,  # ~400k rows/shard
-            'val': 25,     # ~400k rows/shard
-            'test': 25,    # ~400k rows/shard
+            'train': 180,  # ~500k rows/shard (90M rows / 180 shards)
+            'test': 20,    # ~500k rows/shard (10M rows / 20 shards)
         }
 
     print(f"Reading input file: {input_file}")
@@ -61,14 +64,12 @@ def shard_parquet(
     sorted_indices = pc.sort_indices(table, sort_keys=[("event_time", "ascending")])
     table = pc.take(table, sorted_indices)
 
-    # Calculate split boundaries
+    # Calculate split boundaries (90/10 train/test)
     train_end = int(total_rows * train_ratio)
-    val_end = int(total_rows * (train_ratio + val_ratio))
 
     splits = {
         'train': table.slice(0, train_end),
-        'val': table.slice(train_end, val_end - train_end),
-        'test': table.slice(val_end, total_rows - val_end),
+        'test': table.slice(train_end, total_rows - train_end),
     }
 
     # Create output directories
@@ -111,7 +112,9 @@ def shard_parquet(
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Shard Parquet file into train/val/test splits")
+    parser = argparse.ArgumentParser(
+        description="Shard Parquet file into train/test splits (PLAN_2: no validation set)"
+    )
     parser.add_argument(
         "--input",
         type=str,
@@ -127,14 +130,8 @@ def main():
     parser.add_argument(
         "--train-ratio",
         type=float,
-        default=0.8,
-        help="Training split ratio (default: 0.8)"
-    )
-    parser.add_argument(
-        "--val-ratio",
-        type=float,
-        default=0.1,
-        help="Validation split ratio (default: 0.1)"
+        default=0.9,
+        help="Training split ratio (default: 0.9)"
     )
     parser.add_argument(
         "--test-ratio",
@@ -145,27 +142,20 @@ def main():
     parser.add_argument(
         "--train-shards",
         type=int,
-        default=200,
-        help="Number of training shards (default: 200)"
-    )
-    parser.add_argument(
-        "--val-shards",
-        type=int,
-        default=25,
-        help="Number of validation shards (default: 25)"
+        default=180,
+        help="Number of training shards (default: 180)"
     )
     parser.add_argument(
         "--test-shards",
         type=int,
-        default=25,
-        help="Number of test shards (default: 25)"
+        default=20,
+        help="Number of test shards (default: 20)"
     )
 
     args = parser.parse_args()
 
     shards_per_split = {
         'train': args.train_shards,
-        'val': args.val_shards,
         'test': args.test_shards,
     }
 
@@ -173,7 +163,6 @@ def main():
         input_file=args.input,
         output_dir=args.output,
         train_ratio=args.train_ratio,
-        val_ratio=args.val_ratio,
         test_ratio=args.test_ratio,
         shards_per_split=shards_per_split,
     )
