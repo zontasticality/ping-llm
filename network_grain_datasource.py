@@ -1,21 +1,24 @@
 """
-Grain DataSource for network measurement data (PLAN_2).
+Grain DataSource for network measurement data (PLAN_2 - Full Implementation).
 
 This module implements:
-1. Custom Parquet DataSource for network measurements
-2. ContextWindowSampler with 3 training modes (40/30/30 split):
+1. Memory-efficient Parquet DataSource with LRU caching
+2. WindowedMeasurementDataSource - yields windows of consecutive measurements
+3. ContextWindowSampler with 3 training modes (40/30/30 split):
    - Mode 1 (40%): Full timestamp, temporal order
    - Mode 2 (30%): No timestamp, random shuffle
    - Mode 3 (30%): Mixed timestamp with interleaving
-3. Tokenization using PLAN_2 schema
+4. Tokenization using PLAN_2 schema with delta timestamps
+5. MaxText-compatible output format
 """
 
 import random
-from typing import List, Dict, Any, Optional, Iterator
+import numpy as np
+from typing import List, Dict, Any, Optional
+from functools import lru_cache
+import threading
 import grain.python as grain
 import pyarrow.parquet as pq
-import pyarrow.compute as pc
-from datetime import datetime
 
 # Import our tokenization
 from tokenization import encode_measurement
@@ -23,33 +26,72 @@ from tokenization import encode_measurement
 
 class ParquetMeasurementDataSource(grain.RandomAccessDataSource):
     """
-    Grain DataSource for network measurement Parquet files.
+    Memory-efficient Grain DataSource for network measurement Parquet files.
 
-    This reads Parquet files and yields individual measurement rows.
+    Uses LRU caching to avoid loading all files into memory at once.
+    This is critical for datasets with 180+ shards (180M rows total).
     """
 
-    def __init__(self, parquet_files: List[str]):
+    def __init__(self, parquet_files: List[str], cache_size: int = 4):
         """
         Args:
             parquet_files: List of paths to Parquet shard files
+            cache_size: Number of parquet files to keep in memory (default: 4)
         """
-        self.parquet_files = parquet_files
-        self._tables = []
+        self.parquet_files = sorted(parquet_files)  # Sort for deterministic ordering
+        self._file_row_counts = []
         self._row_offsets = []  # Cumulative row counts for each file
         self._total_rows = 0
+        self._cache = {}  # Simple cache: {file_idx: table}
+        self._cache_order = []  # Track access order for LRU eviction
+        self._cache_size = cache_size
+        self._cache_lock = threading.Lock()  # Thread-safe cache access for grain workers
 
-        # Load all Parquet files and compute offsets
-        for parquet_file in parquet_files:
-            table = pq.read_table(parquet_file)
-            self._tables.append(table)
-            self._total_rows += len(table)
+        # Get row counts WITHOUT loading full tables (memory efficient)
+        for parquet_file in self.parquet_files:
+            # Just read metadata, not the full table
+            metadata = pq.read_metadata(parquet_file)
+            row_count = metadata.num_rows
+            self._file_row_counts.append(row_count)
+            self._total_rows += row_count
             self._row_offsets.append(self._total_rows)
 
     def __len__(self):
         return self._total_rows
 
+    def _load_table(self, file_idx: int):
+        """Load table with thread-safe LRU caching."""
+        with self._cache_lock:
+            if file_idx in self._cache:
+                # Cache hit - move to end (most recently used)
+                self._cache_order.remove(file_idx)
+                self._cache_order.append(file_idx)
+                return self._cache[file_idx]
+
+            # Cache miss - load table (release lock during I/O)
+            # This allows other workers to access cache while we read from disk
+
+        # Load table outside the lock (I/O is slow, don't block other workers)
+        table = pq.read_table(self.parquet_files[file_idx])
+
+        with self._cache_lock:
+            # Re-check cache in case another worker loaded it while we were reading
+            if file_idx in self._cache:
+                return self._cache[file_idx]
+
+            # Add to cache
+            self._cache[file_idx] = table
+            self._cache_order.append(file_idx)
+
+            # Evict oldest if cache is full
+            if len(self._cache) > self._cache_size:
+                oldest = self._cache_order.pop(0)
+                del self._cache[oldest]
+
+            return table
+
     def __getitem__(self, index):
-        """Get a single measurement row by global index."""
+        """Get a single measurement row by global index (loads file on-demand with caching)."""
         if index < 0 or index >= self._total_rows:
             raise IndexError(f"Index {index} out of range [0, {self._total_rows})")
 
@@ -63,8 +105,10 @@ class ParquetMeasurementDataSource(grain.RandomAccessDataSource):
         # Compute local index within the file
         local_idx = index if file_idx == 0 else (index - self._row_offsets[file_idx - 1])
 
+        # Load table (cached)
+        table = self._load_table(file_idx)
+
         # Extract row from PyArrow table
-        table = self._tables[file_idx]
         row = {
             'src_addr': table['src_addr'][local_idx].as_py(),
             'dst_addr': table['dst_addr'][local_idx].as_py(),
@@ -76,59 +120,124 @@ class ParquetMeasurementDataSource(grain.RandomAccessDataSource):
         return row
 
 
-class ContextWindowSampler(grain.MapTransform):
+class WindowedMeasurementDataSource(grain.RandomAccessDataSource):
     """
-    Sample context windows with PLAN_2 training modes.
+    Grain DataSource that yields windows of consecutive measurements.
+
+    This wraps ParquetMeasurementDataSource and samples windows of N consecutive
+    measurements, enabling proper in-context learning as specified in PLAN_2.
+
+    Key design decisions:
+    - Windows are consecutive measurements (temporal locality)
+    - Overlapping windows with stride (data augmentation)
+    - Each window becomes one training example
+    """
+
+    def __init__(
+        self,
+        parquet_files: List[str],
+        window_size: int = 64,
+        stride: Optional[int] = None,
+        cache_size: int = 4,
+    ):
+        """
+        Args:
+            parquet_files: List of Parquet shard file paths
+            window_size: Number of measurements per context window (default: 64)
+            stride: Step size between windows. If None, defaults to window_size (non-overlapping)
+            cache_size: Number of parquet files to cache in memory
+        """
+        self.base_source = ParquetMeasurementDataSource(parquet_files, cache_size=cache_size)
+        self.window_size = window_size
+        self.stride = stride if stride is not None else window_size
+
+        # Calculate number of windows
+        total_measurements = len(self.base_source)
+        self._num_windows = max(1, (total_measurements - window_size) // self.stride + 1)
+
+    def __len__(self):
+        return self._num_windows
+
+    def __getitem__(self, window_index):
+        """
+        Get a window of measurements by window index.
+
+        Args:
+            window_index: Index of the window to retrieve
+
+        Returns:
+            List of measurement dictionaries (length = window_size)
+        """
+        if window_index < 0 or window_index >= self._num_windows:
+            raise IndexError(f"Window index {window_index} out of range [0, {self._num_windows})")
+
+        # Calculate start index for this window
+        start_idx = window_index * self.stride
+
+        # Sample measurements for this window
+        window = []
+        for i in range(self.window_size):
+            meas_idx = start_idx + i
+            # Handle edge case: last window might be shorter
+            if meas_idx >= len(self.base_source):
+                # Wrap around (circular) to ensure full window
+                meas_idx = meas_idx % len(self.base_source)
+            window.append(self.base_source[meas_idx])
+
+        return window
+
+
+class ContextWindowTokenizer(grain.MapTransform):
+    """
+    Tokenize context windows with PLAN_2 training modes.
 
     This implements the 3 training modes:
     - Mode 1 (40%): Full timestamp, temporal order
     - Mode 2 (30%): No timestamp, random shuffle
     - Mode 3 (30%): Mixed timestamp with interleaving
+
+    Produces MaxText-compatible output format.
     """
 
     def __init__(
         self,
-        window_size: int = 64,
         max_tokens: int = 1024,
         mode_weights: tuple = (0.40, 0.30, 0.30),
         seed: Optional[int] = None,
     ):
         """
         Args:
-            window_size: Target number of measurements per context window
             max_tokens: Maximum tokens per sequence (hard limit)
             mode_weights: Tuple of (full_ts, no_ts, mixed_ts) probabilities
             seed: Random seed for reproducibility
         """
-        self.window_size = window_size
         self.max_tokens = max_tokens
         self.mode_weights = mode_weights
         self.rng = random.Random(seed)
 
-    def map(self, measurement: Dict[str, Any]) -> Dict[str, Any]:
+    def map(self, window: List[Dict[str, Any]]) -> Dict[str, Any]:
         """
-        Process a single measurement and accumulate into windows.
+        Tokenize a window of measurements with training mode selection.
 
         Args:
-            measurement: Single measurement dictionary (from DataSource)
+            window: List of measurement dictionaries (from WindowedDataSource)
 
         Returns:
-            Dictionary with 'tokens', 'length', 'mode'
-
-        Note: This is called per-measurement by Grain. We'll treat each
-        measurement as a minimal window for now. For proper windowing,
-        use grain.experimental.WindowDataset or custom batching.
+            Dictionary with MaxText-compatible fields:
+                - inputs: token array (int32)
+                - inputs_segmentation: mask for real tokens (int32)
+                - inputs_position: position indices (int32)
+                - targets: same as inputs (autoregressive)
+                - targets_segmentation: same as inputs_segmentation
+                - targets_position: same as inputs_position
         """
-        # For now, encode single measurement as a minimal window
-        # TODO: Implement proper sliding window with grain.WindowDataset
-        window = [measurement]
-
         # Decide training mode (40/30/30 split)
         mode_choice = self.rng.choices(
             ['full_timestamp', 'no_timestamp', 'mixed'],
             weights=self.mode_weights
         )[0]
 
+        # Apply training mode
         if mode_choice == 'full_timestamp':
             # Mode 1: All have timestamps, keep temporal order
             window_sorted = sorted(window, key=lambda m: m['event_time'])
@@ -163,14 +272,38 @@ class ContextWindowSampler(grain.MapTransform):
         # Encode window with optional timestamps
         tokens = self._encode_window(window_final, has_timestamp)
 
+        # Store original length before padding/truncation
+        original_length = len(tokens)
+
         # Truncate to max_tokens if needed
         if len(tokens) > self.max_tokens:
             tokens = tokens[:self.max_tokens]
+            original_length = self.max_tokens
 
+        # Pad to max_tokens for batching
+        # Use token ID 0 (MEASUREMENT_START) as padding
+        while len(tokens) < self.max_tokens:
+            tokens.append(0)
+
+        # Convert to numpy arrays (MaxText expects int32)
+        tokens_array = np.array(tokens, dtype=np.int32)
+
+        # Create segmentation (1 for real tokens, 0 for padding)
+        segmentation = np.ones(self.max_tokens, dtype=np.int32)
+        segmentation[original_length:] = 0
+
+        # Create position IDs (0 to seq_len-1)
+        positions = np.arange(self.max_tokens, dtype=np.int32)
+
+        # For autoregressive training: inputs and targets are the same
+        # (MaxText handles the shifting internally)
         return {
-            "tokens": tokens,
-            "length": len(tokens),
-            "mode": mode_choice,
+            "inputs": tokens_array,
+            "inputs_segmentation": segmentation,
+            "inputs_position": positions,
+            "targets": tokens_array,
+            "targets_segmentation": segmentation,
+            "targets_position": positions,
         }
 
     def _interleave_preserving_order(
@@ -210,6 +343,8 @@ class ContextWindowSampler(grain.MapTransform):
         Delta timestamps skip over non-timestamped measurements:
         - M1(t=100) → M2(no ts) → M3(t=220)
         - M3's delta is 220-100=120s, not relative to M2
+
+        This implements the PLAN_2 delta timestamp specification.
         """
         tokens = []
         prev_timestamped = None
@@ -238,44 +373,58 @@ def create_grain_pipeline(
     shuffle: bool = True,
     shuffle_seed: int = 42,
     num_workers: int = 4,
+    window_stride: Optional[int] = None,
+    cache_size: int = 4,
 ) -> grain.IterDataset:
     """
-    Create Grain data pipeline for network measurements.
+    Create full PLAN_2 Grain data pipeline for network measurements.
+
+    This implements the complete PLAN_2 specification:
+    - Window-based sampling (64 measurements per context)
+    - 3 training modes (40/30/30 split)
+    - Delta timestamp encoding
+    - MaxText-compatible output
 
     Args:
         parquet_files: List of Parquet shard file paths
         batch_size: Batch size for training
-        window_size: Number of measurements per context window
-        max_tokens: Maximum tokens per sequence
+        window_size: Number of measurements per context window (default: 64)
+        max_tokens: Maximum tokens per sequence (default: 1024)
         shuffle: Whether to shuffle the dataset
         shuffle_seed: Random seed for shuffling
         num_workers: Number of worker threads for data loading
+        window_stride: Step between windows (default: window_size for non-overlapping)
+        cache_size: Number of parquet files to cache in memory
 
     Returns:
-        Grain IterDataset ready for training
+        Grain IterDataset ready for MaxText training
     """
-    # Create data source
-    source = ParquetMeasurementDataSource(parquet_files)
+    # Create windowed data source
+    source = WindowedMeasurementDataSource(
+        parquet_files,
+        window_size=window_size,
+        stride=window_stride,
+        cache_size=cache_size,
+    )
 
     # Wrap in MapDataset
     dataset = grain.MapDataset.source(source)
 
-    # Shuffle if requested
+    # Shuffle if requested (shuffles windows, not individual measurements)
     if shuffle:
         dataset = dataset.shuffle(seed=shuffle_seed)
 
-    # Sample context windows with training modes
-    sampler = ContextWindowSampler(
-        window_size=window_size,
+    # Tokenize windows with training mode selection
+    tokenizer = ContextWindowTokenizer(
         max_tokens=max_tokens,
         seed=shuffle_seed,
     )
-    dataset = dataset.map(sampler)
+    dataset = dataset.map(tokenizer)
 
     # Batch
     dataset = dataset.batch(batch_size, drop_remainder=True)
 
-    # Convert to IterDataset
+    # Convert to IterDataset with multiprocessing
     dataset = dataset.to_iter_dataset(
         read_options=grain.ReadOptions(
             num_threads=num_workers,
