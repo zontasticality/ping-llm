@@ -29,7 +29,8 @@
       "Bash(strace:*)",
       "Bash(cat:*)",
       "Bash(getfacl:*)",
-      "Bash(capsh --print:*)"
+      "Bash(capsh --print:*)",
+      "WebSearch"
     ]
   },
   "sandbox": {

@@ -44,6 +44,12 @@ except ImportError:
     print("ERROR: pyyaml not installed. Install with: pip install pyyaml")
     sys.exit(1)
 
+try:
+    import jax
+except ImportError:
+    print("ERROR: jax not installed. Install with: pip install jax")
+    sys.exit(1)
+
 
 def check_wandb_login():
     """Check if user is logged into wandb."""
@@ -65,6 +71,58 @@ def load_config(config_file):
     """Load MaxText YAML config."""
     with open(config_file) as f:
         return yaml.safe_load(f)
+
+
+def get_peak_tflops():
+    """
+    Get peak TFLOPs for the current GPU.
+
+    Returns peak TFLOPS for BF16/FP16 operations (typical for LLM training).
+    If GPU type cannot be determined, returns None.
+    """
+    try:
+        device = jax.devices()[0]
+        device_kind = device.device_kind
+
+        # Peak TFLOPs for common GPUs (BF16/FP16)
+        # Source: NVIDIA specs
+        gpu_specs = {
+            "NVIDIA A100-SXM4-40GB": 312.0,
+            "NVIDIA A100-SXM4-80GB": 312.0,
+            "NVIDIA A100-PCIE-40GB": 312.0,
+            "NVIDIA A100-PCIE-80GB": 312.0,
+            "NVIDIA A100 80GB": 312.0,
+            "NVIDIA A100": 312.0,
+            "Tesla A100-SXM4-40GB": 312.0,
+            "Tesla A100-SXM4-80GB": 312.0,
+            "NVIDIA H100 80GB HBM3": 989.0,  # SXM
+            "NVIDIA H100": 989.0,
+            "NVIDIA H100 PCIe": 756.0,
+            "Tesla H100": 989.0,
+            "NVIDIA V100-SXM2-16GB": 125.0,
+            "NVIDIA V100": 125.0,
+            "Tesla V100-SXM2-16GB": 125.0,
+            "Tesla V100-SXM2-32GB": 125.0,
+        }
+
+        # Try exact match first
+        if device_kind in gpu_specs:
+            return gpu_specs[device_kind]
+
+        # Try partial matches
+        device_kind_lower = device_kind.lower()
+        for gpu_name, peak_tflops in gpu_specs.items():
+            if gpu_name.lower() in device_kind_lower or device_kind_lower in gpu_name.lower():
+                print(f"Matched GPU '{device_kind}' to '{gpu_name}' (Peak: {peak_tflops} TFLOPS)")
+                return peak_tflops
+
+        print(f"WARNING: Unknown GPU type '{device_kind}'. MFU will not be calculated.")
+        print("Known GPU types:", list(gpu_specs.keys()))
+        return None
+
+    except Exception as e:
+        print(f"WARNING: Failed to detect GPU type: {e}. MFU will not be calculated.")
+        return None
 
 
 def main():
@@ -96,6 +154,13 @@ def main():
     print(f"Loading config: {args.config}")
     config = load_config(args.config)
 
+    # Get peak TFLOPs for MFU calculation
+    peak_tflops = get_peak_tflops()
+    if peak_tflops:
+        print(f"Detected GPU peak TFLOPs: {peak_tflops} (BF16/FP16)")
+    else:
+        print("WARNING: Could not detect GPU peak TFLOPs. MFU will not be tracked.")
+
     # Auto-generate run name if not provided
     run_name = args.name or f"maxtext_plan2_{wandb.util.generate_id()}"
 
@@ -117,6 +182,7 @@ def main():
             "per_device_batch_size": args.batch_size,
             "hardware": args.hardware,
             "enable_checkpointing": args.enable_checkpointing,
+            "peak_tflops_bf16": peak_tflops if peak_tflops else "unknown",
         },
         tags=["maxtext", "plan2", "network-measurement"] + args.tags,
         sync_tensorboard=True,  # Enable TensorBoard sync
@@ -133,10 +199,14 @@ def main():
     # Build MaxText command
     project_root = Path(__file__).parent.parent
 
+    # Use absolute path for base_output_directory to fix Orbax checkpoint error
+    output_dir = (project_root / "outputs" / "latency_network" / run_name).resolve()
+
     maxtext_cmd = [
         "python", "-m", "MaxText.train",
         args.config,
         f"run_name={run_name}",
+        f"base_output_directory={output_dir}",  # Absolute path for Orbax
         f"hardware={args.hardware}",
         f"steps={args.steps}",
         f"per_device_batch_size={args.batch_size}",
@@ -147,6 +217,11 @@ def main():
     env = os.environ.copy()
     env["DECOUPLE_GCLOUD"] = "TRUE"
     env["WANDB_RUN_ID"] = run.id
+
+    # Fix JAX memory allocation to allow larger batches
+    # Without this, JAX pre-allocates 80% of GPU memory, preventing batch_size > 32
+    env["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"
+    env["XLA_PYTHON_CLIENT_ALLOCATOR"] = "platform"
 
     # Add src to PYTHONPATH
     src_path = str(project_root / "src")
@@ -175,6 +250,11 @@ def main():
             bufsize=1,
         )
 
+        # Track timing for ETA calculation
+        from collections import deque
+        step_times = deque(maxlen=50)  # Track last 50 step times for moving average
+        checkpoint_period = 5000  # From config (TODO: parse from config if needed)
+
         # Stream output and parse for metrics
         for line in process.stdout:
             print(line, end='')  # Print to console
@@ -189,6 +269,14 @@ def main():
 
                     metrics = {}
 
+                    # Parse step time first (needed for ETA)
+                    step_time = None
+                    if "seconds:" in line:
+                        seconds_str = line.split("seconds:")[1].split(",")[0].strip()
+                        step_time = float(seconds_str)
+                        step_times.append(step_time)
+                        metrics["train/step_time_seconds"] = step_time
+
                     # Parse loss
                     if "loss:" in line:
                         loss_str = line.split("loss:")[1].split(",")[0].strip()
@@ -197,7 +285,13 @@ def main():
                     # Parse TFLOP/s/device
                     if "TFLOP/s/device:" in line:
                         tflops_str = line.split("TFLOP/s/device:")[1].split(",")[0].strip()
-                        metrics["train/tflops_per_device"] = float(tflops_str)
+                        achieved_tflops = float(tflops_str)
+                        metrics["train/tflops_per_device"] = achieved_tflops
+
+                        # Calculate MFU (Model FLOP Utilization)
+                        if peak_tflops:
+                            mfu = (achieved_tflops / peak_tflops) * 100  # as percentage
+                            metrics["train/mfu_percent"] = mfu
 
                     # Parse Tokens/s/device
                     if "Tokens/s/device:" in line:
@@ -209,10 +303,38 @@ def main():
                         weights_str = line.split("total_weights:")[1].split(",")[0].strip()
                         metrics["train/total_weights"] = int(weights_str)
 
-                    # Parse seconds (step time)
-                    if "seconds:" in line:
-                        seconds_str = line.split("seconds:")[1].split(",")[0].strip()
-                        metrics["train/step_time_seconds"] = float(seconds_str)
+                    # Calculate and print ETA
+                    if step_times and step > 0:
+                        avg_step_time = sum(step_times) / len(step_times)
+                        remaining_steps = args.steps - step - 1
+                        eta_seconds = remaining_steps * avg_step_time
+
+                        # Time to next checkpoint
+                        steps_to_checkpoint = checkpoint_period - (step % checkpoint_period)
+                        checkpoint_eta_seconds = steps_to_checkpoint * avg_step_time
+
+                        # Format ETAs
+                        def format_time(seconds):
+                            if seconds < 60:
+                                return f"{seconds:.0f}s"
+                            elif seconds < 3600:
+                                return f"{seconds/60:.1f}m"
+                            elif seconds < 86400:
+                                return f"{seconds/3600:.1f}h"
+                            else:
+                                days = seconds / 86400
+                                hours = (seconds % 86400) / 3600
+                                return f"{days:.0f}d {hours:.0f}h"
+
+                        eta_str = format_time(eta_seconds)
+                        checkpoint_eta_str = format_time(checkpoint_eta_seconds)
+
+                        # Print enhanced progress
+                        print(f"  → Step {step+1}/{args.steps} | ETA: {eta_str} | Next checkpoint: {checkpoint_eta_str}")
+
+                        # Log ETAs to wandb
+                        metrics["train/eta_seconds"] = eta_seconds
+                        metrics["train/eta_to_checkpoint_seconds"] = checkpoint_eta_seconds
 
                     # Log to wandb
                     if metrics:
@@ -236,10 +358,17 @@ def main():
         sys.exit(exit_code)
 
     except KeyboardInterrupt:
-        print("\n\nTraining interrupted by user")
+        print("\n\n" + "="*80)
+        print("⚠️  TRAINING INTERRUPTED BY USER (Ctrl+C)")
+        print("="*80)
+        print("Note: MaxText saves checkpoints every 5000 steps.")
+        print("Your progress up to the last checkpoint is saved in:")
+        print(f"  {config.get('base_output_directory', 'outputs/latency_network')}/checkpoints/")
+        print("You can resume training from the last checkpoint.")
+        print("="*80)
         wandb.log({"training_status": "interrupted"})
         wandb.finish()
-        sys.exit(1)
+        sys.exit(130)  # Standard exit code for SIGINT
     except Exception as e:
         print(f"\n✗ Error: {e}")
         wandb.log({"training_status": "error", "error": str(e)})

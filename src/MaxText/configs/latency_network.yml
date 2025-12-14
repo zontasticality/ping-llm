@@ -56,7 +56,7 @@ dataset_type: "grain"
 grain_file_type: "network_parquet"  # Use custom network measurement data source
 grain_train_files: "data/sharded/train/*.parquet"
 grain_eval_files: "data/sharded/test/*.parquet"
-grain_worker_count: 4  # Parallel data loading workers (reduced for CPU test)
+grain_worker_count: 64  # Use 64 CPU cores - overfeed the GPU! (thread-safety fixed!)
 
 # Attention & Positional Encoding
 attention: "dot_product"

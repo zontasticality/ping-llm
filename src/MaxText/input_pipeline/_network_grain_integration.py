@@ -99,7 +99,7 @@ def create_network_measurement_dataset(
         max_tokens=max_tokens,
         shuffle=shuffle,
         shuffle_seed=shuffle_seed,
-        num_workers=max(1, grain_worker_count),
+        num_workers=grain_worker_count,  # Use 0 to disable multithreading (fixed bug: was max(1, grain_worker_count))
         window_stride=window_stride,
         cache_size=4,  # LRU cache size for parquet files
     )

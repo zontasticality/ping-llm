@@ -16,6 +16,7 @@ import random
 import numpy as np
 from typing import List, Dict, Any, Optional
 from functools import lru_cache
+import threading
 import grain.python as grain
 import pyarrow.parquet as pq
 
@@ -44,6 +45,7 @@ class ParquetMeasurementDataSource(grain.RandomAccessDataSource):
         self._cache = {}  # Simple cache: {file_idx: table}
         self._cache_order = []  # Track access order for LRU eviction
         self._cache_size = cache_size
+        self._cache_lock = threading.Lock()  # Thread-safe cache access for grain workers
 
         # Get row counts WITHOUT loading full tables (memory efficient)
         for parquet_file in self.parquet_files:
@@ -58,26 +60,35 @@ class ParquetMeasurementDataSource(grain.RandomAccessDataSource):
         return self._total_rows
 
     def _load_table(self, file_idx: int):
-        """Load table with LRU caching."""
-        if file_idx in self._cache:
-            # Cache hit - move to end (most recently used)
-            self._cache_order.remove(file_idx)
-            self._cache_order.append(file_idx)
-            return self._cache[file_idx]
+        """Load table with thread-safe LRU caching."""
+        with self._cache_lock:
+            if file_idx in self._cache:
+                # Cache hit - move to end (most recently used)
+                self._cache_order.remove(file_idx)
+                self._cache_order.append(file_idx)
+                return self._cache[file_idx]
 
-        # Cache miss - load table
+            # Cache miss - load table (release lock during I/O)
+            # This allows other workers to access cache while we read from disk
+
+        # Load table outside the lock (I/O is slow, don't block other workers)
         table = pq.read_table(self.parquet_files[file_idx])
 
-        # Add to cache
-        self._cache[file_idx] = table
-        self._cache_order.append(file_idx)
+        with self._cache_lock:
+            # Re-check cache in case another worker loaded it while we were reading
+            if file_idx in self._cache:
+                return self._cache[file_idx]
 
-        # Evict oldest if cache is full
-        if len(self._cache) > self._cache_size:
-            oldest = self._cache_order.pop(0)
-            del self._cache[oldest]
+            # Add to cache
+            self._cache[file_idx] = table
+            self._cache_order.append(file_idx)
 
-        return table
+            # Evict oldest if cache is full
+            if len(self._cache) > self._cache_size:
+                oldest = self._cache_order.pop(0)
+                del self._cache[oldest]
+
+            return table
 
     def __getitem__(self, index):
         """Get a single measurement row by global index (loads file on-demand with caching)."""
