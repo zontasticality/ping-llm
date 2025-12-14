@@ -70,19 +70,24 @@ packet_error_count: int64  - Packet error count (dataset artifact, not used)
 ### 1.2 Dataset Sharding
 
 **Current:** Single 1.1GB file
-**Target:** 250 shards for better shuffling and parallelism
+**Target:** 200 shards for better shuffling and parallelism
 
 **Implementation:** `scripts/shard_parquet.py`
 ```bash
 python scripts/shard_parquet.py \
   --input data/training_data.parquet \
   --output data/sharded \
-  --train-shards 200 \    # 80% train (~400k rows/shard)
-  --val-shards 25 \       # 10% validation
-  --test-shards 25        # 10% test
+  --train-shards 180 \    # 90% train (~500k rows/shard)
+  --test-shards 20        # 10% test (~500k rows/shard)
 ```
 
-**Stratification:** By time to ensure temporal coverage in all splits
+**Rationale for no validation set:**
+- Single training run with fixed architecture (not doing extensive hyperparameter search)
+- Can evaluate on test set periodically during training for monitoring
+- Validation set typically used for hyperparameter tuning and early stopping
+- For this project, we'll train to completion and evaluate on held-out test set
+
+**Stratification:** By time to ensure temporal coverage in both splits
 
 ---
 
@@ -131,23 +136,36 @@ IPv6: <SrcIPv6/DstIPv6> + 16 bytes          (17 tokens total)
 
 #### RTT (Round-Trip Time)
 ```
-Format: <RttStart> + 2 bytes (log-compressed float)
+Format: <RttStart> + 2 bytes (5-bit exponent + 11-bit mantissa)
 
-Encoding:
-  - 0xFFFF: Reserved (unused, <Failed> token used instead)
-  - 0x0000-0xFFFE: raw_value = 10000 * log(rtt + 1)
+Encoding: value_μs = mantissa × 2^exponent
+  - exponent: 5 bits (0-31)
+  - mantissa: 11 bits (0-2047)
+  - Packing: EEEEE MMM | MMMM MMMM
+            (5exp)(3msb)|(8lsb mantissa)
 
-Decoding: rtt = exp(raw_value / 10000) - 1
+Range:
+  - Min: 1 × 2^0 = 1 microsecond (local network)
+  - Max: 2047 × 2^31 = 4.4 trillion μs = 51 days
+  - Earth-Mars (closest): ~180 seconds ✓
+  - Earth-Mars (farthest): ~1300 seconds (22 min) ✓
 
-Range: 0.0 to ~320,000 ms
-Precision: ~0.1% relative error
-  - 1ms   → ±0.01ms
-  - 10ms  → ±0.1ms
-  - 100ms → ±1ms
-  - 1000ms → ±10ms (sufficient for network modeling)
+Precision: ~0.049% relative error (1/2047)
+  - At 1ms (1000μs):    ±0.5μs
+  - At 100ms (100kμs):  ±50μs
+  - At 1s (1Mμs):       ±500μs
+  - At 22min (Mars):    ±650ms (sufficient for interplanetary!)
+
+Conversion:
+  ms → μs: multiply by 1000
+  μs → ms: divide by 1000
 ```
 
-**Rationale:** Log-scale compresses wide dynamic range while maintaining perceptual precision
+**Rationale:**
+- Wide dynamic range (1μs to 51 days) supports future interplanetary networks
+- 11-bit mantissa provides sufficient precision for all terrestrial measurements
+- Powers-of-2 encoding is faster than logarithms
+- Future-proof for Mars, lunar, or other space-based network measurement datasets
 
 #### Timestamps
 ```
@@ -193,10 +211,10 @@ U8         ::= <Byte0> | <Byte1> | ... | <Byte255>
 U16        ::= U8 U8                       # Big-endian uint16
 U32        ::= U8 U8 U8 U8                 # Big-endian uint32
 U64        ::= U8{8}                       # Big-endian uint64
-Float16    ::= U8 U8                       # Log-compressed float
-                                           # Format: exp(value/10000) - 1
-                                           # Range: 0.0 to ~320,000
-                                           # Precision: ~0.1% relative error
+Float16    ::= U8 U8                       # 5-bit exponent + 11-bit mantissa
+                                           # Format: mantissa × 2^exponent (in microseconds)
+                                           # Range: 1μs to 51 days
+                                           # Precision: ~0.049% relative error
 
 # Network fields
 SrcIPv4    ::= <SrcIPv4> U8{4}            # 5 tokens
@@ -218,16 +236,18 @@ Result     ::= <RttStart> Float16         # 3 tokens: successful probe
 # Measurement structure
 Field      ::= SrcIp | DstIp | Timestamp | Result
 
-# All 4 fields present, deterministically shuffled order
-Measurement ::= <MeasurementStart> Field{4}
+# Timestamp is optional - measurements can have 3 or 4 fields
+# Fields are deterministically shuffled (except MeasurementStart which always comes first)
+Measurement ::= <MeasurementStart> Field{3,4}
 
 # Context window (multiple measurements for in-context learning)
+# Some measurements may include timestamps, others may not (see Training Modes section)
 Context    ::= Measurement+
 ```
 
 ### 2.5 Sequence Length Analysis
 
-**IPv4 measurement (typical):**
+**IPv4 measurement (with timestamp):**
 ```
 Field               | First | Subsequent (delta)
 --------------------|-------|-------------------
@@ -239,6 +259,19 @@ Timestamp           |   9   |   2
 --------------------|-------|-------------------
 Total (success)     |  23   |  16
 Total (failed)      |  21   |  14
+```
+
+**IPv4 measurement (NO timestamp):**
+```
+Field               | Tokens
+--------------------|--------
+MeasurementStart    |   1
+SrcIPv4             |   5
+DstIPv4             |   5
+Rtt (success)       |   3
+--------------------|--------
+Total (success)     |  14
+Total (failed)      |  12
 ```
 
 **IPv6 measurement:**
@@ -269,15 +302,50 @@ Improvement: 3x more context for network localization!
 
 **Key functions:**
 ```python
-def encode_rtt_log_compressed(rtt: float) -> List[int]:
-    """Encode RTT as 2-byte log-scale value."""
-    if rtt < 0:
-        return [FAILED]  # Use dedicated token for failures
+def encode_rtt_exponent_mantissa(rtt_ms: float) -> List[int]:
+    """
+    Encode RTT as 5-bit exponent + 11-bit mantissa (microseconds).
 
-    import math
-    raw = int(10000 * math.log(rtt + 1))
-    raw = min(raw, 0xFFFE)
-    return [RTT_START, byte_to_token(raw >> 8), byte_to_token(raw & 0xFF)]
+    Format: value_μs = mantissa × 2^exponent
+    Range: 1μs to 51 days
+    Precision: ~0.049% relative error
+
+    Returns: [RTT_START, byte1, byte2]
+    """
+    if rtt_ms < 0:
+        return [FAILED]  # Use dedicated token for failed probes
+
+    rtt_us = max(1.0, rtt_ms * 1000)  # Convert ms to μs, min 1μs
+
+    # Find exponent (powers of 2)
+    exponent = 0
+    mantissa_float = rtt_us
+    while mantissa_float >= 2048 and exponent < 31:
+        mantissa_float /= 2
+        exponent += 1
+
+    mantissa = min(int(mantissa_float), 2047)
+
+    # Pack: EEEEE MMM | MMMM MMMM
+    #       5exp  3msb  8lsb
+    byte1 = (exponent << 3) | (mantissa >> 8)
+    byte2 = mantissa & 0xFF
+
+    return [RTT_START, byte_to_token(byte1), byte_to_token(byte2)]
+
+def decode_rtt_exponent_mantissa(byte1: int, byte2: int) -> float:
+    """
+    Decode RTT from 5-bit exponent + 11-bit mantissa.
+
+    Returns: RTT in milliseconds
+    """
+    exponent = byte1 >> 3
+    mantissa = ((byte1 & 0x07) << 8) | byte2
+
+    rtt_us = mantissa * (2 ** exponent)
+    rtt_ms = rtt_us / 1000
+
+    return rtt_ms
 
 def encode_timestamp_delta(
     event_time,
@@ -330,7 +398,7 @@ def encode_measurement(
     if rtt < 0:
         result_block = [FAILED]
     else:
-        result_block = encode_rtt_log_compressed(rtt)
+        result_block = encode_rtt_exponent_mantissa(rtt)
 
     # Encode timestamp (absolute or delta)
     timestamp_block = encode_timestamp_delta(
@@ -551,57 +619,166 @@ adam_eps: 1.0e-8
 adam_eps_root: 0.0
 weight_decay: 0.01
 
-# Batching
-per_device_batch_size: 32      # Adjust based on GPU memory
-global_batch_size: 128         # 4 GPUs × 32 samples
+# Batching (Single GPU)
+per_device_batch_size: 32      # Adjust based on A100 memory
+global_batch_size: 32          # Single GPU (no data parallelism)
 sequence_length: 1024          # Match max_target_length
 
-# Effective tokens per step: 128 × 1024 = 131k tokens
-# Total training tokens: 200k steps × 131k = 26.2B tokens (~5 epochs)
+# Effective tokens per step: 32 × 1024 = 32.7k tokens
+# Total training tokens: 200k steps × 32.7k = 6.5B tokens (~1.2 epochs on 5.4B token dataset)
 
 # Precision
 param_dtype: bfloat16
 activation_dtype: bfloat16
 ```
 
-### 4.2 Data Loading
+### 4.2 Data Loading with Timestamp Training Modes
 
 **Framework:** Grain (Google's data loading library)
 
-**Pipeline:**
+**Three Training Modes (Critical for generalization):**
+
+1. **Mode 1: Full Timestamp (40% of batches)**
+   - All measurements include timestamps
+   - Measurements ordered temporally
+   - Delta timestamps refer to previous measurement
+   - Model learns: Temporal patterns, diurnal effects, routing stability over time
+
+2. **Mode 2: No Timestamp (30% of batches)**
+   - No measurements include timestamps
+   - Measurements randomly shuffled (no temporal order)
+   - Model learns: Pure network topology, geographic patterns (atemporal)
+   - Critical for: Queries without timestamp context, generalization to unseen times
+
+3. **Mode 3: Mixed Timestamp (30% of batches)**
+   - Some measurements have timestamps, others don't (randomly assigned)
+   - Timestamped measurements maintain temporal order
+   - Non-timestamped measurements shuffled randomly
+   - Then interleaved while preserving timestamped order
+   - Delta timestamps skip over non-timestamped measurements
+   - Model learns: Robust to missing data, use temporal info when available
+
+**Rationale:**
+- 40% full timestamp: Learn temporal patterns and enable efficient delta encoding
+- 30% no timestamp: Force learning of atemporal network topology (prevents overfitting to "3pm traffic patterns")
+- 30% mixed: Realistic scenario (missing/unreliable timestamps), teaches robustness
+
+**Pipeline Implementation:**
 ```python
 import grain
+import random
 
-# 1. Load sharded Parquet files
-train_ds = grain.experimental.ParquetIterDataset(
-    "data/sharded/train/*.parquet"
-)
+class ContextWindowSampler(grain.transforms.Map):
+    """Sample context windows with timestamp training modes."""
 
-# 2. On-the-fly tokenization with delta timestamps
-class TokenizeAndPack(grain.transforms.Map):
-    def __init__(self):
-        self.prev_timestamp = None
-        self.dataset_start = None  # Set from first batch
+    def __init__(self, window_size=64):
+        self.window_size = window_size
 
-    def map(self, element):
-        tokens = encode_measurement(
-            element,
-            prev_timestamp=self.prev_timestamp,
-            dataset_start=self.dataset_start
-        )
-        self.prev_timestamp = element['event_time']
+    def map(self, measurements):
+        """
+        Sample a context window and apply timestamp training mode.
+
+        Returns: List of token IDs for the context window
+        """
+        # Sample measurements for this context window
+        window = self._sample_measurements(measurements, self.window_size)
+
+        # Decide training mode (40/30/30 split)
+        mode = random.choices(
+            ['full_timestamp', 'no_timestamp', 'mixed'],
+            weights=[0.40, 0.30, 0.30]
+        )[0]
+
+        if mode == 'full_timestamp':
+            # All have timestamps, keep temporal order
+            window.sort(key=lambda m: m['event_time'])
+            has_timestamp = [True] * len(window)
+
+        elif mode == 'no_timestamp':
+            # None have timestamps, random order
+            random.shuffle(window)
+            has_timestamp = [False] * len(window)
+
+        else:  # mode == 'mixed'
+            # Randomly assign timestamps (40-60% coverage)
+            has_timestamp = [random.random() < 0.5 for _ in window]
+
+            # Separate timestamped and non-timestamped
+            timestamped = [m for m, has_ts in zip(window, has_timestamp) if has_ts]
+            non_timestamped = [m for m, has_ts in zip(window, has_timestamp) if not has_ts]
+
+            # Keep timestamped ordered, shuffle non-timestamped
+            timestamped.sort(key=lambda m: m['event_time'])
+            random.shuffle(non_timestamped)
+
+            # Interleave randomly (preserving timestamped order)
+            window = self._interleave_preserving_order(timestamped, non_timestamped)
+            # Update has_timestamp to match new order
+            has_timestamp = [m in timestamped for m in window]
+
+        # Encode window with optional timestamps
+        return self._encode_window(window, has_timestamp)
+
+    def _encode_window(self, window, has_timestamp):
+        """
+        Encode measurements with delta timestamps.
+
+        Delta timestamps skip over non-timestamped measurements:
+        - M1(t=100) → M2(no ts) → M3(t=220)
+        - M3's delta is 220-100=120s, not relative to M2
+        """
+        tokens = []
+        prev_timestamped = None
+
+        for meas, include_ts in zip(window, has_timestamp):
+            # Encode timestamp block (if included)
+            if include_ts:
+                timestamp_block = encode_timestamp_delta(
+                    meas['event_time'],
+                    prev_timestamped  # Delta to previous TIMESTAMPED measurement
+                )
+                prev_timestamped = meas['event_time']
+            else:
+                timestamp_block = []  # Omit timestamp entirely
+
+            # Encode measurement fields (shuffled, with optional timestamp)
+            meas_tokens = encode_measurement(
+                meas,
+                timestamp_block=timestamp_block
+            )
+            tokens.extend(meas_tokens)
+
         return {"tokens": tokens, "length": len(tokens)}
 
-train_ds = train_ds.map(TokenizeAndPack())
+    def _interleave_preserving_order(self, ordered_list, random_list):
+        """Randomly interleave two lists, preserving order of first list."""
+        result = []
+        i, j = 0, 0
 
-# 3. Pack multiple measurements per sequence
-train_ds = train_ds.batch(
-    batch_size=per_device_batch_size,
-    drop_remainder=True
-)
+        while i < len(ordered_list) or j < len(random_list):
+            # Randomly decide whether to take from ordered or random
+            # (with bias to maintain roughly even distribution)
+            if i >= len(ordered_list):
+                result.append(random_list[j])
+                j += 1
+            elif j >= len(random_list):
+                result.append(ordered_list[i])
+                i += 1
+            elif random.random() < 0.5:
+                result.append(ordered_list[i])
+                i += 1
+            else:
+                result.append(random_list[j])
+                j += 1
 
-# 4. Shuffle and repeat
-train_ds = train_ds.shuffle(buffer_size=10000)
+        return result
+
+
+# Data pipeline
+train_ds = grain.experimental.ParquetIterDataset("data/sharded/train/*.parquet")
+train_ds = train_ds.map(ContextWindowSampler(window_size=64))
+train_ds = train_ds.batch(batch_size=32, drop_remainder=True)
+train_ds = train_ds.shuffle(buffer_size=1000)
 train_ds = train_ds.repeat()
 ```
 
@@ -642,28 +819,79 @@ eval_steps: 100                # 100 eval batches per eval
 # - Field-specific metrics (RTT MAE, IP byte accuracy)
 ```
 
-### 4.5 Hardware Requirements
+### 4.5 Positional Encoding Strategy
 
-**Minimum (local testing):**
-```
-CPU: 8 cores
-RAM: 32GB
-GPU: 1× RTX 4090 (24GB VRAM)
-Disk: 10GB for checkpoints
+**Question:** Do we need positional embeddings when fields are shuffled within measurements?
+
+**Answer:** Yes, positional encoding is still valuable, but for **between-measurement** position, not within-measurement.
+
+**Three options to test:**
+
+1. **RoPE (Rotary Position Embeddings)** - RECOMMENDED STARTING POINT
+   ```yaml
+   position_embedding: "rope"
+   ```
+   - **Pros:** Standard, well-tested, encodes relative position efficiently
+   - **Cons:** Adds noise within measurements (shuffled fields don't have meaningful position)
+   - **Verdict:** Noise is minor, causal structure + RoPE on measurement sequence position is helpful
+
+2. **Learned Positional Embeddings**
+   ```yaml
+   position_embedding: "learned"
+   ```
+   - **Pros:** Model can learn to ignore position within measurements, use it between measurements
+   - **Cons:** Extra parameters (1024 × 640 = 655k params)
+   - **Verdict:** Most flexible, worth testing as ablation
+
+3. **No Positional Encoding**
+   ```yaml
+   position_embedding: "none"
+   ```
+   - **Pros:** No noise from shuffled fields, delta timestamps provide temporal info
+   - **Cons:** Model doesn't know position in context window (recency bias lost)
+   - **Verdict:** Interesting experiment, might work given field shuffling
+
+**Why RoPE is orthogonal to delta timestamps:**
+- **Delta timestamps:** Encode real-world temporal distance ("60 seconds elapsed")
+- **RoPE:** Encodes position in context window ("This is the 5th measurement in the prompt")
+- Both are useful: Delta for temporal patterns, RoPE for in-context learning recency
+
+**Recommendation:** Start with RoPE, test "learned" and "none" as ablations if time permits.
+
+### 4.6 Hardware Requirements
+
+**Target Platform: Single A100 (40GB or 80GB) on SLURM**
+
+```yaml
+# Hardware configuration
+hardware: gpu
+ici_data_parallelism: 1        # No multi-GPU parallelism
+ici_tensor_parallelism: 1
+ici_pipeline_parallelism: 1
 ```
 
-**Recommended (production):**
+**Requirements:**
 ```
-GPUs: 4× A100 (40GB or 80GB)
-CPU: 32 cores
-RAM: 128GB
-Disk: 500GB SSD for checkpoints + data
+GPU: 1× A100 (40GB minimum, 80GB recommended)
+CPU: 16+ cores (for Grain data loading)
+RAM: 64GB
+Disk: 100GB SSD for checkpoints + sharded data
 ```
 
 **Expected throughput:**
-- Single A100 (40GB): ~50k tokens/sec
-- 4× A100: ~200k tokens/sec
-- Time to 200k steps: ~7 hours on 4× A100
+- Single A100 (40GB): ~40-50k tokens/sec
+- Batch size 32 × sequence length 1024 = 32.7k tokens/batch
+- ~1.2-1.5 batches/sec
+- **Time to 200k steps: ~37 hours** (1.5 days)
+
+**Memory estimate:**
+```
+Model parameters: ~95M × 2 bytes (bfloat16) = 190MB
+Optimizer state (AdamW): ~95M × 8 bytes = 760MB
+Gradients: ~95M × 2 bytes = 190MB
+Activations (batch=32, seq=1024): ~2-3GB
+Total: ~4-5GB (fits comfortably in 40GB A100)
+```
 
 ---
 
@@ -673,7 +901,7 @@ Disk: 500GB SSD for checkpoints + data
 
 **Tasks:**
 - [ ] Update `tokenization.py` with optimized encoding:
-  - [ ] Implement log-compressed RTT (2 bytes)
+  - [ ] Implement 5-bit exponent + 11-bit mantissa RTT encoding (microseconds, 2 bytes)
   - [ ] Implement delta timestamps (1/4 bytes)
   - [ ] Merge SrcIp/DstIp with IPv4/IPv6 tokens
   - [ ] Add `<Failed>` token for failed probes
@@ -687,10 +915,34 @@ Disk: 500GB SSD for checkpoints + data
 
 **Validation criteria:**
 - All token IDs in [0, 266]
-- IPv4 first measurement: exactly 23 tokens
-- IPv4 subsequent (delta): exactly 16 tokens
-- RTT round-trip error < 0.1% for all observed values
+- IPv4 first measurement: exactly 23 tokens (with timestamp), 14 tokens (without)
+- IPv4 subsequent (delta): exactly 16 tokens (with timestamp), 14 tokens (without)
+- RTT round-trip error < 0.049% for all observed values (5-bit exponent + 11-bit mantissa)
 - Failed probes (RTT=-1.0) encoded as single `<Failed>` token
+
+### Phase 0.5: Training Modes Implementation
+
+**Tasks:**
+- [ ] Implement `ContextWindowSampler` in Grain pipeline:
+  - [ ] Mode 1 (40%): Full timestamp, temporal order
+  - [ ] Mode 2 (30%): No timestamp, random shuffle
+  - [ ] Mode 3 (30%): Mixed timestamp with interleaving logic
+- [ ] Update `encode_measurement()` to accept optional timestamp block
+- [ ] Implement `_interleave_preserving_order()` for Mode 3
+- [ ] Test delta timestamp skipping (Mode 3):
+  - [ ] Verify deltas refer to previous timestamped measurement
+  - [ ] Test with various timestamp coverage ratios (30-70%)
+- [ ] Validate training modes:
+  - [ ] Sample 100 context windows, verify mode distribution (40/30/30)
+  - [ ] Check Mode 1: all measurements have timestamps, sorted by time
+  - [ ] Check Mode 2: no measurements have timestamps, random order
+  - [ ] Check Mode 3: mixed measurements interleaved correctly
+
+**Validation criteria:**
+- Mode distribution matches 40/30/30 split over 1000 samples
+- Mode 1 sequences are strictly temporally ordered
+- Mode 2 sequences have no timestamps
+- Mode 3 delta timestamps skip non-timestamped measurements correctly
 
 ### Phase 1: MaxText Configuration
 
@@ -760,27 +1012,28 @@ Disk: 500GB SSD for checkpoints + data
 - GPU utilization >80%
 - Throughput >30k tokens/sec (single A100)
 
-### Phase 4: SLURM Multi-GPU Training
+### Phase 4: SLURM Single-GPU Training
 
 **Tasks:**
 - [ ] Update `scripts/slurm_train_maxtext.sh`:
-  - [ ] Configure 4-GPU job
+  - [ ] Configure single A100 job (40GB or 80GB)
   - [ ] Set data paths for cluster storage
   - [ ] Add TensorBoard logging
+  - [ ] Configure environment variables (DECOUPLE_GCLOUD=TRUE)
 - [ ] Submit training job:
-  - [ ] Run for 200k steps
+  - [ ] Run for 200k steps (~37 hours on A100)
   - [ ] Monitor TensorBoard remotely
   - [ ] Save checkpoints every 5k steps
-- [ ] Evaluate on validation set:
+- [ ] Evaluate on test set (periodically during training):
   - [ ] Compute perplexity
   - [ ] Measure RTT prediction MAE
   - [ ] Check IP byte accuracy
 
 **Validation criteria:**
-- Training completes without OOM
-- Validation loss plateaus or decreases
+- Training completes without OOM (should use ~4-5GB of 40GB)
+- Test loss decreases or plateaus
 - RTT prediction MAE < 10ms for typical measurements
-- Checkpoints save successfully
+- Checkpoints save successfully (absolute paths)
 
 ### Phase 5: Model Evaluation
 
@@ -1012,23 +1265,34 @@ Total unique IPs:
 | Aspect | PLAN.md | PLAN_2.md | Change |
 |--------|---------|-----------|--------|
 | **Vocab size** | 266 | 267 | +1 (added `<Failed>`) |
-| **Tokens/measurement** | 42-66 | 16-47 | 53-64% reduction |
-| **Context capacity** | 15-24 | 22-64 | 3x improvement |
+| **Tokens/measurement (IPv4)** | 42-45 | 14-23 | 49-69% reduction |
+| **Context capacity** | ~22 | ~64 (IPv4 no-ts) | 3x improvement |
 | **Model size** | 100M | ~95M | Optimized for generalization |
 | **MLP ratio** | 4x | 3.2x | Smaller for generalization |
 | **Depth** | 12 | 20 | +67% for search reasoning |
 | **Embedding** | 768 | 640 | Optimized for small vocab |
 | **Max length** | 512-2048 (TBD) | 1024 | Fixed for in-context learning |
-| **RTT encoding** | 8 bytes float64 | 2 bytes log-compressed | 75% reduction |
-| **Timestamp** | 8 bytes absolute | 2-9 bytes (deltas) | 78-89% reduction |
+| **RTT encoding** | 8 bytes float64 | 2 bytes (5exp+11mant) | 75% reduction, 1μs-51 days range |
+| **Timestamp** | 8 bytes absolute | 1-9 bytes (deltas) | 78-89% reduction |
 | **Removed fields** | - | msm_id, size, errors | Cleaner schema |
+| **Optional timestamps** | No | Yes (40/30/30 modes) | Enables atemporal learning |
+| **Dataset split** | 80/10/10 | 90/10 | No validation set |
+| **GPUs** | 1-4 | 1 | Single A100 on SLURM |
+| **Position encoding** | Not specified | RoPE (recommended) | Orthogonal to delta timestamps |
 
 **Philosophy shift:**
 - **Old:** General-purpose measurement modeling
 - **New:** Generalization-focused design for network path selection and IP inference via in-context learning
+- **Key insight:** Optional timestamps enable model to learn both temporal patterns and atemporal network topology
+
+**Novel contributions:**
+1. **5-bit exponent RTT encoding:** Future-proof for interplanetary networks (Mars!)
+2. **3 training modes:** 40% full timestamp, 30% no timestamp, 30% mixed
+3. **Delta timestamp skipping:** Deltas refer to previous timestamped measurement in mixed mode
+4. **Timestamp-agnostic predictions:** Model learns topology independent of temporal context
 
 ---
 
 **Document status:** Living document, updated as implementation progresses
-**Last updated:** 2025-12-13
-**Next review:** After Phase 0 completion (tokenization update)
+**Last updated:** 2025-12-13 (Updated: RTT encoding, training modes, single-GPU, RoPE discussion)
+**Next review:** After Phase 0.5 completion (training modes + tokenization update)
