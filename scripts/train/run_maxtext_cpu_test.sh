@@ -1,6 +1,6 @@
 #!/bin/bash
 # Wrapper script for running MaxText on CPU with proper environment variables
-# Usage: ./scripts/run_maxtext_cpu_test.sh [additional args...]
+# Usage: ./scripts/train/run_maxtext_cpu_test.sh [additional args...]
 
 set -e
 

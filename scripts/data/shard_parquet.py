@@ -3,23 +3,48 @@
 Shard the single training_data.parquet file into multiple smaller files.
 
 This script:
-1. Reads data/training_data.parquet (100M rows)
-2. Splits into train/val/test (80/10/10 split)
+1. Reads data/training_data.parquet (200M rows)
+2. Splits into train/test (90/10 split - no validation per PLAN_2)
 3. Shards each split into multiple files for better I/O parallelism
 4. Stratifies by time to ensure balanced temporal distribution
+5. Casts string columns to large_string to handle 200M+ rows (avoids 2GB limit)
 
 Output structure:
     data/sharded/
-        train/shard_0000.parquet, shard_0001.parquet, ...
-        val/shard_0000.parquet, ...
-        test/shard_0000.parquet, ...
+        train/shard_0000.parquet, shard_0001.parquet, ... (180 shards)
+        test/shard_0000.parquet, ... (20 shards)
 """
 
 import argparse
 import os
 from pathlib import Path
+import pyarrow as pa
 import pyarrow.parquet as pq
 import pyarrow.compute as pc
+
+
+def cast_to_large_types(table):
+    """
+    Cast string and binary columns to large_string and large_binary.
+
+    This is necessary for large datasets (200M+ rows) where standard
+    string/binary types hit the 2GB limit during operations like sorting.
+    """
+    schema = table.schema
+    new_fields = []
+
+    for field in schema:
+        if field.type == pa.string():
+            # Cast string to large_string
+            new_fields.append(pa.field(field.name, pa.large_string()))
+        elif field.type == pa.binary():
+            # Cast binary to large_binary
+            new_fields.append(pa.field(field.name, pa.large_binary()))
+        else:
+            new_fields.append(field)
+
+    new_schema = pa.schema(new_fields)
+    return table.cast(new_schema)
 
 
 def shard_parquet(
@@ -45,19 +70,22 @@ def shard_parquet(
     - Validation set typically used for hyperparameter tuning and early stopping
     - For this project, we'll train to completion and evaluate on held-out test set
     """
-    assert abs(train_ratio + test_ratio - 1.0) < 1e-6, \
-        "Ratios must sum to 1.0"
+    assert abs(train_ratio + test_ratio - 1.0) < 1e-6, "Ratios must sum to 1.0"
 
     if shards_per_split is None:
         shards_per_split = {
-            'train': 180,  # ~500k rows/shard (90M rows / 180 shards)
-            'test': 20,    # ~500k rows/shard (10M rows / 20 shards)
+            "train": 180,  # ~1M rows/shard (180M rows / 180 shards)
+            "test": 20,  # ~1M rows/shard (20M rows / 20 shards)
         }
 
     print(f"Reading input file: {input_file}")
     table = pq.read_table(input_file)
     total_rows = len(table)
     print(f"Total rows: {total_rows:,}")
+
+    # Cast string/binary columns to large types to avoid 2GB limit
+    print("Casting to large types (for 200M+ rows)...")
+    table = cast_to_large_types(table)
 
     # Sort by event_time to enable stratified splitting
     print("Sorting by event_time...")
@@ -68,8 +96,8 @@ def shard_parquet(
     train_end = int(total_rows * train_ratio)
 
     splits = {
-        'train': table.slice(0, train_end),
-        'test': table.slice(train_end, total_rows - train_end),
+        "train": table.slice(0, train_end),
+        "test": table.slice(train_end, total_rows - train_end),
     }
 
     # Create output directories
@@ -83,7 +111,9 @@ def shard_parquet(
         num_shards = shards_per_split[split_name]
         rows_per_shard = split_rows // num_shards
 
-        print(f"\nSharding {split_name} split: {split_rows:,} rows into {num_shards} shards")
+        print(
+            f"\nSharding {split_name} split: {split_rows:,} rows into {num_shards} shards"
+        )
         print(f"  ~{rows_per_shard:,} rows per shard")
 
         for shard_idx in range(num_shards):
@@ -98,7 +128,7 @@ def shard_parquet(
 
             # Write shard
             output_file = output_path / split_name / f"shard_{shard_idx:04d}.parquet"
-            pq.write_table(shard_table, output_file, compression='snappy')
+            pq.write_table(shard_table, output_file, compression="snappy")
 
             if (shard_idx + 1) % 20 == 0 or shard_idx == num_shards - 1:
                 print(f"  Written {shard_idx + 1}/{num_shards} shards")
@@ -119,44 +149,41 @@ def main():
         "--input",
         type=str,
         default="data/training_data.parquet",
-        help="Input Parquet file path"
+        help="Input Parquet file path",
     )
     parser.add_argument(
         "--output",
         type=str,
         default="data/sharded",
-        help="Output directory for sharded files"
+        help="Output directory for sharded files",
     )
     parser.add_argument(
         "--train-ratio",
         type=float,
         default=0.9,
-        help="Training split ratio (default: 0.9)"
+        help="Training split ratio (default: 0.9)",
     )
     parser.add_argument(
-        "--test-ratio",
-        type=float,
-        default=0.1,
-        help="Test split ratio (default: 0.1)"
+        "--test-ratio", type=float, default=0.1, help="Test split ratio (default: 0.1)"
     )
     parser.add_argument(
         "--train-shards",
         type=int,
         default=180,
-        help="Number of training shards (default: 180)"
+        help="Number of training shards (default: 180)",
     )
     parser.add_argument(
         "--test-shards",
         type=int,
         default=20,
-        help="Number of test shards (default: 20)"
+        help="Number of test shards (default: 20)",
     )
 
     args = parser.parse_args()
 
     shards_per_split = {
-        'train': args.train_shards,
-        'test': args.test_shards,
+        "train": args.train_shards,
+        "test": args.test_shards,
     }
 
     shard_parquet(

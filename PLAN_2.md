@@ -72,9 +72,9 @@ packet_error_count: int64  - Packet error count (dataset artifact, not used)
 **Current:** Single 1.1GB file
 **Target:** 200 shards for better shuffling and parallelism
 
-**Implementation:** `scripts/shard_parquet.py`
+**Implementation:** `scripts/data/shard_parquet.py`
 ```bash
-python scripts/shard_parquet.py \
+python scripts/data/shard_parquet.py \
   --input data/training_data.parquet \
   --output data/sharded \
   --train-shards 180 \    # 90% train (~500k rows/shard)
@@ -906,8 +906,8 @@ Total: ~4-5GB (fits comfortably in 40GB A100)
   - [ ] Merge SrcIp/DstIp with IPv4/IPv6 tokens
   - [ ] Add `<Failed>` token for failed probes
   - [ ] Remove msm_id, size, error_count encodings
-- [ ] Update `scripts/test_tokenization_standalone.py` for new scheme
-- [ ] Create `scripts/verify_tokenization.py` to validate:
+- [ ] Update `scripts/tests/test_tokenization_standalone.py` for new scheme
+- [ ] Create `scripts/data/verify_tokenization.py` to validate:
   - [ ] Token counts (23 for IPv4 first, 16 for subsequent)
   - [ ] RTT encoding/decoding accuracy (±0.1% error)
   - [ ] Delta timestamp coverage (95%+ use 1-byte)
@@ -971,7 +971,7 @@ Total: ~4-5GB (fits comfortably in 40GB A100)
 ### Phase 2: Dataset Preparation
 
 **Tasks:**
-- [ ] Run `scripts/shard_parquet.py`:
+- [ ] Run `scripts/data/shard_parquet.py`:
   - [ ] Create 200 train shards
   - [ ] Create 25 val shards
   - [ ] Create 25 test shards
@@ -1015,7 +1015,7 @@ Total: ~4-5GB (fits comfortably in 40GB A100)
 ### Phase 4: SLURM Single-GPU Training
 
 **Tasks:**
-- [ ] Update `scripts/slurm_train_maxtext.sh`:
+- [ ] Update `scripts/train/slurm_train_maxtext.sh`:
   - [ ] Configure single A100 job (40GB or 80GB)
   - [ ] Set data paths for cluster storage
   - [ ] Add TensorBoard logging

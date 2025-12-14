@@ -12,45 +12,56 @@ base_config: decoupled_base_test.yml
 
 # Run configuration
 run_name: latency_network_training
-base_output_directory: /home/zyansheep/Projects/ping-llm/outputs/latency_network
+base_output_directory: outputs/latency_network
 
-# Model architecture - small 100M param decoder-only transformer
-vocab_size: 266  # 10 role tokens + 256 byte tokens
-num_decoder_layers: 12
-emb_dim: 768
-num_query_heads: 12
-num_kv_heads: 12
-head_dim: 64
-mlp_dim: 3072
+# Model architecture - PLAN_2: ~95M param decoder-only transformer
+# Optimized for generalization (deep + narrow MLP ratio)
+vocab_size: 267  # 11 role tokens + 256 byte tokens (PLAN_2)
+num_decoder_layers: 20  # Deep for multi-step reasoning (inverse search)
+emb_dim: 640  # Optimized for small vocab
+num_query_heads: 10  # 640 / 64 = 10 heads
+num_kv_heads: 10  # Standard attention (not MQA/GQA)
+head_dim: 64  # Standard head dimension
+mlp_dim: 2048  # 3.2x ratio (vs standard 4x) for generalization
 max_target_length: 1024
 max_prefill_predict_length: 1024
 
-# Training
+# Training - PLAN_2 hyperparameters
 steps: 200000
-per_device_batch_size: 8
-learning_rate: 3.0e-4
+per_device_batch_size: 32  # Batch size for single A100 (PLAN_2)
+learning_rate: 3.0e-4  # Standard for small-medium models
+learning_rate_schedule: "cosine"
+warmup_steps: 2000
 adam_b1: 0.9
 adam_b2: 0.999
 adam_eps: 1.0e-8
+adam_eps_root: 0.0
+weight_decay: 0.01
 dropout_rate: 0.1
 
 # Checkpointing
 enable_checkpointing: true
 checkpoint_period: 5000
 
-# Logging
-log_period: 100
-eval_interval: 1000
-eval_steps: 100
+# Logging & Monitoring
+log_period: 100           # Log metrics every 100 steps
+eval_interval: 1000       # Evaluate every 1000 steps
+eval_steps: 100           # Run 100 eval steps
+enable_tensorboard: true  # Enable TensorBoard logging
+tensorboard_dir: ""       # Auto-set to base_output_directory/tensorboard
 
 # Dataset
-# For Phase 2 testing, use synthetic data (no real data loading)
-# Later: dataset_type: "grain" with custom DataSource
-dataset_type: "synthetic"
+# Using Grain pipeline with sharded parquet files (200M rows, 180 train + 20 test shards)
+dataset_type: "grain"
+grain_file_type: "parquet"  # Use parquet data source (not arrayrecord)
+grain_train_files: "data/sharded/train/*.parquet"
+grain_eval_files: "data/sharded/test/*.parquet"
+grain_worker_count: 16  # Parallel data loading workers
 
-# Attention
+# Attention & Positional Encoding
 attention: "dot_product"
 scan_layers: true
+position_embedding: "rope"  # RoPE for relative position encoding (PLAN_2)
 
 # Precision
 dtype: "bfloat16"
