@@ -29,6 +29,7 @@ import grain.python as grain
 from MaxText.utils import gcs_utils
 from MaxText.input_pipeline import _input_pipeline_utils
 from MaxText.input_pipeline import _grain_tokenizer
+from MaxText.input_pipeline import _network_grain_integration  # Custom network data
 from MaxText import multihost_dataloading
 from MaxText import max_logging
 from MaxText import tokenizer
@@ -185,8 +186,13 @@ def get_datasets(
     if shuffle:
       dataset = grain.experimental.WindowShuffleIterDataset(dataset, window_size=100, seed=shuffle_seed)
     return dataset
+  elif data_file_type == "network_parquet":
+    # Custom network measurement data pipeline (PLAN_2)
+    max_logging.log(f"Using custom network measurement data pipeline")
+    # This will be handled at a higher level - return None to signal custom handling
+    return None
   else:
-    raise ValueError(f"grain pipeline supports (arrayrecord, parquet) as grain_file_type, but got {data_file_type}")
+    raise ValueError(f"grain pipeline supports (arrayrecord, parquet, network_parquet) as grain_file_type, but got {data_file_type}")
 
 
 def pretrain_preprocessing_pipeline(
@@ -353,7 +359,23 @@ def make_grain_train_iterator(
         grain_data_source_max_workers=config.grain_data_source_max_workers,
         mixture_config_path=config.grain_train_mixture_config_path,
     )
-    if config.use_dpo:
+
+    # Custom network measurement data pipeline (PLAN_2)
+    if train_ds is None and config.grain_file_type == "network_parquet":
+      max_logging.log("Creating custom network measurement dataset...")
+      train_dataloader = _network_grain_integration.create_network_measurement_dataset(
+          data_file_pattern=config.grain_train_files,
+          batch_size=config.global_batch_size_to_load // jax.process_count(),
+          max_tokens=config.max_target_length,
+          shuffle=config.enable_data_shuffling,
+          shuffle_seed=config.data_shuffle_seed,
+          num_epoch=config.num_epoch,
+          dataloading_host_index=process_indices.index(jax.process_index()),
+          dataloading_host_count=len(process_indices),
+          grain_worker_count=config.grain_worker_count,
+          grain_per_worker_buffer_size=config.grain_per_worker_buffer_size,
+      )
+    elif config.use_dpo:
       train_dataloader = dpo_preprocessing_pipeline(
           train_ds,
           config,
@@ -450,7 +472,23 @@ def make_grain_eval_iterator(
         grain_prefetch_buffer_size=config.grain_prefetch_buffer_size_eval,
         grain_data_source_max_workers=config.grain_data_source_max_workers,
     )
-    if config.use_dpo:
+
+    # Custom network measurement data pipeline (PLAN_2)
+    if eval_ds is None and config.grain_file_type == "network_parquet":
+      max_logging.log("Creating custom network measurement eval dataset...")
+      eval_dataloader = _network_grain_integration.create_network_measurement_dataset(
+          data_file_pattern=config.grain_eval_files,
+          batch_size=config.global_batch_size_to_load_eval // jax.process_count(),
+          max_tokens=config.max_target_length,
+          shuffle=False,  # No shuffle for eval
+          shuffle_seed=config.data_shuffle_seed,
+          num_epoch=1,
+          dataloading_host_index=process_indices.index(jax.process_index()),
+          dataloading_host_count=len(process_indices),
+          grain_worker_count=config.grain_worker_count_eval,
+          grain_per_worker_buffer_size=config.grain_per_worker_buffer_size_eval,
+      )
+    elif config.use_dpo:
       eval_dataloader = dpo_preprocessing_pipeline(
           eval_ds,
           config,
