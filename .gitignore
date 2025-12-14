@@ -151,3 +151,4 @@ gha-creds-*.json
 
 # data folder
 data/
+outputs/

@@ -7,7 +7,12 @@
       "Bash(uv pip install:*)",
       "Bash(python:*)",
       "Bash(.venv/bin/python:*)",
-      "Bash(ls:*)"
+      "Bash(ls:*)",
+      "Bash(uv venv:*)",
+      "Bash(DECOUPLE_GCLOUD=TRUE .venv/bin/python:*)",
+      "Bash(JOB_INDEX=0 NUM_PROCESSES=1 DECOUPLE_GCLOUD=TRUE .venv/bin/python:*)",
+      "Bash(JOB_INDEX=0 JOB_COMPLETION_INDEX=0 NUM_PROCESSES=1 PROCESS_COUNT=1 DECOUPLE_GCLOUD=TRUE .venv/bin/python:*)",
+      "Bash(bash:*)"
     ]
   }
 }

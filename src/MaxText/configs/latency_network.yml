@@ -1,0 +1,62 @@
+# Network Latency Measurement Training Config
+#
+# This config trains a decoder-only transformer on network ping measurements.
+# Dataset: 100M rows of RIPE Atlas measurements with IPv4/IPv6 addresses and RTT data
+#
+# Usage:
+#   DECOUPLE_GCLOUD=TRUE python -m MaxText.train src/MaxText/configs/latency_network.yml \
+#     run_name=latency_test steps=5
+
+# Inherit from decoupled base for local/CPU testing
+base_config: decoupled_base_test.yml
+
+# Run configuration
+run_name: latency_network_training
+base_output_directory: /home/zyansheep/Projects/ping-llm/outputs/latency_network
+
+# Model architecture - small 100M param decoder-only transformer
+vocab_size: 266  # 10 role tokens + 256 byte tokens
+num_decoder_layers: 12
+emb_dim: 768
+num_query_heads: 12
+num_kv_heads: 12
+head_dim: 64
+mlp_dim: 3072
+max_target_length: 1024
+max_prefill_predict_length: 1024
+
+# Training
+steps: 200000
+per_device_batch_size: 8
+learning_rate: 3.0e-4
+adam_b1: 0.9
+adam_b2: 0.999
+adam_eps: 1.0e-8
+dropout_rate: 0.1
+
+# Checkpointing
+enable_checkpointing: true
+checkpoint_period: 5000
+
+# Logging
+log_period: 100
+eval_interval: 1000
+eval_steps: 100
+
+# Dataset
+# For Phase 2 testing, use synthetic data (no real data loading)
+# Later: dataset_type: "grain" with custom DataSource
+dataset_type: "synthetic"
+
+# Attention
+attention: "dot_product"
+scan_layers: true
+
+# Precision
+dtype: "bfloat16"
+
+# Hardware (override via CLI: hardware=cpu or hardware=gpu)
+hardware: "cpu"
+
+# Skip distributed JAX setup for single-process local testing
+skip_jax_distributed_system: true
