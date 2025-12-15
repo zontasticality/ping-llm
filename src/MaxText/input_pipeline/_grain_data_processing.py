@@ -186,13 +186,13 @@ def get_datasets(
     if shuffle:
       dataset = grain.experimental.WindowShuffleIterDataset(dataset, window_size=100, seed=shuffle_seed)
     return dataset
-  elif data_file_type == "network_parquet":
+  elif data_file_type in ("network_parquet", "network_arrayrecord"):
     # Custom network measurement data pipeline (PLAN_2)
-    max_logging.log(f"Using custom network measurement data pipeline")
+    max_logging.log(f"Using custom network measurement data pipeline ({data_file_type})")
     # This will be handled at a higher level - return None to signal custom handling
     return None
   else:
-    raise ValueError(f"grain pipeline supports (arrayrecord, parquet, network_parquet) as grain_file_type, but got {data_file_type}")
+    raise ValueError(f"grain pipeline supports (arrayrecord, parquet, network_parquet, network_arrayrecord) as grain_file_type, but got {data_file_type}")
 
 
 def pretrain_preprocessing_pipeline(
@@ -361,12 +361,14 @@ def make_grain_train_iterator(
     )
 
     # Custom network measurement data pipeline (PLAN_2)
-    if train_ds is None and config.grain_file_type == "network_parquet":
-      max_logging.log("Creating custom network measurement dataset...")
+    if train_ds is None and config.grain_file_type in ("network_parquet", "network_arrayrecord"):
+      use_arrayrecord = config.grain_file_type == "network_arrayrecord"
+      max_logging.log(f"Creating custom network measurement dataset ({config.grain_file_type})...")
       train_dataloader = _network_grain_integration.create_network_measurement_dataset(
           data_file_pattern=config.grain_train_files,
           batch_size=config.global_batch_size_to_load // jax.process_count(),
           max_tokens=config.max_target_length,
+          use_arrayrecord=use_arrayrecord,
           shuffle=config.enable_data_shuffling,
           shuffle_seed=config.data_shuffle_seed,
           num_epoch=config.num_epoch,
@@ -474,12 +476,14 @@ def make_grain_eval_iterator(
     )
 
     # Custom network measurement data pipeline (PLAN_2)
-    if eval_ds is None and config.grain_file_type == "network_parquet":
-      max_logging.log("Creating custom network measurement eval dataset...")
+    if eval_ds is None and config.grain_file_type in ("network_parquet", "network_arrayrecord"):
+      use_arrayrecord = config.grain_file_type == "network_arrayrecord"
+      max_logging.log(f"Creating custom network measurement eval dataset ({config.grain_file_type})...")
       eval_dataloader = _network_grain_integration.create_network_measurement_dataset(
           data_file_pattern=config.grain_eval_files,
           batch_size=config.global_batch_size_to_load_eval // jax.process_count(),
           max_tokens=config.max_target_length,
+          use_arrayrecord=use_arrayrecord,
           shuffle=False,  # No shuffle for eval
           shuffle_seed=config.data_shuffle_seed,
           num_epoch=1,

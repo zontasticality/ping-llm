@@ -18,7 +18,8 @@ import os
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '../../..'))
 
 import grain.python as grain
-from network_grain_datasource import create_grain_pipeline
+from network_grain_datasource import create_grain_pipeline as create_parquet_pipeline
+from network_grain_datasource_arrayrecord import create_grain_pipeline as create_arrayrecord_pipeline
 from MaxText import max_logging
 
 
@@ -35,6 +36,7 @@ def create_network_measurement_dataset(
     grain_per_worker_buffer_size: int = 2,
     window_size: int = 64,
     window_stride: int = None,
+    use_arrayrecord: bool = False,
 ) -> grain.IterDataset:
     """
     Create full PLAN_2 Grain dataset for network measurements.
@@ -63,7 +65,7 @@ def create_network_measurement_dataset(
     Returns:
         Grain IterDataset ready for MaxText training
     """
-    # Find parquet files
+    # Find data files (Parquet or ArrayRecord)
     import glob
     from pathlib import Path
 
@@ -73,9 +75,11 @@ def create_network_measurement_dataset(
         data_files = sorted(glob.glob(str(Path(data_file_pattern).expanduser().resolve())))
 
     if not data_files:
-        raise FileNotFoundError(f"No parquet files found matching pattern: {data_file_pattern}")
+        file_type = "ArrayRecord" if use_arrayrecord else "Parquet"
+        raise FileNotFoundError(f"No {file_type} files found matching pattern: {data_file_pattern}")
 
-    max_logging.log(f"[PLAN_2] Found {len(data_files)} parquet files for network measurements")
+    file_type = "ArrayRecord" if use_arrayrecord else "Parquet"
+    max_logging.log(f"[PLAN_2] Found {len(data_files)} {file_type} files for network measurements")
     max_logging.log(f"[PLAN_2] Window size: {window_size} measurements per context")
     max_logging.log(f"[PLAN_2] Training modes: 40% full_timestamp, 30% no_timestamp, 30% mixed")
 
@@ -91,18 +95,32 @@ def create_network_measurement_dataset(
         data_files = data_files[dataloading_host_index::dataloading_host_count]
         max_logging.log(f"[PLAN_2] This host will process {len(data_files)} files")
 
-    # Create full PLAN_2 pipeline
-    dataset = create_grain_pipeline(
-        parquet_files=data_files,
-        batch_size=batch_size,
-        window_size=window_size,
-        max_tokens=max_tokens,
-        shuffle=shuffle,
-        shuffle_seed=shuffle_seed,
-        num_workers=grain_worker_count,  # Use 0 to disable multithreading (fixed bug: was max(1, grain_worker_count))
-        window_stride=window_stride,
-        cache_size=4,  # LRU cache size for parquet files
-    )
+    # Create full PLAN_2 pipeline (Parquet or ArrayRecord)
+    if use_arrayrecord:
+        max_logging.log(f"[PLAN_2] Using ArrayRecord (fast random access!)")
+        dataset = create_arrayrecord_pipeline(
+            arrayrecord_files=data_files,
+            batch_size=batch_size,
+            window_size=window_size,
+            max_tokens=max_tokens,
+            shuffle=shuffle,
+            shuffle_seed=shuffle_seed,
+            num_workers=grain_worker_count,
+            window_stride=window_stride,
+        )
+    else:
+        max_logging.log(f"[PLAN_2] Using Parquet (consider converting to ArrayRecord for 10-100× faster data loading)")
+        dataset = create_parquet_pipeline(
+            parquet_files=data_files,
+            batch_size=batch_size,
+            window_size=window_size,
+            max_tokens=max_tokens,
+            shuffle=shuffle,
+            shuffle_seed=shuffle_seed,
+            num_workers=grain_worker_count,
+            window_stride=window_stride,
+            cache_size=512,  # LRU cache size for parquet files
+        )
 
     max_logging.log(f"[PLAN_2] Network measurement dataset created successfully")
     max_logging.log(f"[PLAN_2] Features: window-based sampling, 40/30/30 training modes, delta timestamps")

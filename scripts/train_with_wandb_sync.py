@@ -132,10 +132,11 @@ def main():
     parser.add_argument("--entity", default=None, help="Wandb entity (team name)")
     parser.add_argument("--name", default=None, help="Run name (auto-generated if not provided)")
     parser.add_argument("--tags", nargs="+", default=[], help="Wandb tags")
-    parser.add_argument("--steps", type=int, default=200000, help="Training steps")
-    parser.add_argument("--batch-size", type=int, default=32, help="Per-device batch size")
-    parser.add_argument("--hardware", default="gpu", choices=["gpu", "cpu"], help="Hardware to use")
-    parser.add_argument("--enable-checkpointing", action="store_true", help="Enable checkpointing")
+    parser.add_argument("--steps", type=int, default=None, help="Training steps (default: from config)")
+    parser.add_argument("--batch-size", type=int, default=None, help="Per-device batch size (default: from config)")
+    parser.add_argument("--hardware", default=None, choices=["gpu", "cpu", None], help="Hardware to use (default: from config)")
+    parser.add_argument("--enable-checkpointing", type=lambda x: x.lower() == 'true', default=None,
+                        help="Enable checkpointing: true/false (default: from config)")
     parser.add_argument("--wandb-mode", default="online", choices=["online", "offline", "disabled"],
                         help="Wandb mode")
     args = parser.parse_args()
@@ -153,6 +154,20 @@ def main():
     # Load config
     print(f"Loading config: {args.config}")
     config = load_config(args.config)
+
+    # Use config values as defaults if not provided via command line
+    steps = args.steps if args.steps is not None else config.get('steps', 200000)
+    batch_size = args.batch_size if args.batch_size is not None else config.get('per_device_batch_size', 32)
+    hardware = args.hardware if args.hardware is not None else config.get('hardware', 'gpu')
+    enable_checkpointing = args.enable_checkpointing if args.enable_checkpointing is not None else config.get('enable_checkpointing', False)
+    checkpoint_period = config.get('checkpoint_period', 5000)
+
+    print(f"Configuration:")
+    print(f"  Steps: {steps} {'(from config)' if args.steps is None else '(from CLI)'}")
+    print(f"  Batch size: {batch_size} {'(from config)' if args.batch_size is None else '(from CLI)'}")
+    print(f"  Hardware: {hardware} {'(from config)' if args.hardware is None else '(from CLI)'}")
+    print(f"  Checkpointing: {enable_checkpointing} {'(from config)' if args.enable_checkpointing is None else '(from CLI)'}")
+    print(f"  Checkpoint period: {checkpoint_period} steps")
 
     # Get peak TFLOPs for MFU calculation
     peak_tflops = get_peak_tflops()
@@ -178,10 +193,11 @@ def main():
         mode=args.wandb_mode,
         config={
             **config,
-            "steps": args.steps,
-            "per_device_batch_size": args.batch_size,
-            "hardware": args.hardware,
-            "enable_checkpointing": args.enable_checkpointing,
+            "steps": steps,
+            "per_device_batch_size": batch_size,
+            "hardware": hardware,
+            "enable_checkpointing": enable_checkpointing,
+            "checkpoint_period": checkpoint_period,
             "peak_tflops_bf16": peak_tflops if peak_tflops else "unknown",
         },
         tags=["maxtext", "plan2", "network-measurement"] + args.tags,
@@ -207,10 +223,10 @@ def main():
         args.config,
         f"run_name={run_name}",
         f"base_output_directory={output_dir}",  # Absolute path for Orbax
-        f"hardware={args.hardware}",
-        f"steps={args.steps}",
-        f"per_device_batch_size={args.batch_size}",
-        f"enable_checkpointing={'true' if args.enable_checkpointing else 'false'}",
+        f"hardware={hardware}",
+        f"steps={steps}",
+        f"per_device_batch_size={batch_size}",
+        f"enable_checkpointing={'true' if enable_checkpointing else 'false'}",
     ]
 
     # Set environment variables
@@ -253,7 +269,6 @@ def main():
         # Track timing for ETA calculation
         from collections import deque
         step_times = deque(maxlen=50)  # Track last 50 step times for moving average
-        checkpoint_period = 5000  # From config (TODO: parse from config if needed)
 
         # Stream output and parse for metrics
         for line in process.stdout:
@@ -306,7 +321,7 @@ def main():
                     # Calculate and print ETA
                     if step_times and step > 0:
                         avg_step_time = sum(step_times) / len(step_times)
-                        remaining_steps = args.steps - step - 1
+                        remaining_steps = steps - step - 1
                         eta_seconds = remaining_steps * avg_step_time
 
                         # Time to next checkpoint
@@ -330,7 +345,7 @@ def main():
                         checkpoint_eta_str = format_time(checkpoint_eta_seconds)
 
                         # Print enhanced progress
-                        print(f"  → Step {step+1}/{args.steps} | ETA: {eta_str} | Next checkpoint: {checkpoint_eta_str}")
+                        print(f"  → Step {step+1}/{steps} | ETA: {eta_str} | Next checkpoint: {checkpoint_eta_str}")
 
                         # Log ETAs to wandb
                         metrics["train/eta_seconds"] = eta_seconds
@@ -361,7 +376,7 @@ def main():
         print("\n\n" + "="*80)
         print("⚠️  TRAINING INTERRUPTED BY USER (Ctrl+C)")
         print("="*80)
-        print("Note: MaxText saves checkpoints every 5000 steps.")
+        print(f"Note: MaxText saves checkpoints every {checkpoint_period} steps.")
         print("Your progress up to the last checkpoint is saved in:")
         print(f"  {config.get('base_output_directory', 'outputs/latency_network')}/checkpoints/")
         print("You can resume training from the last checkpoint.")

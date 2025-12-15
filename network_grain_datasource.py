@@ -428,7 +428,7 @@ def create_grain_pipeline(
     dataset = dataset.to_iter_dataset(
         read_options=grain.ReadOptions(
             num_threads=num_workers,
-            prefetch_buffer_size=2,
+            prefetch_buffer_size=16,
         )
     )
 

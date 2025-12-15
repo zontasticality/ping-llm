@@ -56,18 +56,22 @@ dataset_type: "grain"
 grain_file_type: "network_parquet"  # Use custom network measurement data source
 grain_train_files: "data/sharded/train/*.parquet"
 grain_eval_files: "data/sharded/test/*.parquet"
-grain_worker_count: 64  # Use 64 CPU cores - overfeed the GPU! (thread-safety fixed!)
+grain_worker_count: 16  # Use 64 CPU cores - overfeed the GPU! (thread-safety fixed!)
 
 # Attention & Positional Encoding
-attention: "dot_product"
+attention: "autoselected"  # Auto-selects best attention for hardware (flash on GPU, falls back if needed)
 scan_layers: true
 position_embedding: "rope"  # RoPE for relative position encoding (PLAN_2)
 
 # Precision
 dtype: "bfloat16"
 
+# GPU Optimizations
+use_iota_embed: true  # Memory-efficient embeddings
+remat_policy: "minimal_with_context"  # Optimized for small models (less recomputation than "full")
+
 # Hardware (override via CLI: hardware=cpu or hardware=gpu)
-hardware: "cpu"
+hardware: "gpu"  # Set to GPU for production training
 
 # Skip distributed JAX setup for single-process local testing
 skip_jax_distributed_system: true
