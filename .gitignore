@@ -154,3 +154,4 @@ gha-creds-*.json
 /outputs/
 /wandb/
 /node_modules/
+/.venv_old
