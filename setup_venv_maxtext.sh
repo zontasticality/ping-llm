@@ -32,10 +32,11 @@ echo "2. Upgrading pip and uv..."
 pip install --upgrade pip
 pip install uv
 
-# Install MaxText via uv (with resolution strategy)
+# Install MaxText from source (editable mode with cuda12 dependencies)
+# This ensures we get the correct dependencies for the local source code
 echo ""
-echo "3. Installing MaxText from PyPI..."
-uv pip install maxtext --resolution=lowest
+echo "3. Installing MaxText from source (editable mode)..."
+uv pip install -e .[cuda12] --resolution=lowest
 echo "   Running install_maxtext_github_deps..."
 install_maxtext_github_deps
 
@@ -65,10 +66,9 @@ python -c "import grain; print(f'  Grain version: {grain.__version__}')"
 python -c "import pyarrow; print(f'  PyArrow version: {pyarrow.__version__}')"
 python -c "import wandb; print(f'  Wandb version: {wandb.__version__}')"
 
-# Check if we can import MaxText
+# Check if we can import MaxText (installed in editable mode, no PYTHONPATH needed)
 echo ""
 echo "8. Testing MaxText import..."
-export PYTHONPATH=src:${PYTHONPATH:-}
 python -c "from MaxText import train; print('  MaxText import: ✓')"
 
 # Freeze dependencies for reproducibility
@@ -90,7 +90,6 @@ echo "  4. Run CPU smoke test (see VENV_SETUP_PLAN.md Step 2)"
 echo ""
 echo "Quick smoke test:"
 echo "  source .venv/bin/activate"
-echo "  export PYTHONPATH=src:\${PYTHONPATH:-}"
 echo "  DECOUPLE_GCLOUD=TRUE python -m MaxText.train \\"
 echo "    src/MaxText/configs/latency_network.yml \\"
 echo "    hardware=cpu steps=10 per_device_batch_size=2"

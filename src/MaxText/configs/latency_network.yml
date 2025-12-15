@@ -52,11 +52,14 @@ tensorboard_dir: ""       # Auto-set to base_output_directory/tensorboard
 
 # Dataset
 # Using Grain pipeline with sharded parquet files (200M rows, 180 train + 20 test shards)
+# Note: SLURM allocates 16 CPU cores + 60GB RAM. Data (~1.8GB) is eagerly loaded into memory
+# at startup, eliminating disk I/O during training.
 dataset_type: "grain"
 grain_file_type: "network_parquet"  # Use custom network measurement data source
 grain_train_files: "data/sharded/train/*.parquet"
 grain_eval_files: "data/sharded/test/*.parquet"
-grain_worker_count: 64  # Use 64 CPU cores - overfeed the GPU! (thread-safety fixed!)
+grain_worker_count: 12  # Use 12 workers (out of 16 cores, leaving 4 for GPU/system)
+grain_per_worker_buffer_size: 8  # Aggressive prefetching with 16 cores available
 
 # Attention & Positional Encoding
 attention: "dot_product"

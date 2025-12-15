@@ -32,11 +32,12 @@ class ParquetMeasurementDataSource(grain.RandomAccessDataSource):
     This is critical for datasets with 180+ shards (180M rows total).
     """
 
-    def __init__(self, parquet_files: List[str], cache_size: int = 4):
+    def __init__(self, parquet_files: List[str], cache_size: int = 4, eager_load: bool = False):
         """
         Args:
             parquet_files: List of paths to Parquet shard files
             cache_size: Number of parquet files to keep in memory (default: 4)
+            eager_load: If True, load all files into memory at initialization (default: False)
         """
         self.parquet_files = sorted(parquet_files)  # Sort for deterministic ordering
         self._file_row_counts = []
@@ -47,14 +48,26 @@ class ParquetMeasurementDataSource(grain.RandomAccessDataSource):
         self._cache_size = cache_size
         self._cache_lock = threading.Lock()  # Thread-safe cache access for grain workers
 
-        # Get row counts WITHOUT loading full tables (memory efficient)
-        for parquet_file in self.parquet_files:
-            # Just read metadata, not the full table
+        # Determine if we should eager load (all files fit in cache)
+        self._eager_load = eager_load or (cache_size >= len(parquet_files))
+
+        # Get row counts and optionally preload tables
+        for file_idx, parquet_file in enumerate(self.parquet_files):
+            # Read metadata first
             metadata = pq.read_metadata(parquet_file)
             row_count = metadata.num_rows
             self._file_row_counts.append(row_count)
             self._total_rows += row_count
             self._row_offsets.append(self._total_rows)
+
+            # If eager loading, preload all files into memory
+            if self._eager_load:
+                table = pq.read_table(parquet_file)
+                self._cache[file_idx] = table
+                self._cache_order.append(file_idx)
+
+        if self._eager_load:
+            print(f"[EAGER LOAD] Preloaded {len(self.parquet_files)} parquet files ({self._total_rows:,} rows) into memory")
 
     def __len__(self):
         return self._total_rows
@@ -139,6 +152,7 @@ class WindowedMeasurementDataSource(grain.RandomAccessDataSource):
         window_size: int = 64,
         stride: Optional[int] = None,
         cache_size: int = 4,
+        eager_load: bool = False,
     ):
         """
         Args:
@@ -146,8 +160,9 @@ class WindowedMeasurementDataSource(grain.RandomAccessDataSource):
             window_size: Number of measurements per context window (default: 64)
             stride: Step size between windows. If None, defaults to window_size (non-overlapping)
             cache_size: Number of parquet files to cache in memory
+            eager_load: If True, preload all parquet files into memory at initialization
         """
-        self.base_source = ParquetMeasurementDataSource(parquet_files, cache_size=cache_size)
+        self.base_source = ParquetMeasurementDataSource(parquet_files, cache_size=cache_size, eager_load=eager_load)
         self.window_size = window_size
         self.stride = stride if stride is not None else window_size
 
@@ -375,6 +390,8 @@ def create_grain_pipeline(
     num_workers: int = 4,
     window_stride: Optional[int] = None,
     cache_size: int = 4,
+    eager_load: bool = False,
+    prefetch_buffer_size: int = 2,
 ) -> grain.IterDataset:
     """
     Create full PLAN_2 Grain data pipeline for network measurements.
@@ -395,6 +412,8 @@ def create_grain_pipeline(
         num_workers: Number of worker threads for data loading
         window_stride: Step between windows (default: window_size for non-overlapping)
         cache_size: Number of parquet files to cache in memory
+        eager_load: If True, preload all parquet files into memory at initialization
+        prefetch_buffer_size: Size of prefetch buffer for each worker thread
 
     Returns:
         Grain IterDataset ready for MaxText training
@@ -405,6 +424,7 @@ def create_grain_pipeline(
         window_size=window_size,
         stride=window_stride,
         cache_size=cache_size,
+        eager_load=eager_load,
     )
 
     # Wrap in MapDataset
@@ -428,7 +448,7 @@ def create_grain_pipeline(
     dataset = dataset.to_iter_dataset(
         read_options=grain.ReadOptions(
             num_threads=num_workers,
-            prefetch_buffer_size=2,
+            prefetch_buffer_size=prefetch_buffer_size,
         )
     )
 

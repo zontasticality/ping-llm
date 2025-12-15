@@ -136,6 +136,7 @@ def main():
     parser.add_argument("--batch-size", type=int, default=32, help="Per-device batch size")
     parser.add_argument("--hardware", default="gpu", choices=["gpu", "cpu"], help="Hardware to use")
     parser.add_argument("--enable-checkpointing", action="store_true", help="Enable checkpointing")
+    parser.add_argument("--no-resume", action="store_true", help="Start fresh training even if checkpoints exist")
     parser.add_argument("--wandb-mode", default="online", choices=["online", "offline", "disabled"],
                         help="Wandb mode")
     args = parser.parse_args()
@@ -202,6 +203,24 @@ def main():
     # Use absolute path for base_output_directory to fix Orbax checkpoint error
     output_dir = (project_root / "outputs" / "latency_network" / run_name).resolve()
 
+    # Auto-resume: Check for existing checkpoints (unless --no-resume is set)
+    checkpoint_path = None
+    if not args.no_resume:
+        checkpoints_dir = output_dir / run_name / "checkpoints"
+        if checkpoints_dir.exists():
+            # Find the most recent checkpoint (highest numbered directory)
+            checkpoint_dirs = sorted([d for d in checkpoints_dir.iterdir() if d.is_dir()],
+                                    key=lambda x: int(x.name) if x.name.isdigit() else -1)
+            if checkpoint_dirs:
+                latest_checkpoint = checkpoint_dirs[-1]
+                checkpoint_path = str(latest_checkpoint)
+                print(f"✓ Found existing checkpoint: {checkpoint_path}")
+                print(f"  Resuming training from step {latest_checkpoint.name}")
+                print()
+    elif args.no_resume:
+        print("ℹ  --no-resume flag set: Starting fresh training (ignoring existing checkpoints)")
+        print()
+
     maxtext_cmd = [
         "python", "-m", "MaxText.train",
         args.config,
@@ -212,6 +231,12 @@ def main():
         f"per_device_batch_size={args.batch_size}",
         f"enable_checkpointing={'true' if args.enable_checkpointing else 'false'}",
     ]
+
+    # Add checkpoint loading if we found one
+    if checkpoint_path:
+        maxtext_cmd.append(f"load_full_state_path={checkpoint_path}")
+        print(f"  → Resuming from: {checkpoint_path}")
+        print()
 
     # Set environment variables
     env = os.environ.copy()

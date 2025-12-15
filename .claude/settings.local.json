@@ -30,7 +30,20 @@
       "Bash(cat:*)",
       "Bash(getfacl:*)",
       "Bash(capsh --print:*)",
-      "WebSearch"
+      "WebSearch",
+      "Bash(PYTHONPATH=src python:*)",
+      "Bash(pip index:*)",
+      "Bash(grep:*)",
+      "Bash(pip show:*)",
+      "Bash(PYTHONPATH=src DECOUPLE_GCLOUD=TRUE timeout 30 python:*)",
+      "Bash(pip freeze:*)",
+      "Bash(DECOUPLE_GCLOUD=TRUE timeout 15 python:*)",
+      "Bash(lscpu:*)",
+      "Bash(taskset:*)",
+      "Bash(ulimit:*)",
+      "WebFetch(domain:docs.unity.rc.umass.edu)",
+      "Bash(scontrol show job:*)",
+      "Bash(sinfo:*)"
     ]
   },
   "sandbox": {

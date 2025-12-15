@@ -35,6 +35,7 @@ def create_network_measurement_dataset(
     grain_per_worker_buffer_size: int = 2,
     window_size: int = 64,
     window_stride: int = None,
+    cache_size: int = None,
 ) -> grain.IterDataset:
     """
     Create full PLAN_2 Grain dataset for network measurements.
@@ -59,6 +60,7 @@ def create_network_measurement_dataset(
         grain_per_worker_buffer_size: Buffer size per worker
         window_size: Number of measurements per context window (default: 64, per PLAN_2)
         window_stride: Step between windows (default: None = window_size for non-overlapping)
+        cache_size: Number of parquet files to cache in memory (default: None = all files)
 
     Returns:
         Grain IterDataset ready for MaxText training
@@ -91,6 +93,14 @@ def create_network_measurement_dataset(
         data_files = data_files[dataloading_host_index::dataloading_host_count]
         max_logging.log(f"[PLAN_2] This host will process {len(data_files)} files")
 
+    # Set cache_size to load all files if not specified (for maximum performance)
+    # With ~200 files @ 9MB each = ~1.8GB, easily fits in memory
+    if cache_size is None:
+        cache_size = len(data_files)
+        max_logging.log(f"[PLAN_2] Cache size set to {cache_size} (all files) for optimal performance")
+    else:
+        max_logging.log(f"[PLAN_2] Cache size set to {cache_size} (limited caching)")
+
     # Create full PLAN_2 pipeline
     dataset = create_grain_pipeline(
         parquet_files=data_files,
@@ -101,7 +111,9 @@ def create_network_measurement_dataset(
         shuffle_seed=shuffle_seed,
         num_workers=grain_worker_count,  # Use 0 to disable multithreading (fixed bug: was max(1, grain_worker_count))
         window_stride=window_stride,
-        cache_size=4,  # LRU cache size for parquet files
+        cache_size=cache_size,  # LRU cache size for parquet files (default: all files)
+        eager_load=True,  # Preload all files at initialization for maximum performance
+        prefetch_buffer_size=grain_per_worker_buffer_size,  # Buffer size per worker
     )
 
     max_logging.log(f"[PLAN_2] Network measurement dataset created successfully")
