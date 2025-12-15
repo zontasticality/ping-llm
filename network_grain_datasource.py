@@ -441,22 +441,24 @@ def create_grain_pipeline(
     )
     dataset = dataset.map(tokenizer)
 
-    # Batch
+    # Batch before converting to IterDataset (MapDataset batch operations are more efficient)
     dataset = dataset.batch(batch_size, drop_remainder=True)
 
-    # Apply multiprocessing prefetch for high-performance data loading
-    # This runs data loading + transformations in parallel worker processes
+    # Convert to IterDataset with ReadOptions for parallel data loading
+    # Using threading (ReadOptions) instead of multiprocessing (mp_prefetch) because:
+    # 1. Our data source uses threading.Lock which can't be pickled for multiprocessing
+    # 2. Eager-loaded data is already in memory, so threads can share it efficiently
+    # 3. This is the same approach used by MaxText for thread-safe data sources
     if num_workers > 0:
-        multiprocessing_options = grain.MultiprocessingOptions(
-            num_workers=num_workers,
-            per_worker_buffer_size=prefetch_buffer_size,
+        dataset = dataset.to_iter_dataset(
+            read_options=grain.ReadOptions(
+                num_threads=num_workers,
+                prefetch_buffer_size=prefetch_buffer_size,
+            )
         )
-        dataset = dataset.mp_prefetch(multiprocessing_options)
-        print(f"[GRAIN MP_PREFETCH] Using {num_workers} workers with buffer size {prefetch_buffer_size}")
+        print(f"[GRAIN THREADING] Using {num_workers} threads with buffer size {prefetch_buffer_size}")
     else:
+        dataset = dataset.to_iter_dataset()
         print(f"[GRAIN] Single-threaded mode (num_workers=0)")
-
-    # Convert to IterDataset (mp_prefetch handles the parallelism, so no ReadOptions needed)
-    dataset = dataset.to_iter_dataset()
 
     return dataset
