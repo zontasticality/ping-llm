@@ -444,12 +444,19 @@ def create_grain_pipeline(
     # Batch
     dataset = dataset.batch(batch_size, drop_remainder=True)
 
-    # Convert to IterDataset with multiprocessing
-    dataset = dataset.to_iter_dataset(
-        read_options=grain.ReadOptions(
-            num_threads=num_workers,
-            prefetch_buffer_size=prefetch_buffer_size,
+    # Apply multiprocessing prefetch for high-performance data loading
+    # This runs data loading + transformations in parallel worker processes
+    if num_workers > 0:
+        multiprocessing_options = grain.MultiprocessingOptions(
+            num_workers=num_workers,
+            per_worker_buffer_size=prefetch_buffer_size,
         )
-    )
+        dataset = dataset.mp_prefetch(multiprocessing_options)
+        print(f"[GRAIN MP_PREFETCH] Using {num_workers} workers with buffer size {prefetch_buffer_size}")
+    else:
+        print(f"[GRAIN] Single-threaded mode (num_workers=0)")
+
+    # Convert to IterDataset (mp_prefetch handles the parallelism, so no ReadOptions needed)
+    dataset = dataset.to_iter_dataset()
 
     return dataset

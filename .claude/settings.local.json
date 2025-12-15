@@ -43,7 +43,8 @@
       "Bash(ulimit:*)",
       "WebFetch(domain:docs.unity.rc.umass.edu)",
       "Bash(scontrol show job:*)",
-      "Bash(sinfo:*)"
+      "Bash(sinfo:*)",
+      "WebFetch(domain:developers.googleblog.com)"
     ]
   },
   "sandbox": {
