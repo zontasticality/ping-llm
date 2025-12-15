@@ -150,4 +150,7 @@ dmypy.json
 gha-creds-*.json
 
 # data folder
-data/
+/data/
+/outputs/
+/wandb/
+/node_modules/
