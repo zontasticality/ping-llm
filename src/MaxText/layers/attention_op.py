@@ -1354,7 +1354,7 @@ class AttentionOp(nnx.Module):
 
     # Initialize default attention configuration
     sliding_window_size = None
-    mask_type = "padding_causal"
+    mask_type = "causal"  # Use simple "causal" to avoid enum conversion issues in transformer_engine
     qkv_layout = "BSHD_BSHD_BSHD"  # Non-packed format: 'BS3HD', 'BSHD_BS2HD' or 'BSHD_BSHD_BSHD'
     max_segments_per_seq = 1  # max number of segments per sequence; for non-packed its 1
 
@@ -1381,15 +1381,17 @@ class AttentionOp(nnx.Module):
       mask_type = "causal"
     else:
       # Default case: no packing, no context parallelism
-      dummy_attn_mask = jnp.zeros((1, 1, 1, self.max_target_length, self.max_target_length), dtype=jnp.uint8)
-      attn_mask = self.generate_attention_mask(query, key, decoder_segment_ids, model_mode)
-      attn_mask = jnp.where((attn_mask >= DEFAULT_MASK_VALUE * 0.5), 0, 1).astype(jnp.uint8)
+      # BUG FIX: transformer_engine's DotProductAttention expects sequence_descriptor to be
+      # None or SequenceDescriptor, not a plain array. When attn_mask_type is set, masking is internal.
+      print(f"[ATTENTION_OP DEBUG] Using None for dummy_attn_mask and attn_mask (FIX APPLIED)")
+      dummy_attn_mask = None
+      attn_mask = None
 
     dpa_layer = DotProductAttention(
         head_dim=head_dim,
         num_attention_heads=self.num_query_heads,
         num_gqa_groups=self.num_kv_heads,
-        attn_mask_type=mask_type,  # 'no_mask', 'padding', 'causal', or 'padding_causal'
+        attn_mask_type=mask_type,  # 'no_mask', 'padding', 'causal', 'padding_causal', or 'causal_padding'
         attn_bias_type="no_bias",  # 'no_bias', 'pre_scale_bias' or 'post_scale_bias'
         attention_dropout=self.dropout_rate,
         dropout_rng_name="aqt",

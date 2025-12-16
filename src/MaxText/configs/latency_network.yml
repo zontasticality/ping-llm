@@ -55,6 +55,7 @@ tensorboard_dir: ""       # Auto-set to base_output_directory/tensorboard
 # Note: SLURM allocates 16 CPU cores + 60GB RAM. Data (~1.8GB) is eagerly loaded into memory
 # at startup, eliminating disk I/O during training.
 dataset_type: "grain"
+packing: False  # Disable packing to avoid SequenceDescriptor incompatibility with cudnn_flash_te
 grain_file_type: "network_parquet"  # Use custom network measurement data source
 grain_train_files: "data/sharded/train/*.parquet"
 grain_eval_files: "data/sharded/test/*.parquet"

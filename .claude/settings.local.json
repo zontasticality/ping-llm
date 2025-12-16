@@ -44,7 +44,18 @@
       "WebFetch(domain:docs.unity.rc.umass.edu)",
       "Bash(scontrol show job:*)",
       "Bash(sinfo:*)",
-      "WebFetch(domain:developers.googleblog.com)"
+      "WebFetch(domain:developers.googleblog.com)",
+      "Bash(modal app deploy:*)",
+      "Bash(modal --help:*)",
+      "Bash(modal deploy:*)",
+      "Bash(timeout 300 modal deploy:*)",
+      "Bash(tee:*)",
+      "WebFetch(domain:docs.astral.sh)",
+      "Bash(modal volume ls:*)",
+      "WebFetch(domain:modal.com)",
+      "WebFetch(domain:github.com)",
+      "WebFetch(domain:raw.githubusercontent.com)",
+      "Bash(git log:*)"
     ]
   },
   "sandbox": {
