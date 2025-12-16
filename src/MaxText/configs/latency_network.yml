@@ -41,7 +41,9 @@ dropout_rate: 0.1
 
 # Checkpointing
 enable_checkpointing: true
-checkpoint_period: 5000
+checkpoint_period: 1000  # Save checkpoint every 1000 steps
+save_checkpoint_on_completion: true  # Save final checkpoint when training completes/terminates
+# Note: train.py also saves checkpoint on KeyboardInterrupt/SystemExit to prevent data loss
 
 # Logging & Monitoring
 log_period: 100           # Log metrics every 100 steps

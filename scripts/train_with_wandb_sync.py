@@ -386,11 +386,24 @@ def main():
         print("\n\n" + "="*80)
         print("⚠️  TRAINING INTERRUPTED BY USER (Ctrl+C)")
         print("="*80)
-        print("Note: MaxText saves checkpoints every 5000 steps.")
-        print("Your progress up to the last checkpoint is saved in:")
-        print(f"  {config.get('base_output_directory', 'outputs/latency_network')}/checkpoints/")
-        print("You can resume training from the last checkpoint.")
-        print("="*80)
+        print("Sending interrupt signal to MaxText training process...")
+        print("Waiting for checkpoint save...")
+
+        # Send SIGINT (not SIGTERM) so Python can catch it as KeyboardInterrupt
+        # This allows MaxText's exception handler to save a checkpoint
+        import signal
+        process.send_signal(signal.SIGINT)
+
+        # Wait for the process to exit (with timeout)
+        try:
+            process.wait(timeout=120)  # Give it 2 minutes to save checkpoint
+            print("✓ Training process saved checkpoint and exited")
+        except subprocess.TimeoutExpired:
+            print("⚠️  Checkpoint save timed out, forcing termination...")
+            process.kill()
+            process.wait()
+
+        print("\n" + "="*80)
         wandb.log({"training_status": "interrupted"})
         wandb.finish()
         sys.exit(130)  # Standard exit code for SIGINT

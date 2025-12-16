@@ -489,6 +489,19 @@ def train_loop(config, recorder, state=None):
     if checkpoint_manager is not None:
       # in case the last checkpoint_period checkpoint is still in progress
       checkpoint_manager.wait_until_finished()
+  except (KeyboardInterrupt, SystemExit):
+    max_logging.log(f"\n{'='*80}")
+    max_logging.log(f"Training interrupted at step {step}. Saving checkpoint...")
+    max_logging.log(f"{'='*80}")
+    # Save checkpoint on interrupt so progress isn't lost
+    state_to_save = state if not config.use_dpo else _split_dpo_state(state)[0]
+    checkpointing.maybe_save_checkpoint(checkpoint_manager, state_to_save, config, data_iterator, step)
+    if checkpoint_manager is not None:
+      max_logging.log("Waiting for checkpoint to complete...")
+      checkpoint_manager.wait_until_finished()
+    max_logging.log(f"✓ Checkpoint saved at step {step}.")
+    max_logging.log(f"{'='*80}")
+    raise  # Re-raise to exit cleanly
   except exceptions.StopTraining as e:
     max_logging.log(f"Training stopped: {str(e)}")
   finally:

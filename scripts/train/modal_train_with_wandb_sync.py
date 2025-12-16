@@ -69,7 +69,9 @@ image = (
     .add_local_file("README.md", f"{WORKDIR}/README.md", copy=True)
     .add_local_file("build_hooks.py", f"{WORKDIR}/build_hooks.py", copy=True)
     .add_local_dir("dependencies", f"{WORKDIR}/dependencies", copy=True)
-    .add_local_file("src/MaxText/__init__.py", f"{WORKDIR}/src/MaxText/__init__.py", copy=True)  # Only __init__.py for version
+    .add_local_file(
+        "src/MaxText/__init__.py", f"{WORKDIR}/src/MaxText/__init__.py", copy=True
+    )  # Only __init__.py for version
     .add_local_dir(
         "src/install_maxtext_extra_deps",
         f"{WORKDIR}/src/install_maxtext_extra_deps",
@@ -82,18 +84,18 @@ image = (
     )
     .pip_install("wandb")
     # Stage 3: Copy the rest of the code (fast layer that rebuilds on code changes)
-    # CACHE BUST: 2025-12-16-03 - Using simple causal mask
+    # CACHE BUST: 2025-12-16-12 - Changed to SIGINT in train_with_wandb_sync.py
     .add_local_dir(".", WORKDIR, ignore=IGNORE_PATTERNS, copy=True)
 )
 
 app = modal.App(APP_NAME)
 shared_vol = modal.Volume.from_name(VOLUME_NAME, create_if_missing=True)
-secrets = []
 
 
 @app.function(
     image=image,
     gpu="A100-40GB",
+    cpu=16,  # Allocate 16 CPUs for data loading (12 grain workers + 4 for GPU/system)
     volumes={"/mnt": shared_vol},
     secrets=[modal.Secret.from_name("wandb-secret")],
     timeout=60 * 60 * 24,  # 24 hours (Modal max 86400s)
@@ -102,10 +104,11 @@ def run(
     run_name: str = "plan2_modal_wb_sync",
     steps: int = 200_000,
     batch_size: int = 32,
-    grain_workers: int = 8,
     wandb_project: str = "ping-llm-plan2",
-    wandb_mode: str = "online",  # online|offline|disabled
 ):
+    import signal
+    import atexit
+
     # Create symlinks so config's relative paths work
     # Config expects: data/sharded/... and outputs/...
     # Volume provides: /mnt/data/sharded/... and /mnt/outputs/...
@@ -128,5 +131,31 @@ def run(
         str(batch_size),
         "--hardware",
         "gpu",
+        "--enable-checkpointing",  # Enable checkpointing to save progress
     ]
-    subprocess.run(cmd, check=True, cwd=WORKDIR)
+
+    # Start the training subprocess
+    process = subprocess.Popen(cmd, cwd=WORKDIR)
+
+    # Register cleanup handler to send SIGINT on exit
+    def cleanup_handler():
+        if process.poll() is None:  # Process still running
+            print("\n" + "="*80)
+            print("⚠️  Container shutting down - sending interrupt to training process...")
+            print("="*80)
+            process.send_signal(signal.SIGINT)
+            try:
+                process.wait(timeout=25)  # Modal gives 30s grace period
+                print("✓ Training process exited gracefully")
+            except subprocess.TimeoutExpired:
+                print("⚠️  Training did not exit in time")
+                process.kill()
+            print("="*80)
+
+    atexit.register(cleanup_handler)
+
+    # Wait for the process to complete
+    exit_code = process.wait()
+
+    if exit_code != 0:
+        raise subprocess.CalledProcessError(exit_code, cmd)
