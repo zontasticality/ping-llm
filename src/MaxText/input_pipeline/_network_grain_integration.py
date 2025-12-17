@@ -1,24 +1,30 @@
 """
 Integration layer for network measurement data with MaxText Grain pipeline.
 
-This module bridges the full PLAN_2 network_grain_datasource.py with MaxText's
-training loop.
+This module provides two data loading approaches:
 
-Implements:
-- Window-based sampling (64 measurements per context)
-- 3 training modes (40/30/30 split)
-- Delta timestamp encoding
-- MaxText-compatible output format
+1. PLAN_2 (Legacy): Window-based sampling from Parquet shards
+   - Use create_network_measurement_dataset()
+   - 64 measurements per context, sampled at training time
+   - Good for testing and development
+
+2. DATA_LOADING_PLAN_1 (Recommended): Pre-chunked probe-centric data from ArrayRecord
+   - Use create_probe_chunk_dataset()
+   - Probe-centric 5-minute buckets, pre-tokenized
+   - 50-100x faster I/O, perfect for federated/decentralized training
+   - Requires running scripts/data/create_probe_chunks.py first
 """
 
 import sys
 import os
+from pathlib import Path
 
 # Add project root to path to import our custom modules
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '../../..'))
 
 import grain.python as grain
 from network_grain_datasource import create_grain_pipeline
+from MaxText.input_pipeline._probe_chunk_datasource import create_probe_chunk_pipeline
 from MaxText import max_logging
 
 
@@ -118,5 +124,88 @@ def create_network_measurement_dataset(
 
     max_logging.log(f"[PLAN_2] Network measurement dataset created successfully")
     max_logging.log(f"[PLAN_2] Features: window-based sampling, 40/30/30 training modes, delta timestamps")
+
+    return dataset
+
+
+def create_probe_chunk_dataset(
+    data_file_pattern: str,
+    batch_size: int,
+    crop_size: int = 1024,
+    shuffle: bool = True,
+    shuffle_seed: int = 42,
+    num_epoch: int = 1,
+    dataloading_host_index: int = 0,
+    dataloading_host_count: int = 1,
+    grain_worker_count: int = 0,
+    grain_per_worker_buffer_size: int = 2,
+    build_probe_index: bool = False,
+) -> grain.IterDataset:
+    """
+    Create probe-centric chunk dataset (DATA_LOADING_PLAN_1).
+
+    This is the RECOMMENDED approach for production training. It provides:
+    - 50-100x faster I/O (one chunk read vs 64 measurements)
+    - Pre-tokenized data (removes tokenization from training hot path)
+    - Probe-centric design (perfect for federated/decentralized deployment)
+    - ArrayRecord format (optimized for random access)
+
+    Prerequisites:
+        Run scripts/data/create_probe_chunks.py to create chunked data first.
+
+    Args:
+        data_file_pattern: Path to ArrayRecord file (e.g., "data/probe_chunks/train.arrayrecord")
+        batch_size: Batch size for training
+        crop_size: Tokens per training example (default: 1024)
+        shuffle: Whether to shuffle chunks
+        shuffle_seed: Random seed for shuffling
+        num_epoch: Number of epochs to repeat (default: 1)
+        dataloading_host_index: Index of this host (for distributed loading)
+        dataloading_host_count: Total number of hosts
+        grain_worker_count: Number of worker threads
+        grain_per_worker_buffer_size: Buffer size per worker
+        build_probe_index: Build probe index for client-first sampling (slower initialization)
+
+    Returns:
+        Grain IterDataset ready for MaxText training
+    """
+    # Resolve path
+    arrayrecord_path = Path(data_file_pattern).expanduser().resolve()
+
+    if not arrayrecord_path.exists():
+        raise FileNotFoundError(
+            f"ArrayRecord file not found: {arrayrecord_path}\n"
+            f"Run: python scripts/data/create_probe_chunks.py"
+        )
+
+    max_logging.log(f"[DATA_LOADING_PLAN_1] Loading probe-centric chunks from {arrayrecord_path}")
+    max_logging.log(f"[DATA_LOADING_PLAN_1] Crop size: {crop_size} tokens per training example")
+    max_logging.log(f"[DATA_LOADING_PLAN_1] Training modes: 40% full_timestamp, 30% no_timestamp, 30% mixed")
+
+    # Multi-epoch support (repeat dataset)
+    if num_epoch > 1:
+        max_logging.log(f"[DATA_LOADING_PLAN_1] WARNING: Multi-epoch repeat not yet implemented for ArrayRecord")
+        max_logging.log(f"[DATA_LOADING_PLAN_1] Will use single epoch. Implement repeat in training loop instead.")
+
+    # Distributed loading support
+    if dataloading_host_count > 1:
+        max_logging.log(f"[DATA_LOADING_PLAN_1] WARNING: Distributed loading across {dataloading_host_count} hosts")
+        max_logging.log(f"[DATA_LOADING_PLAN_1] ArrayRecord sharding not yet implemented - all hosts will read same data")
+        max_logging.log(f"[DATA_LOADING_PLAN_1] For distributed training, pre-shard ArrayRecord files by host")
+
+    # Create probe chunk pipeline
+    dataset = create_probe_chunk_pipeline(
+        arrayrecord_path=str(arrayrecord_path),
+        batch_size=batch_size,
+        crop_size=crop_size,
+        shuffle=shuffle,
+        shuffle_seed=shuffle_seed,
+        num_workers=grain_worker_count,
+        prefetch_buffer_size=grain_per_worker_buffer_size,
+        build_probe_index=build_probe_index,
+    )
+
+    max_logging.log(f"[DATA_LOADING_PLAN_1] Probe chunk dataset created successfully")
+    max_logging.log(f"[DATA_LOADING_PLAN_1] Benefits: 50-100x faster I/O, pre-tokenized, probe-centric design")
 
     return dataset

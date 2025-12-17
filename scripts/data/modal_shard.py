@@ -1,11 +1,15 @@
 """Shard a large Parquet on Modal CPU (>=64GB RAM).
 
 Usage:
-  modal run scripts/train/modal_shard.py::shard
+  modal run scripts/data/modal_shard.py::shard
 
 Assumes:
   - Modal volume `ping-llm` (or set MODAL_VOLUME) has /data/training_data.parquet
   - Writes shards to /mnt/data/sharded/{train,test}
+
+Note: This is the LEGACY sharding approach for PLAN_2 (parquet shards).
+      For the new probe-centric approach (DATA_LOADING_PLAN_1), use:
+      modal run scripts/data/modal_create_probe_chunks.py::create_chunks
 """
 
 import os
