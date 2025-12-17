@@ -99,7 +99,7 @@ echo "  Test shards: $TEST_SHARDS (expected 20)"
 
 if [ "$TRAIN_SHARDS" -eq 0 ]; then
     echo "ERROR: No training shards found in $DATA_DIR/train/"
-    echo "Run: python scripts/data/shard_parquet.py first"
+    echo "Run: python scripts/data/probe_chunk_preprocess.py first"
     exit 1
 fi
 if [ "$TEST_SHARDS" -eq 0 ]; then

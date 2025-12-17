@@ -307,7 +307,7 @@ def main():
         train_files = glob.glob("data/sharded/train/*.parquet")
         if not train_files:
             print("\n❌ ERROR: No training shards found")
-            print("Run: .venv/bin/python scripts/data/shard_parquet.py")
+            print("Run: .venv/bin/python scripts/data/probe_chunk_preprocess.py")
             sys.exit(1)
 
         print(f"\nFound {len(train_files)} training shards")

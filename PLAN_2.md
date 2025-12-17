@@ -72,13 +72,15 @@ packet_error_count: int64  - Packet error count (dataset artifact, not used)
 **Current:** Single 1.1GB file
 **Target:** 200 shards for better shuffling and parallelism
 
-**Implementation:** `scripts/data/shard_parquet.py`
+**Implementation:** `scripts/data/probe_chunk_preprocess.py` (replaces the legacy sharding script)
 ```bash
-python scripts/data/shard_parquet.py \
+python scripts/data/probe_chunk_preprocess.py \
   --input data/training_data.parquet \
-  --output data/sharded \
-  --train-shards 180 \    # 90% train (~500k rows/shard)
-  --test-shards 20        # 10% test (~500k rows/shard)
+  --output data/probe_chunks_out \
+  --temp-shards /tmp/probe_shards \
+  --num-shards 256 \
+  --train-ratio 0.9 \
+  --max-tokens 100000
 ```
 
 **Rationale for no validation set:**
@@ -971,7 +973,7 @@ Total: ~4-5GB (fits comfortably in 40GB A100)
 ### Phase 2: Dataset Preparation
 
 **Tasks:**
-- [ ] Run `scripts/data/shard_parquet.py`:
+- [ ] Run `scripts/data/probe_chunk_preprocess.py`:
   - [ ] Create 200 train shards
   - [ ] Create 25 val shards
   - [ ] Create 25 test shards

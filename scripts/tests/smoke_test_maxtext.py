@@ -221,7 +221,7 @@ def main():
         print("=" * 80)
         print("\nPLAN_2 implementation is ready for MaxText integration!")
         print("Next steps:")
-        print("  1. Run dataset sharding: python scripts/data/shard_parquet.py")
+        print("  1. Run dataset preprocessing: python scripts/data/probe_chunk_preprocess.py")
         print("  2. Test Grain data pipeline with real data")
         print("  3. Run MaxText training smoke test (CPU)")
         print("  4. Submit SLURM job for full GPU training")

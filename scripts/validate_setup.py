@@ -96,12 +96,12 @@ def main():
     all_ok &= check(
         f"Training shards: {len(train_shards)}/180",
         len(train_shards) == 180,
-        "Run: python scripts/shard_parquet.py"
+        "Run: python scripts/data/probe_chunk_preprocess.py"
     )
     all_ok &= check(
         f"Test shards: {len(test_shards)}/20",
         len(test_shards) == 20,
-        "Run: python scripts/shard_parquet.py"
+        "Run: python scripts/data/probe_chunk_preprocess.py"
     )
 
     # Config file
