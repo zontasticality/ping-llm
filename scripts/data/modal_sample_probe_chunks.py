@@ -85,15 +85,19 @@ shared_vol = Volume.from_name(VOLUME_NAME, create_if_missing=True)
 
 def _find_arrayrecord_files(base_dir: Path, split: str) -> list[Path]:
     """Find ArrayRecord files for a split, supporting single-file or sharded layouts."""
-    candidates = sorted((base_dir).glob(f"{split}*.arrayrecord"))
-    if not candidates:
-        # also support nested train/test dirs (e.g., probe_chunk_preprocess output)
-        candidates = sorted((base_dir / split).glob(f"{split}_shard_*.arrayrecord"))
-        if not candidates:
-            raise FileNotFoundError(
-                f"No ArrayRecord files found for split '{split}' in {base_dir}"
-            )
-    return candidates
+    # Prefer nested sharded layout (e.g., base/train/train_shard_*.arrayrecord)
+    nested = sorted((base_dir / split).glob(f"{split}_shard_*.arrayrecord"))
+    if nested:
+        return nested
+
+    # Fallback to single-file layout (e.g., base/train.arrayrecord)
+    top_level = sorted(base_dir.glob(f"{split}*.arrayrecord"))
+    if top_level:
+        return top_level
+
+    raise FileNotFoundError(
+        f"No ArrayRecord files found for split '{split}' in {base_dir}"
+    )
 
 
 def _decode_uint16(data: bytes) -> list[int]:
@@ -141,8 +145,10 @@ def sample_chunks(
         for f in files[:3]:
             print(f"  - {f}")
 
-        # For simplicity, sample within the first file; extend to multi-file if needed
-        source = ProbeChunkDataSource(str(files[0]), build_probe_index=False)
+        # Sample from one shard (pick random shard for variety)
+        shard_path = rng.choice(files)
+        print(f"Sampling from shard: {shard_path}")
+        source = ProbeChunkDataSource(str(shard_path), build_probe_index=False)
         cropper = ProbeChunkCropper(crop_size=crop_size, seed=seed)
 
         n = len(source)
@@ -155,7 +161,12 @@ def sample_chunks(
             chunk = source[idx]
             cropped = cropper.random_map(chunk, rng)
 
-            tokens = cropped["tokens"].tolist()
+            # ProbeChunkCropper outputs MaxText-format fields; use inputs as the cropped token window
+            tokens = cropped["inputs"].tolist()
+            seg = cropped.get("inputs_segmentation")
+            from tokenization import decode_token_stream_pretty, decode_tokens_to_measurements
+            pretty_tokens = decode_token_stream_pretty(tokens)
+            measurements = decode_tokens_to_measurements(tokens, segmentation=seg.tolist() if hasattr(seg, "tolist") else seg)
             meta = chunk["metadata"]
             print(f"\n  Sample {i} (idx {idx}):")
             print(
@@ -164,9 +175,15 @@ def sample_chunks(
             print(
                 f"    chunk_tokens={chunk['n_tokens']}, meas={chunk['n_measurements']}, crop_size={len(tokens)}"
             )
-            print(f"    token stream (first 64): {tokens[:64]}")
+            print(f"    token stream (first 64): {pretty_tokens[:64]}")
             if len(tokens) > 64:
-                print(f"    token stream (last 16): {tokens[-16:]}")
+                print(f"    token stream (last 16): {pretty_tokens[-16:]}")
+            if measurements:
+                print("    decoded measurements (first 2):")
+                for m_idx, meas in enumerate(measurements[:2], 1):
+                    print(f"      m{m_idx}:")
+                    for b in meas["blocks"]:
+                        print(f"        - {b}")
 
 
 @app.local_entrypoint()

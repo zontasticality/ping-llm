@@ -50,7 +50,8 @@ class ProbeChunkDataSource(grain.RandomAccessDataSource):
         """
         self.arrayrecord_path = arrayrecord_path
         self.reader = array_record_module.ArrayRecordReader(arrayrecord_path)
-        self._length = len(self.reader)
+        # ArrayRecordReader does not implement __len__; use num_records() API.
+        self._length = self.reader.num_records()
 
         # Optional: build probe index for client-first sampling
         self.probe_index = None
@@ -77,8 +78,8 @@ class ProbeChunkDataSource(grain.RandomAccessDataSource):
 
     def _read_chunk(self, index: int) -> dict:
         """Read and deserialize a chunk from ArrayRecord."""
-        # Read serialized record
-        record_bytes = self.reader[index]
+        # Read serialized record using the list-based overload (more reliable across versions)
+        record_bytes = self.reader.read([index])[0]
 
         # Deserialize from PyArrow IPC format
         reader = ipc.open_stream(record_bytes)

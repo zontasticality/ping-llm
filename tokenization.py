@@ -41,6 +41,19 @@ FAILED = 10
 BYTE_TOKEN_OFFSET = 11
 
 VOCAB_SIZE = 267
+TOKEN_NAMES = {
+    MEASUREMENT_START: "MEASUREMENT_START",
+    SRC_IPV4: "SRC_IPV4",
+    SRC_IPV6: "SRC_IPV6",
+    DST_IPV4: "DST_IPV4",
+    DST_IPV6: "DST_IPV6",
+    TIMESTAMP_ABS: "TIMESTAMP_ABS",
+    TIMESTAMP_DELTA1: "TIMESTAMP_DELTA1",
+    TIMESTAMP_DELTA4: "TIMESTAMP_DELTA4",
+    RTT_START: "RTT_START",
+    THROUGHPUT_START: "THROUGHPUT_START",
+    FAILED: "FAILED",
+}
 
 
 def byte_to_token(byte_val: int) -> int:
@@ -173,6 +186,172 @@ def encode_rtt_exponent_mantissa(rtt_ms: float) -> List[int]:
     byte2 = mantissa & 0xFF
 
     return [RTT_START, byte_to_token(byte1), byte_to_token(byte2)]
+
+
+def decode_token_stream_pretty(tokens: List[int]) -> List[str]:
+    """
+    Render a token list as human-friendly strings.
+
+    - Named tokens for role/timestamp/RTT/FAIL
+    - Byte tokens as Byte(0x..) with decimal
+    - Unknown tokens as Unknown(<id>)
+    """
+    pretty = []
+    for t in tokens:
+        if t in TOKEN_NAMES:
+            pretty.append(TOKEN_NAMES[t])
+        elif BYTE_TOKEN_OFFSET <= t < VOCAB_SIZE:
+            val = token_to_byte(t)
+            pretty.append(f"Byte(0x{val:02X}/{val})")
+        else:
+            pretty.append(f"Unknown({t})")
+    return pretty
+
+
+def _decode_ip_tokens(role_token: int, data_tokens: List[int]) -> dict:
+    """Decode an IP block into a readable structure."""
+    if role_token in (SRC_IPV4, DST_IPV4):
+        ip_version = 4
+        expected = 4
+    elif role_token in (SRC_IPV6, DST_IPV6):
+        ip_version = 6
+        expected = 16
+    else:
+        return {"kind": "unknown", "tokens": [role_token] + data_tokens}
+
+    if len(data_tokens) < expected:
+        return {"kind": "ip_truncated", "ip_version": ip_version, "tokens": [role_token] + data_tokens}
+
+    byte_vals = [token_to_byte(t) for t in data_tokens[:expected]]
+    try:
+        if ip_version == 4:
+            ip_str = str(ipaddress.IPv4Address(bytes(byte_vals)))
+        else:
+            ip_str = str(ipaddress.IPv6Address(bytes(byte_vals)))
+    except Exception:
+        ip_str = "InvalidIP"
+
+    kind = "src_ip" if role_token in (SRC_IPV4, SRC_IPV6) else "dst_ip"
+    return {
+        "kind": kind,
+        "ip_version": ip_version,
+        "ip": ip_str,
+        "tokens": [role_token] + data_tokens[:expected],
+    }
+
+
+def decode_tokens_to_measurements(tokens: List[int], segmentation: Optional[List[int]] = None) -> List[dict]:
+    """
+    Decode a token stream back into measurement-like structures.
+
+    The result is isomorphic to the token ordering: each measurement keeps an
+    ordered list of field blocks as they appeared (shuffled order preserved).
+
+    Blocks:
+      - src_ip / dst_ip (with decoded address)
+      - rtt / failed
+      - timestamp_abs / timestamp_delta1 / timestamp_delta4 (with decoded values)
+      - unknown / truncated blocks are preserved with their raw tokens
+    """
+    # Honor segmentation mask if provided (to drop padding from crops)
+    if segmentation is not None and len(segmentation) == len(tokens):
+        valid_len = 0
+        for flag in segmentation:
+            if flag:
+                valid_len += 1
+            else:
+                break
+        tokens = tokens[:valid_len]
+
+    measurements: List[dict] = []
+    current = {"blocks": []}
+
+    def flush_current():
+        nonlocal current
+        if current["blocks"]:
+            measurements.append(current)
+        current = {"blocks": []}
+
+    i = 0
+    n = len(tokens)
+    while i < n:
+        t = tokens[i]
+        if t == MEASUREMENT_START:
+            flush_current()
+            i += 1
+            continue
+
+        # IP blocks
+        if t in (SRC_IPV4, DST_IPV4, SRC_IPV6, DST_IPV6):
+            expected = 4 if t in (SRC_IPV4, DST_IPV4) else 16
+            block_tokens = tokens[i + 1 : i + 1 + expected]
+            block = _decode_ip_tokens(t, block_tokens)
+            current["blocks"].append(block)
+            i += 1 + expected
+            continue
+
+        # RTT / failed
+        if t == FAILED:
+            current["blocks"].append({"kind": "failed", "tokens": [t]})
+            i += 1
+            continue
+        if t == RTT_START:
+            if i + 2 < n:
+                b1 = tokens[i + 1]
+                b2 = tokens[i + 2]
+                try:
+                    rtt_ms = decode_rtt_exponent_mantissa(token_to_byte(b1), token_to_byte(b2))
+                except AssertionError:
+                    rtt_ms = None
+                current["blocks"].append(
+                    {"kind": "rtt", "rtt_ms": rtt_ms, "tokens": tokens[i : i + 3]}
+                )
+                i += 3
+                continue
+            else:
+                current["blocks"].append({"kind": "rtt_truncated", "tokens": tokens[i:]})
+                break
+
+        # Timestamp
+        if t in (TIMESTAMP_ABS, TIMESTAMP_DELTA1, TIMESTAMP_DELTA4):
+            if t == TIMESTAMP_ABS:
+                expected = 8
+            elif t == TIMESTAMP_DELTA1:
+                expected = 1
+            else:
+                expected = 4
+            data = tokens[i + 1 : i + 1 + expected]
+            if len(data) < expected:
+                current["blocks"].append({"kind": "timestamp_truncated", "tokens": tokens[i:]})
+                break
+            try:
+                if t == TIMESTAMP_ABS:
+                    ts = struct.unpack(">Q", bytes([token_to_byte(x) for x in data]))[0]
+                    decoded = datetime.utcfromtimestamp(ts)
+                    block_kind = "timestamp_abs"
+                elif t == TIMESTAMP_DELTA1:
+                    ts = token_to_byte(data[0])
+                    decoded = ts
+                    block_kind = "timestamp_delta1"
+                else:
+                    ts = struct.unpack(">I", bytes([token_to_byte(x) for x in data]))[0]
+                    decoded = ts
+                    block_kind = "timestamp_delta4"
+            except Exception:
+                decoded = None
+                block_kind = "timestamp_unknown"
+            current["blocks"].append(
+                {"kind": block_kind, "value": decoded, "tokens": [t] + data}
+            )
+            i += 1 + expected
+            continue
+
+        # Byte/unknown fallback
+        current["blocks"].append({"kind": "unknown", "tokens": [t]})
+        i += 1
+
+    flush_current()
+    return measurements
 
 
 def decode_rtt_exponent_mantissa(byte1: int, byte2: int) -> float:
