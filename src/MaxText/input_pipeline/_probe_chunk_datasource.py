@@ -175,10 +175,25 @@ class ProbeChunkCropper(grain.RandomMapTransform):
         meas_offsets = self._deserialize_offsets(chunk['meas_offsets'])
 
         # Choose training mode (40/30/30 split)
-        mode = rng.choices(
-            ['full_timestamp', 'no_timestamp', 'mixed'],
-            weights=self.mode_weights
-        )[0]
+        # Some RNGs (e.g., numpy Generator) don't have .choices; fallback to choice with cumulative weights
+        try:
+            mode = rng.choices(
+                ['full_timestamp', 'no_timestamp', 'mixed'],
+                weights=self.mode_weights
+            )[0]
+        except AttributeError:
+            population = ['full_timestamp', 'no_timestamp', 'mixed']
+            cum_weights = []
+            total = 0.0
+            for w in self.mode_weights:
+                total += w
+                cum_weights.append(total)
+            r = rng.random()
+            mode = population[0]
+            for p, cw in zip(population, cum_weights):
+                if r <= cw:
+                    mode = p
+                    break
 
         # Find valid crop positions (aligned to measurement boundaries)
         valid_start_positions = [0]  # Always allow starting at beginning

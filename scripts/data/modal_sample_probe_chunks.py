@@ -76,7 +76,7 @@ image = (
     .pip_install("wandb")
     # Stage 3: Copy the rest of the code (fast layer that rebuilds on code changes)
     # CACHE BUST: 2025-12-16-12 - Changed to SIGINT in train_with_wandb_sync.py
-    .add_local_dir(".", WORKDIR, ignore=IGNORE_PATTERNS, copy=True)
+    .add_local_dir(".", WORKDIR, ignore=IGNORE_PATTERNS, copy=False)
 )
 
 app = App(APP_NAME)
@@ -164,9 +164,15 @@ def sample_chunks(
             # ProbeChunkCropper outputs MaxText-format fields; use inputs as the cropped token window
             tokens = cropped["inputs"].tolist()
             seg = cropped.get("inputs_segmentation")
-            from tokenization import decode_token_stream_pretty, decode_tokens_to_measurements
+            from tokenization import (
+                decode_token_stream_pretty,
+                decode_tokens_to_measurements,
+            )
+
             pretty_tokens = decode_token_stream_pretty(tokens)
-            measurements = decode_tokens_to_measurements(tokens, segmentation=seg.tolist() if hasattr(seg, "tolist") else seg)
+            measurements = decode_tokens_to_measurements(
+                tokens, segmentation=seg.tolist() if hasattr(seg, "tolist") else seg
+            )
             meta = chunk["metadata"]
             print(f"\n  Sample {i} (idx {idx}):")
             print(

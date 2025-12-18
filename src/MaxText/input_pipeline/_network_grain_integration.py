@@ -24,7 +24,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), '../../..'))
 
 import grain.python as grain
 from network_grain_datasource import create_grain_pipeline
-from MaxText.input_pipeline._probe_chunk_datasource import create_probe_chunk_pipeline
+from MaxText.input_pipeline.probe_chunk_pipeline import build_probe_chunk_dataset
 from MaxText import max_logging
 
 
@@ -194,7 +194,7 @@ def create_probe_chunk_dataset(
         max_logging.log(f"[DATA_LOADING_PLAN_1] For distributed training, pre-shard ArrayRecord files by host")
 
     # Create probe chunk pipeline
-    dataset = create_probe_chunk_pipeline(
+    dataset = build_probe_chunk_dataset(
         arrayrecord_path=str(arrayrecord_path),
         batch_size=batch_size,
         crop_size=crop_size,
