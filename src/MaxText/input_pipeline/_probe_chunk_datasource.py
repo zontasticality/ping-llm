@@ -1,11 +1,13 @@
 """
-Grain DataSource for probe-centric measurement chunks (DATA_LOADING_PLAN_1.md).
+Grain DataSource for probe-centric measurement rows (DATA_LOADING_PLAN_3).
 
 This module implements:
-1. ProbeChunkDataSource - reads pre-built chunks from ArrayRecord
-2. ProbeChunkCropper - randomly crops 1024-token windows from chunks
-3. Training-time timestamp masking (40/30/30 modes)
-4. Measurement-boundary-aligned cropping
+1. ProbeRowDataSource - reads big probe rows from ArrayRecord
+2. ProbeRowSampler - generates K contexts per row with PLAN_3 sampling:
+   - Multi-scale temporal sampling (log-uniform window sizes)
+   - Timestamp mode selection (40% full, 30% partial, 30% none)
+   - Field order randomization
+   - Runtime tokenization with data augmentation
 """
 
 import struct
@@ -13,6 +15,8 @@ import random
 import numpy as np
 from typing import List, Dict, Any, Optional
 import grain.python as grain
+from datetime import datetime
+from math import ceil
 
 try:
     import array_record.python.array_record_module as array_record_module
@@ -25,60 +29,48 @@ except ImportError:
 import pyarrow as pa
 import pyarrow.ipc as ipc
 
+# Import tokenization (from project root)
+import sys
+from pathlib import Path
+project_root = Path(__file__).parent.parent.parent.parent
+sys.path.insert(0, str(project_root))
+from tokenization import encode_measurement
 
-class ProbeChunkDataSource(grain.RandomAccessDataSource):
+
+class ProbeRowDataSource(grain.RandomAccessDataSource):
     """
-    Grain DataSource for pre-chunked probe measurements stored in ArrayRecord.
+    Grain DataSource for probe rows stored in ArrayRecord (PLAN_3 format).
 
-    Each element is a chunk (one probe's 5-minute window, possibly split).
+    Each element is a row containing one probe's measurement history (up to 8MB).
 
     Features:
-    - Random access to chunks via ArrayRecord
-    - Efficient deserialization of tokens and meas_offsets
-    - Optional client-first sampling support (via src_id index)
+    - Random access to rows via ArrayRecord
+    - Efficient deserialization of PyArrow IPC measurements
+    - Returns raw measurements for runtime tokenization
     """
 
-    def __init__(
-        self,
-        arrayrecord_path: str,
-        build_probe_index: bool = False,
-    ):
+    def __init__(self, arrayrecord_path: str):
         """
         Args:
-            arrayrecord_path: Path to ArrayRecord file (e.g., data/probe_chunks/train.arrayrecord)
-            build_probe_index: If True, build src_id -> chunk indices mapping (for client-first sampling)
+            arrayrecord_path: Path to ArrayRecord file (e.g., data/probe_rows/train.arrayrecord)
         """
         self.arrayrecord_path = arrayrecord_path
         self.reader = array_record_module.ArrayRecordReader(arrayrecord_path)
-        # ArrayRecordReader does not implement __len__; use num_records() API.
         self._length = self.reader.num_records()
-
-        # Optional: build probe index for client-first sampling
-        self.probe_index = None
-        if build_probe_index:
-            print(f"[ProbeChunkDataSource] Building probe index for {self._length:,} chunks...")
-            self._build_probe_index()
-            print(f"[ProbeChunkDataSource] Index built: {len(self.probe_index)} probes")
-
-    def _build_probe_index(self):
-        """Build mapping of src_id -> list of chunk indices."""
-        from collections import defaultdict
-        self.probe_index = defaultdict(list)
-
-        for i in range(self._length):
-            chunk = self._read_chunk(i)
-            src_id = chunk['src_id']
-            self.probe_index[src_id].append(i)
-
-        # Convert to regular dict
-        self.probe_index = dict(self.probe_index)
 
     def __len__(self):
         return self._length
 
-    def _read_chunk(self, index: int) -> dict:
-        """Read and deserialize a chunk from ArrayRecord."""
-        # Read serialized record using the list-based overload (more reliable across versions)
+    def _deserialize_measurements(self, measurements_bytes: bytes) -> List[dict]:
+        """Deserialize measurements from PyArrow IPC format."""
+        reader = ipc.open_stream(measurements_bytes)
+        table = reader.read_all()
+        reader.close()
+        return table.to_pylist()
+
+    def _read_row(self, index: int) -> dict:
+        """Read and deserialize a row from ArrayRecord."""
+        # Read serialized record
         record_bytes = self.reader.read([index])[0]
 
         # Deserialize from PyArrow IPC format
@@ -89,179 +81,365 @@ class ProbeChunkDataSource(grain.RandomAccessDataSource):
         # Convert to dict
         record = {
             'src_id': batch.column('src_id')[0].as_py(),
-            'bucket_start_time': batch.column('bucket_start_time')[0].as_py(),
-            'bucket_duration_s': batch.column('bucket_duration_s')[0].as_py(),
-            'part_id': batch.column('part_id')[0].as_py(),
-            'tokens': batch.column('tokens')[0].as_py(),  # bytes
-            'meas_offsets': batch.column('meas_offsets')[0].as_py(),  # bytes
-            'n_tokens': batch.column('n_tokens')[0].as_py(),
+            'measurements': batch.column('measurements')[0].as_py(),  # bytes
             'n_measurements': batch.column('n_measurements')[0].as_py(),
+            'time_span_seconds': batch.column('time_span_seconds')[0].as_py(),
+            'first_timestamp': batch.column('first_timestamp')[0].as_py(),
+            'last_timestamp': batch.column('last_timestamp')[0].as_py(),
         }
 
         return record
 
     def __getitem__(self, index):
         """
-        Get a chunk by index.
+        Get a row by index.
 
         Returns:
             Dictionary with:
                 - src_id: int
-                - tokens: bytes (serialized uint16 array)
-                - meas_offsets: bytes (serialized int32 array)
-                - n_tokens: int
+                - measurements: List[dict] (deserialized)
                 - n_measurements: int
-                - metadata: dict with bucket info
+                - metadata: dict with time_span, timestamps
         """
         if index < 0 or index >= self._length:
             raise IndexError(f"Index {index} out of range [0, {self._length})")
 
-        chunk = self._read_chunk(index)
+        row = self._read_row(index)
+
+        # Deserialize measurements
+        measurements = self._deserialize_measurements(row['measurements'])
 
         return {
-            'src_id': chunk['src_id'],
-            'tokens': chunk['tokens'],
-            'meas_offsets': chunk['meas_offsets'],
-            'n_tokens': chunk['n_tokens'],
-            'n_measurements': chunk['n_measurements'],
+            'src_id': row['src_id'],
+            'measurements': measurements,
+            'n_measurements': row['n_measurements'],
             'metadata': {
-                'bucket_start_time': chunk['bucket_start_time'],
-                'bucket_duration_s': chunk['bucket_duration_s'],
-                'part_id': chunk['part_id'],
+                'time_span_seconds': row['time_span_seconds'],
+                'first_timestamp': row['first_timestamp'],
+                'last_timestamp': row['last_timestamp'],
             }
         }
 
 
-class ProbeChunkCropper(grain.RandomMapTransform):
+class ProbeRowSampler(grain.RandomMapTransform):
     """
-    Randomly crop 1024-token windows from chunks with measurement-boundary alignment.
+    Generate ONE training context per row with PLAN_3 sampling.
 
-    Implements:
-    1. Random crop start position aligned to measurement boundaries (using meas_offsets)
-    2. Training-time timestamp masking (40/30/30 modes)
-    3. Padding/truncation to max_tokens
-    4. MaxText-compatible output format
+    This will be called K times per row via dataset repetition.
+
+    For each call:
+    1. Sample measurement window (small row: all, large row: log-uniform)
+    2. Select timestamp mode (40% full, 30% partial, 30% none)
+    3. Tokenize with field randomization
+    4. Pad to crop_size
     """
 
     def __init__(
         self,
         crop_size: int = 1024,
+        avg_tokens_per_measurement: int = 30,
+        max_contexts_per_row: int = 16,
         mode_weights: tuple = (0.40, 0.30, 0.30),
         seed: Optional[int] = None,
     ):
         """
         Args:
             crop_size: Number of tokens per training example (default: 1024)
-            mode_weights: Tuple of (full_ts, no_ts, mixed_ts) probabilities
+            avg_tokens_per_measurement: Estimated tokens per measurement (default: 30)
+            max_contexts_per_row: Maximum contexts to generate per row (default: 16)
+            mode_weights: Tuple of (full_ts, partial_ts, no_ts) probabilities
             seed: Random seed for reproducibility
         """
         self.crop_size = crop_size
+        self.avg_tokens_per_meas = avg_tokens_per_measurement
+        self.max_K = max_contexts_per_row
         self.mode_weights = mode_weights
         self.seed = seed
 
-    def random_map(self, chunk: Dict[str, Any], rng: random.Random) -> Dict[str, Any]:
+    def random_map(self, row: dict, rng: random.Random) -> dict:
         """
-        Randomly crop and process a chunk.
+        Generate ONE context from a row.
 
         Args:
-            chunk: Chunk dictionary from ProbeChunkDataSource
+            row: Row dictionary from ProbeRowDataSource
             rng: Random number generator from Grain
 
         Returns:
-            MaxText-compatible dictionary with inputs/targets
+            Single context dictionary
         """
-        # Deserialize tokens and offsets
-        tokens = self._deserialize_tokens(chunk['tokens'])
-        meas_offsets = self._deserialize_offsets(chunk['meas_offsets'])
+        return self._generate_one_context(row, rng)
 
-        # Choose training mode (40/30/30 split)
-        # Some RNGs (e.g., numpy Generator) don't have .choices; fallback to choice with cumulative weights
-        try:
-            mode = rng.choices(
-                ['full_timestamp', 'no_timestamp', 'mixed'],
-                weights=self.mode_weights
-            )[0]
-        except AttributeError:
-            population = ['full_timestamp', 'no_timestamp', 'mixed']
-            cum_weights = []
-            total = 0.0
-            for w in self.mode_weights:
-                total += w
-                cum_weights.append(total)
-            r = rng.random()
-            mode = population[0]
-            for p, cw in zip(population, cum_weights):
-                if r <= cw:
-                    mode = p
-                    break
+    def map(self, row: dict) -> List[dict]:
+        """
+        Generate K contexts from a row (for testing).
 
-        # Find valid crop positions (aligned to measurement boundaries)
-        valid_start_positions = [0]  # Always allow starting at beginning
-        for offset in meas_offsets[1:]:  # Skip first (always 0)
-            if offset + self.crop_size <= len(tokens):
-                valid_start_positions.append(offset)
+        Args:
+            row: Row dictionary from ProbeRowDataSource
 
-        # If chunk is smaller than crop_size, use full chunk
-        if not valid_start_positions or len(tokens) <= self.crop_size:
-            crop_start = 0
-            crop_end = min(len(tokens), self.crop_size)
+        Returns:
+            List of K context dictionaries
+        """
+        measurements = row['measurements']
+        n = len(measurements)
+
+        # Calculate K contexts for this row
+        K = min(ceil(n / self.avg_tokens_per_meas), self.max_K)
+        K = max(K, 1)  # At least 1 context
+
+        rng = random.Random(self.seed)
+        contexts = []
+        for _ in range(K):
+            context = self._generate_one_context(row, rng)
+            contexts.append(context)
+
+        return contexts
+
+    def _generate_one_context(self, row: dict, rng: random.Random) -> dict:
+        """Generate a single training context from row."""
+        measurements = row['measurements']
+        n = len(measurements)
+
+        # Calculate target measurements for ~crop_size tokens
+        target_measurements = self.crop_size // self.avg_tokens_per_meas
+
+        # Branch: small row vs large row
+        if n < target_measurements:
+            # Small row: use all measurements
+            meas_buffer = measurements
         else:
-            # Random crop at measurement boundary
-            crop_start = rng.choice(valid_start_positions)
-            crop_end = min(crop_start + self.crop_size, len(tokens))
+            # Large row: sample window
+            meas_buffer = self._sample_large_row(
+                measurements, target_measurements, rng
+            )
 
-        # Extract crop
-        cropped_tokens = tokens[crop_start:crop_end].copy()
+        # Select timestamp mode
+        mode = self._select_timestamp_mode(rng)
 
-        # Apply timestamp masking based on mode
-        # TODO: Implement actual timestamp token removal (requires parsing token structure)
-        # For now, we'll just use the tokens as-is since this requires deep understanding
-        # of the token structure and finding timestamp tokens within measurements
-        # This can be added in a follow-up if needed
+        # Tokenize measurements
+        tokens = self._tokenize_measurements(meas_buffer, mode, rng)
 
-        # Store original length before padding
-        original_length = len(cropped_tokens)
+        # Pad and format
+        return self._format_output(tokens)
 
-        # Pad to crop_size
-        if len(cropped_tokens) < self.crop_size:
-            # Pad with token 0 (MEASUREMENT_START, used as padding)
-            padding = np.zeros(self.crop_size - len(cropped_tokens), dtype=np.int32)
-            cropped_tokens = np.concatenate([cropped_tokens, padding])
+    def _sample_large_row(
+        self, measurements: List[dict], target: int, rng
+    ) -> List[dict]:
+        """
+        Sample measurements from large row using log-uniform window.
 
-        # Ensure int32 type
-        cropped_tokens = cropped_tokens.astype(np.int32)
+        Args:
+            measurements: Full list of measurements
+            target: Target number of measurements
+            rng: Random number generator (numpy or Python random)
 
-        # Create segmentation mask (1 for real tokens, 0 for padding)
+        Returns:
+            Sampled and sorted measurements
+        """
+        n = len(measurements)
+
+        # Check RNG type and use appropriate methods
+        is_numpy = hasattr(rng, 'integers')
+
+        # Log-uniform window size
+        log_min = 0  # log(1) = 0
+        log_max = np.log(n)
+        if is_numpy:
+            log_size = rng.uniform(log_min, log_max)
+        else:
+            log_size = rng.uniform(log_min, log_max)
+        window_size = min(n, int(np.exp(log_size)))
+        window_size = max(window_size, 1)  # At least 1
+
+        # Random offset
+        if window_size >= n:
+            offset = 0
+        else:
+            if is_numpy:
+                offset = rng.integers(0, n - window_size + 1)
+            else:
+                offset = rng.randint(0, n - window_size)
+
+        # Select window
+        window = measurements[offset:offset + window_size]
+
+        # Randomly subsample from window if needed
+        if len(window) <= target:
+            selected = window
+        else:
+            # Random sample without replacement
+            if is_numpy:
+                indices = rng.choice(len(window), size=target, replace=False)
+                selected = [window[i] for i in indices]
+            else:
+                selected = rng.sample(window, target)
+
+        # Sort by timestamp
+        selected.sort(key=lambda m: m['event_time'])
+
+        return selected
+
+    def _select_timestamp_mode(self, rng) -> str:
+        """Select timestamp mode: full, partial, or none."""
+        is_numpy = hasattr(rng, 'integers')
+
+        if is_numpy:
+            r = rng.random()
+        else:
+            r = rng.random()
+
+        if r < self.mode_weights[0]:
+            return 'full'
+        elif r < self.mode_weights[0] + self.mode_weights[1]:
+            return 'partial'
+        else:
+            return 'none'
+
+    def _tokenize_measurements(
+        self,
+        measurements: List[dict],
+        mode: str,
+        rng,
+    ) -> List[int]:
+        """
+        Tokenize measurements with timestamp mode and field randomization.
+
+        Args:
+            measurements: List of measurement dicts
+            mode: 'full', 'partial', or 'none'
+            rng: Random number generator (numpy or Python random)
+
+        Returns:
+            List of token IDs
+        """
+        tokens = []
+        prev_timestamp = None
+        is_numpy = hasattr(rng, 'integers')
+
+        if mode == 'full':
+            # Include all timestamps
+            for meas in measurements:
+                meas_tokens = encode_measurement(
+                    meas,
+                    prev_timestamp=prev_timestamp,
+                    include_timestamp=True,
+                )
+                tokens.extend(meas_tokens)
+                prev_timestamp = meas['event_time']
+
+        elif mode == 'partial':
+            # Extract random percentage (10-90%)
+            extract_pct = rng.uniform(0.1, 0.9)
+            n_extract = max(1, int(len(measurements) * extract_pct))
+
+            # Random sample to extract (remove timestamps)
+            if is_numpy:
+                extract_indices = set(rng.choice(
+                    len(measurements), size=n_extract, replace=False
+                ))
+            else:
+                extract_indices = set(rng.sample(
+                    range(len(measurements)), n_extract
+                ))
+
+            # Build two lists: timestamped and non-timestamped
+            timestamped = []
+            non_timestamped = []
+
+            for i, meas in enumerate(measurements):
+                if i in extract_indices:
+                    non_timestamped.append(meas)
+                else:
+                    timestamped.append(meas)
+
+            # Randomize non-timestamped
+            if is_numpy:
+                rng.shuffle(non_timestamped)
+            else:
+                rng.shuffle(non_timestamped)
+
+            # Merge: interleave randomly
+            all_meas = []
+            ts_idx = 0
+            nts_idx = 0
+
+            for _ in range(len(measurements)):
+                if ts_idx >= len(timestamped):
+                    all_meas.append(('nts', non_timestamped[nts_idx]))
+                    nts_idx += 1
+                elif nts_idx >= len(non_timestamped):
+                    all_meas.append(('ts', timestamped[ts_idx]))
+                    ts_idx += 1
+                else:
+                    # Random choice
+                    if rng.random() < 0.5:
+                        all_meas.append(('ts', timestamped[ts_idx]))
+                        ts_idx += 1
+                    else:
+                        all_meas.append(('nts', non_timestamped[nts_idx]))
+                        nts_idx += 1
+
+            # Tokenize
+            for typ, meas in all_meas:
+                include_ts = (typ == 'ts')
+                meas_tokens = encode_measurement(
+                    meas,
+                    prev_timestamp=prev_timestamp if include_ts else None,
+                    include_timestamp=include_ts,
+                )
+                tokens.extend(meas_tokens)
+                if include_ts:
+                    prev_timestamp = meas['event_time']
+
+        else:  # mode == 'none'
+            # No timestamps, randomize order
+            shuffled = measurements.copy()
+            rng.shuffle(shuffled)
+
+            for meas in shuffled:
+                meas_tokens = encode_measurement(
+                    meas,
+                    prev_timestamp=None,
+                    include_timestamp=False,
+                )
+                tokens.extend(meas_tokens)
+
+        return tokens
+
+    def _format_output(self, tokens: List[int]) -> dict:
+        """Pad to crop_size and format for MaxText."""
+        tokens = np.array(tokens, dtype=np.int32)
+
+        # Truncate if too long
+        if len(tokens) > self.crop_size:
+            tokens = tokens[:self.crop_size]
+
+        original_length = len(tokens)
+
+        # Pad if too short
+        if len(tokens) < self.crop_size:
+            padding = np.zeros(
+                self.crop_size - len(tokens), dtype=np.int32
+            )
+            tokens = np.concatenate([tokens, padding])
+
+        # Segmentation mask
         segmentation = np.ones(self.crop_size, dtype=np.int32)
         segmentation[original_length:] = 0
 
-        # Create position IDs (0 to crop_size-1)
+        # Position IDs
         positions = np.arange(self.crop_size, dtype=np.int32)
 
-        # MaxText-compatible format (autoregressive: inputs = targets)
         return {
-            "inputs": cropped_tokens,
+            "inputs": tokens,
             "inputs_segmentation": segmentation,
             "inputs_position": positions,
-            "targets": cropped_tokens,
+            "targets": tokens,
             "targets_segmentation": segmentation,
             "targets_position": positions,
         }
 
-    def _deserialize_tokens(self, tokens_bytes: bytes) -> np.ndarray:
-        """Deserialize tokens from bytes (uint16 array)."""
-        n_tokens = len(tokens_bytes) // 2  # Each token is 2 bytes (uint16)
-        tokens = struct.unpack(f'{n_tokens}H', tokens_bytes)
-        return np.array(tokens, dtype=np.int32)
 
-    def _deserialize_offsets(self, offsets_bytes: bytes) -> np.ndarray:
-        """Deserialize meas_offsets from bytes (int32 array)."""
-        n_offsets = len(offsets_bytes) // 4  # Each offset is 4 bytes (int32)
-        offsets = struct.unpack(f'{n_offsets}i', offsets_bytes)
-        return np.array(offsets, dtype=np.int32)
-
-
-def create_probe_chunk_pipeline(
+def create_probe_row_pipeline(
     arrayrecord_path: str,
     batch_size: int = 32,
     crop_size: int = 1024,
@@ -269,31 +447,26 @@ def create_probe_chunk_pipeline(
     shuffle_seed: int = 42,
     num_workers: int = 4,
     prefetch_buffer_size: int = 2,
-    build_probe_index: bool = False,
 ) -> grain.IterDataset:
     """
-    Create Grain pipeline for probe-centric chunks.
+    Create Grain pipeline for probe rows (PLAN_3).
 
     Args:
         arrayrecord_path: Path to ArrayRecord file
         batch_size: Batch size for training
         crop_size: Tokens per training example (default: 1024)
-        shuffle: Whether to shuffle chunks
+        shuffle: Whether to shuffle rows
         shuffle_seed: Random seed for shuffling
         num_workers: Number of worker threads
         prefetch_buffer_size: Prefetch buffer size per worker
-        build_probe_index: Build probe index for client-first sampling
 
     Returns:
         Grain IterDataset ready for MaxText training
     """
     # Create data source
-    source = ProbeChunkDataSource(
-        arrayrecord_path=arrayrecord_path,
-        build_probe_index=build_probe_index,
-    )
+    source = ProbeRowDataSource(arrayrecord_path=arrayrecord_path)
 
-    print(f"[ProbeChunkPipeline] Loaded {len(source):,} chunks from {arrayrecord_path}")
+    print(f"[ProbeRowPipeline] Loaded {len(source):,} rows from {arrayrecord_path}")
 
     # Wrap in MapDataset
     dataset = grain.MapDataset.source(source)
@@ -302,12 +475,12 @@ def create_probe_chunk_pipeline(
     if shuffle:
         dataset = dataset.shuffle(seed=shuffle_seed)
 
-    # Random crop with timestamp masking
-    cropper = ProbeChunkCropper(
+    # Generate one context per row (for K contexts, repeat dataset or use multiple epochs)
+    sampler = ProbeRowSampler(
         crop_size=crop_size,
         seed=shuffle_seed,
     )
-    dataset = dataset.random_map(cropper, seed=shuffle_seed)
+    dataset = dataset.random_map(sampler, seed=shuffle_seed)
 
     # Batch
     dataset = dataset.batch(batch_size, drop_remainder=True)
@@ -323,6 +496,6 @@ def create_probe_chunk_pipeline(
     else:
         dataset = dataset.to_iter_dataset()
 
-    print(f"[ProbeChunkPipeline] Pipeline created: batch_size={batch_size}, crop_size={crop_size}")
+    print(f"[ProbeRowPipeline] Pipeline created: batch_size={batch_size}, crop_size={crop_size}")
 
     return dataset
