@@ -31,36 +31,9 @@
 
 ## Available Scripts
 
-### 1. `create_probe_rows.py` - Sequential (Original)
+> **Note:** The sequential `create_probe_rows.py` has been removed. Use the parallel versions below.
 
-**Use when:**
-- Small datasets (< 1M measurements)
-- Learning/testing the pipeline
-- Single-core systems
-- Debugging data issues
-
-**Pros:**
-- ✅ Simple, easy to understand
-- ✅ Low memory usage (~500MB)
-- ✅ No parallelization complexity
-
-**Cons:**
-- ❌ Very slow (4,755 meas/sec)
-- ❌ Not suitable for production
-- ❌ 8+ hours for 200M measurements
-
-**Example:**
-```bash
-python scripts/data/create_probe_rows.py \
-  --input "data/test/shard_0001.parquet" \
-  --output data/probe_rows
-```
-
-**Performance:** ~1m 45s for 500K measurements
-
----
-
-### 2. `create_probe_rows_parallel.py` - Parallel In-Memory
+### 1. `create_probe_rows_parallel.py` - Parallel In-Memory
 
 **Use when:**
 - Medium datasets (1M - 50M measurements)
@@ -102,7 +75,7 @@ failed to allocate data of size 16.0 KiB (24.5 GiB/24.5 GiB used)
 
 ---
 
-### 3. `create_probe_rows_parallel_streaming.py` - Streaming (Recommended)
+### 2. `create_probe_rows_parallel_streaming.py` - Streaming (Recommended)
 
 **Use when:**
 - **Large datasets (50M+ measurements)**
@@ -148,8 +121,8 @@ python scripts/data/create_probe_rows_parallel_streaming.py \
 
 ### Local Development
 ```bash
-# Testing on small subset
-python scripts/data/create_probe_rows.py \
+# Testing on small subset (streaming version)
+python scripts/data/create_probe_rows_parallel_streaming.py \
   --input "data/test/shard_0001.parquet" \
   --output data/probe_rows_test
 
@@ -165,8 +138,8 @@ python scripts/data/create_probe_rows_parallel_streaming.py \
 
 **Option A: High-memory instance (Recommended)**
 ```bash
-# modal_create_probe_rows_v2.py uses streaming by default
-modal run scripts/data/modal_create_probe_rows_v2.py
+# Uses streaming version with 64GB RAM
+modal run scripts/data/modal_create_probe_rows_parallel_streaming.py
 
 # Or deploy locally and run streaming version:
 python scripts/data/create_probe_rows_parallel_streaming.py \
@@ -226,7 +199,6 @@ memory_limit_gb = available_gb - 1.0  # Leave 1GB for system
 
 | Dataset Size | RAM Available | Script | Workers | Time (200M) |
 |--------------|---------------|--------|---------|-------------|
-| < 1M | Any | `sequential` | 1 | 7 hours |
 | 1M - 10M | 8GB+ | `parallel` | 4 | 50 min |
 | 10M - 50M | 16GB+ | `parallel` | 8 | 25 min |
 | 50M - 200M | 16GB+ | **streaming** | 8 | **30 min** ✅ |
@@ -281,8 +253,7 @@ You're using `create_probe_rows_parallel.py` but getting OOM.
 1. **Immediate fix (Modal):**
    ```bash
    # Use streaming version
-   modal deploy scripts/data/modal_create_probe_rows_v2.py
-   modal run probe-rows-preprocessing-v2::create_probe_rows
+   modal run scripts/data/modal_create_probe_rows_parallel_streaming.py
    ```
 
 2. **Local testing:**
@@ -303,15 +274,14 @@ You're using `create_probe_rows_parallel.py` but getting OOM.
 
 ---
 
-## Should We Delete Old Scripts?
+## Available Scripts
 
-**NO** - Keep all three for different use cases:
+We maintain two implementations for different use cases:
 
-- `create_probe_rows.py` → Testing, debugging, small datasets
-- `create_probe_rows_parallel.py` → Medium datasets, high RAM systems
-- `create_probe_rows_parallel_streaming.py` → **Production, Modal, large datasets** ✅
+- `create_probe_rows_parallel.py` → Medium datasets (1M-50M measurements), high RAM systems
+- `create_probe_rows_parallel_streaming.py` → **Production, Modal, large datasets (50M+)** ✅
 
-Each has its place in the workflow.
+The sequential version was removed as the parallel versions are strictly better.
 
 ---
 

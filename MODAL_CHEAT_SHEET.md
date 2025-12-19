@@ -3,7 +3,7 @@
 ## One-Line Command
 
 ```bash
-modal run scripts/data/modal_run_streaming.py
+modal run scripts/data/modal_create_probe_rows_parallel_streaming.py
 ```
 
 **That's it!** Takes 20-25 minutes.
@@ -15,12 +15,17 @@ modal run scripts/data/modal_run_streaming.py
 ### Deploy and Run
 ```bash
 cd /home/zyansheep/Projects/ping-llm
-modal run scripts/data/modal_run_streaming.py
+modal run scripts/data/modal_create_probe_rows_parallel_streaming.py
+```
+
+### Inspect Results (Always Do This!)
+```bash
+modal run scripts/data/modal_inspect_probe_rows.py
 ```
 
 ### Check Volume Contents
 ```bash
-modal volume ls ping-llm-data data/probe_rows
+modal volume ls ping-llm data/probe_rows
 ```
 
 ### View Logs

@@ -219,6 +219,10 @@ def process_probe_batch_from_parquet(args):
             for m in measurements_struct_list
         ]
 
+        # Sort measurements by timestamp (in-memory, per-row sorting)
+        # This is memory-efficient since we only sort one probe at a time
+        measurements.sort(key=lambda m: m['event_time'])
+
         rows = write_probe_to_arrayrecord(writer, src_addr, measurements, max_size_bytes)
         rows_written += rows
         measurements_total += len(measurements)
@@ -258,15 +262,36 @@ def process_parquet_to_probe_rows_streaming(
     train_ratio: float = 0.9,
     num_workers: int = None,
     memory_limit_gb: float = None,
+    assume_ordered: bool = True,
 ):
     """
-    Memory-efficient parallel processing with streaming.
+    Memory-efficient parallel processing with streaming and post-processing sort.
 
     Strategy:
     1. Use DuckDB to write grouped data to disk (avoids OOM)
     2. Stream batches from disk to workers
-    3. Parallel processing of batches
-    4. Merge results
+    3. Sort measurements in-memory per-row (memory-efficient)
+    4. Parallel processing of batches
+    5. Merge results
+
+    Args:
+        input_pattern: Glob pattern for input parquet files
+        output_dir: Output directory for ArrayRecord files
+        max_row_size_mb: Maximum row size in MB
+        train_ratio: Ratio of probes for training set
+        num_workers: Number of worker processes (default: CPU count)
+        memory_limit_gb: DuckDB memory limit in GB (default: available - 1GB)
+        assume_ordered: Only affects outer ordering of result by src_addr.
+                       Does NOT affect measurement ordering (always sorted in post-processing).
+                       Set to False to add ORDER BY src_addr in DuckDB query.
+
+    IMPORTANT: Measurements are ALWAYS sorted by timestamp in post-processing.
+    This happens in parallel workers on a per-row basis, which is extremely
+    memory-efficient (only one probe's measurements in memory at a time).
+    This avoids DuckDB OOM errors from trying to sort 200M+ rows.
+
+    The assume_ordered parameter now only controls whether the GROUP BY result
+    is ordered by src_addr (cosmetic - doesn't affect correctness).
     """
     if num_workers is None:
         num_workers = cpu_count()
@@ -300,6 +325,16 @@ def process_parquet_to_probe_rows_streaming(
         con = duckdb.connect(':memory:')
         con.execute(f"SET memory_limit='{memory_limit_gb}GB'")
 
+        # Enable streaming optimizations
+        con.execute("SET preserve_insertion_order=true")
+        con.execute("SET temp_directory='{}'".format(temp_dir))
+
+        # Try to use external algorithms for large aggregations
+        try:
+            con.execute("SET force_external=true")
+        except:
+            pass  # Older DuckDB versions may not support this
+
         # Get list of input files
         import glob
         parquet_files = sorted(glob.glob(input_pattern))
@@ -314,22 +349,45 @@ def process_parquet_to_probe_rows_streaming(
 
         group_start = time.time()
 
-        con.execute(f"""
-            COPY (
-                SELECT
-                    src_addr,
-                    LIST(STRUCT_PACK(
-                        event_time := event_time,
-                        src_addr := src_addr,
-                        dst_addr := dst_addr,
-                        ip_version := ip_version,
-                        rtt := rtt
-                    ) ORDER BY event_time) as measurements
-                FROM read_parquet('{input_pattern}')
-                GROUP BY src_addr
-                ORDER BY src_addr
-            ) TO '{intermediate_parquet}' (FORMAT PARQUET)
-        """)
+        # Build query - measurements are now sorted in post-processing
+        # Only the outer ORDER BY depends on assume_ordered parameter
+        if assume_ordered:
+            print("  Grouping without ORDER BY (measurements sorted in post-processing)")
+            query = f"""
+                COPY (
+                    SELECT
+                        src_addr,
+                        LIST(STRUCT_PACK(
+                            event_time := event_time,
+                            src_addr := src_addr,
+                            dst_addr := dst_addr,
+                            ip_version := ip_version,
+                            rtt := rtt
+                        )) as measurements
+                    FROM read_parquet('{input_pattern}')
+                    GROUP BY src_addr
+                ) TO '{intermediate_parquet}' (FORMAT PARQUET)
+            """
+        else:
+            print("  Grouping with outer ORDER BY src_addr (measurements sorted in post-processing)")
+            query = f"""
+                COPY (
+                    SELECT
+                        src_addr,
+                        LIST(STRUCT_PACK(
+                            event_time := event_time,
+                            src_addr := src_addr,
+                            dst_addr := dst_addr,
+                            ip_version := ip_version,
+                            rtt := rtt
+                        )) as measurements
+                    FROM read_parquet('{input_pattern}')
+                    GROUP BY src_addr
+                    ORDER BY src_addr
+                ) TO '{intermediate_parquet}' (FORMAT PARQUET)
+            """
+
+        con.execute(query)
 
         group_time = time.time() - group_start
 
@@ -499,6 +557,11 @@ def main():
         default=None,
         help="DuckDB memory limit in GB (default: available - 1GB)"
     )
+    parser.add_argument(
+        "--no-assume-ordered",
+        action="store_true",
+        help="Do NOT assume data is pre-ordered (adds ORDER BY, slower but safer)"
+    )
 
     args = parser.parse_args()
 
@@ -509,6 +572,7 @@ def main():
         train_ratio=args.train_ratio,
         num_workers=args.workers,
         memory_limit_gb=args.memory_limit_gb,
+        assume_ordered=not args.no_assume_ordered,
     )
 
 
