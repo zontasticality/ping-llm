@@ -171,7 +171,7 @@ class ProbeRowSampler(grain.RandomMapTransform):
 
     def map(self, row: dict) -> List[dict]:
         """
-        Generate K contexts from a row (for testing).
+        Generate K contexts from a row (for testing/analysis).
 
         Args:
             row: Row dictionary from ProbeRowDataSource
@@ -437,65 +437,3 @@ class ProbeRowSampler(grain.RandomMapTransform):
             "targets_segmentation": segmentation,
             "targets_position": positions,
         }
-
-
-def create_probe_row_pipeline(
-    arrayrecord_path: str,
-    batch_size: int = 32,
-    crop_size: int = 1024,
-    shuffle: bool = True,
-    shuffle_seed: int = 42,
-    num_workers: int = 4,
-    prefetch_buffer_size: int = 2,
-) -> grain.IterDataset:
-    """
-    Create Grain pipeline for probe rows (PLAN_3).
-
-    Args:
-        arrayrecord_path: Path to ArrayRecord file
-        batch_size: Batch size for training
-        crop_size: Tokens per training example (default: 1024)
-        shuffle: Whether to shuffle rows
-        shuffle_seed: Random seed for shuffling
-        num_workers: Number of worker threads
-        prefetch_buffer_size: Prefetch buffer size per worker
-
-    Returns:
-        Grain IterDataset ready for MaxText training
-    """
-    # Create data source
-    source = ProbeRowDataSource(arrayrecord_path=arrayrecord_path)
-
-    print(f"[ProbeRowPipeline] Loaded {len(source):,} rows from {arrayrecord_path}")
-
-    # Wrap in MapDataset
-    dataset = grain.MapDataset.source(source)
-
-    # Shuffle if requested
-    if shuffle:
-        dataset = dataset.shuffle(seed=shuffle_seed)
-
-    # Generate one context per row (for K contexts, repeat dataset or use multiple epochs)
-    sampler = ProbeRowSampler(
-        crop_size=crop_size,
-        seed=shuffle_seed,
-    )
-    dataset = dataset.random_map(sampler, seed=shuffle_seed)
-
-    # Batch
-    dataset = dataset.batch(batch_size, drop_remainder=True)
-
-    # Convert to IterDataset
-    if num_workers > 0:
-        dataset = dataset.to_iter_dataset(
-            read_options=grain.ReadOptions(
-                num_threads=num_workers,
-                prefetch_buffer_size=prefetch_buffer_size,
-            )
-        )
-    else:
-        dataset = dataset.to_iter_dataset()
-
-    print(f"[ProbeRowPipeline] Pipeline created: batch_size={batch_size}, crop_size={crop_size}")
-
-    return dataset

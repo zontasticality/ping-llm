@@ -1,27 +1,27 @@
 """
-Sample random probe chunks on Modal using the Grain pipeline.
+Sample random probe rows on Modal using the Grain pipeline (PLAN_3).
 
 Purpose:
-- Quick sanity check of ArrayRecord outputs before full training.
-- Uses the same ProbeChunkDataSource + ProbeChunkCropper infrastructure as training.
-- Prints readable token samples from train/test splits.
+- Quick sanity check of ArrayRecord outputs before full training
+- Uses the same ProbeRowDataSource + ProbeRowSampler infrastructure as training
+- Prints readable token samples from train/test splits
+- Measures tokens/second throughput
 
 Usage:
-  modal run scripts/data/modal_sample_probe_chunks.py::sample_chunks
+  modal run scripts/data/modal_sample_probe_chunks.py::sample_rows
 
 Assumes:
-- Modal volume (default: ping-llm) has probe_chunks/{train,test}_shard_*.arrayrecord
-- Or single-file probe_chunks/{train,test}.arrayrecord
+- Modal volume (default: ping-llm) has probe_rows/train.arrayrecord and probe_rows/test.arrayrecord
 """
 
 import os
-import random
 import sys
+import time
 from pathlib import Path
 
 from modal import App, Image, Volume
 
-APP_NAME = "ping-llm-sample-probe-chunks"
+APP_NAME = "ping-llm-sample-probe-rows"
 WORKDIR = "/workspace"
 VOLUME_NAME = os.environ.get("MODAL_VOLUME", "ping-llm")
 
@@ -75,35 +75,12 @@ image = (
     )
     .pip_install("wandb")
     # Stage 3: Copy the rest of the code (fast layer that rebuilds on code changes)
-    # CACHE BUST: 2025-12-16-12 - Changed to SIGINT in train_with_wandb_sync.py
+    # CACHE BUST: 2025-12-18-01 - PLAN_3 refactor
     .add_local_dir(".", WORKDIR, ignore=IGNORE_PATTERNS, copy=False)
 )
 
 app = App(APP_NAME)
 shared_vol = Volume.from_name(VOLUME_NAME, create_if_missing=True)
-
-
-def _find_arrayrecord_files(base_dir: Path, split: str) -> list[Path]:
-    """Find ArrayRecord files for a split, supporting single-file or sharded layouts."""
-    # Prefer nested sharded layout (e.g., base/train/train_shard_*.arrayrecord)
-    nested = sorted((base_dir / split).glob(f"{split}_shard_*.arrayrecord"))
-    if nested:
-        return nested
-
-    # Fallback to single-file layout (e.g., base/train.arrayrecord)
-    top_level = sorted(base_dir.glob(f"{split}*.arrayrecord"))
-    if top_level:
-        return top_level
-
-    raise FileNotFoundError(
-        f"No ArrayRecord files found for split '{split}' in {base_dir}"
-    )
-
-
-def _decode_uint16(data: bytes) -> list[int]:
-    import numpy as np
-
-    return np.frombuffer(data, dtype=np.uint16).tolist()
 
 
 @app.function(
@@ -113,74 +90,92 @@ def _decode_uint16(data: bytes) -> list[int]:
     memory=8 * 1024,
     timeout=60 * 15,
 )
-def sample_chunks(
-    data_dir: str = "/mnt/data/probe_chunks",
+def sample_rows(
+    data_dir: str = "/mnt/data/probe_rows",
     num_samples_per_split: int = 3,
     crop_size: int = 128,
     seed: int = 42,
+    measure_throughput: bool = True,
+    throughput_batches: int = 100,
 ):
     """
     Sample random cropped token windows from train/test ArrayRecord files and print them.
+    Also measure tokens/second throughput.
 
     Args:
-        data_dir: Directory containing train/test ArrayRecord files (sharded or single).
-        num_samples_per_split: Number of random samples to print per split.
-        crop_size: Crop size passed to ProbeChunkCropper (default 128).
-        seed: RNG seed for reproducibility.
+        data_dir: Directory containing train.arrayrecord and test.arrayrecord
+        num_samples_per_split: Number of random samples to print per split
+        crop_size: Crop size passed to ProbeRowSampler (default 128)
+        seed: RNG seed for reproducibility
+        measure_throughput: Whether to measure tokens/second throughput
+        throughput_batches: Number of batches to use for throughput measurement
     """
     sys.path.insert(0, str(Path(WORKDIR)))  # ensure repo imports work
 
     from src.MaxText.input_pipeline._probe_chunk_datasource import (
-        ProbeChunkDataSource,
-        ProbeChunkCropper,
+        ProbeRowDataSource,
+        ProbeRowSampler,
+    )
+    from tokenization import (
+        decode_token_stream_pretty,
+        decode_tokens_to_measurements,
     )
 
     base = Path(data_dir)
-    rng = random.Random(seed)
 
     for split in ["train", "test"]:
-        files = _find_arrayrecord_files(base, split)
+        arrayrecord_file = base / f"{split}.arrayrecord"
+
+        if not arrayrecord_file.exists():
+            print(f"\n== Split: {split} ==")
+            print(f"ArrayRecord file not found: {arrayrecord_file}")
+            continue
+
         print(f"\n== Split: {split} ==")
-        print(f"Found {len(files)} ArrayRecord file(s)")
-        for f in files[:3]:
-            print(f"  - {f}")
+        print(f"ArrayRecord file: {arrayrecord_file}")
 
-        # Sample from one shard (pick random shard for variety)
-        shard_path = rng.choice(files)
-        print(f"Sampling from shard: {shard_path}")
-        source = ProbeChunkDataSource(str(shard_path), build_probe_index=False)
-        cropper = ProbeChunkCropper(crop_size=crop_size, seed=seed)
+        # Create data source
+        source = ProbeRowDataSource(str(arrayrecord_file))
+        print(f"Total rows: {len(source):,}")
 
+        # Create sampler
+        sampler = ProbeRowSampler(crop_size=crop_size, seed=seed)
+
+        # Sample random rows
+        import random
+        rng = random.Random(seed)
         n = len(source)
+
         if n == 0:
-            print(f"  (no chunks in {files[0]})")
+            print(f"  (no rows in {arrayrecord_file})")
             continue
 
         indices = [rng.randrange(n) for _ in range(min(num_samples_per_split, n))]
+
         for i, idx in enumerate(indices, 1):
-            chunk = source[idx]
-            cropped = cropper.random_map(chunk, rng)
+            row = source[idx]
 
-            # ProbeChunkCropper outputs MaxText-format fields; use inputs as the cropped token window
-            tokens = cropped["inputs"].tolist()
-            seg = cropped.get("inputs_segmentation")
-            from tokenization import (
-                decode_token_stream_pretty,
-                decode_tokens_to_measurements,
-            )
+            # Generate one context using the sampler
+            context = sampler.random_map(row, rng)
 
+            # Extract token stream and segmentation
+            tokens = context["inputs"].tolist()
+            seg = context["inputs_segmentation"]
+
+            # Decode for display
             pretty_tokens = decode_token_stream_pretty(tokens)
             measurements = decode_tokens_to_measurements(
                 tokens, segmentation=seg.tolist() if hasattr(seg, "tolist") else seg
             )
-            meta = chunk["metadata"]
-            print(f"\n  Sample {i} (idx {idx}):")
-            print(
-                f"    src_id={chunk['src_id']} part={meta['part_id']} bucket_start={meta['bucket_start_time']}"
-            )
-            print(
-                f"    chunk_tokens={chunk['n_tokens']}, meas={chunk['n_measurements']}, crop_size={len(tokens)}"
-            )
+
+            meta = row["metadata"]
+            print(f"\n  Sample {i} (row {idx}):")
+            print(f"    src_id={row['src_id']}")
+            print(f"    n_measurements={row['n_measurements']:,}")
+            print(f"    time_span={meta['time_span_seconds']:.1f}s")
+            print(f"    first_timestamp={meta['first_timestamp']}")
+            print(f"    last_timestamp={meta['last_timestamp']}")
+            print(f"    crop_size={crop_size}, actual_tokens={seg.sum()}")
             print(f"    token stream (first 64): {pretty_tokens[:64]}")
             if len(tokens) > 64:
                 print(f"    token stream (last 16): {pretty_tokens[-16:]}")
@@ -191,7 +186,34 @@ def sample_chunks(
                     for b in meas["blocks"]:
                         print(f"        - {b}")
 
+        # Measure throughput if requested
+        if measure_throughput and n > 0:
+            print(f"\n  === Throughput Test ({throughput_batches} batches, crop_size={crop_size}) ===")
+
+            start_time = time.time()
+            total_tokens = 0
+
+            for batch_idx in range(throughput_batches):
+                # Sample random row
+                row_idx = rng.randrange(n)
+                row = source[row_idx]
+
+                # Generate context
+                context = sampler.random_map(row, rng)
+
+                # Count real tokens (not padding)
+                seg = context["inputs_segmentation"]
+                total_tokens += seg.sum()
+
+            elapsed = time.time() - start_time
+            tokens_per_sec = total_tokens / elapsed
+
+            print(f"    Total tokens generated: {total_tokens:,}")
+            print(f"    Time elapsed: {elapsed:.2f}s")
+            print(f"    Throughput: {tokens_per_sec:,.0f} tokens/sec")
+            print(f"    Throughput: {tokens_per_sec / 1000:.1f}K tokens/sec")
+
 
 @app.local_entrypoint()
 def main():
-    sample_chunks.remote()
+    sample_rows.remote()

@@ -9,7 +9,7 @@ Probe-centric big-row data loading from ArrayRecord:
    - Multi-scale temporal learning (log-uniform window sampling)
    - Runtime tokenization with data augmentation (3 timestamp modes)
    - Probe-centric design (perfect for federated/decentralized training)
-   - Requires running scripts/data/create_probe_rows.py first
+   - Requires running scripts/data/create_probe_rows_parallel_streaming.py first
 """
 
 import sys
@@ -37,7 +37,7 @@ def create_probe_chunk_dataset(
     grain_per_worker_buffer_size: int = 2,
 ) -> grain.IterDataset:
     """
-    Create probe-centric row dataset (DATA_LOADING_PLAN_3).
+    Create probe-centric row dataset (PLAN_3).
 
     This is the RECOMMENDED approach for production training. It provides:
     - Minimal padding (<5% vs 50-90%)
@@ -47,7 +47,7 @@ def create_probe_chunk_dataset(
     - ArrayRecord format (optimized for random access)
 
     Prerequisites:
-        Run scripts/data/create_probe_rows.py to create probe row data first.
+        Run scripts/data/modal_create_probe_rows_parallel_streaming.py to create probe row data first.
 
     Args:
         data_file_pattern: Path to ArrayRecord file (e.g., "data/probe_rows/train.arrayrecord")
@@ -73,20 +73,20 @@ def create_probe_chunk_dataset(
             f"Run: python scripts/data/create_probe_rows.py"
         )
 
-    max_logging.log(f"[DATA_LOADING_PLAN_3] Loading probe-centric rows from {arrayrecord_path}")
-    max_logging.log(f"[DATA_LOADING_PLAN_3] Crop size: {crop_size} tokens per training example")
-    max_logging.log(f"[DATA_LOADING_PLAN_3] Training modes: 40% full_timestamp, 30% partial_timestamp, 30% no_timestamp")
+    max_logging.log(f"[PLAN_3] Loading probe-centric rows from {arrayrecord_path}")
+    max_logging.log(f"[PLAN_3] Crop size: {crop_size} tokens per training example")
+    max_logging.log(f"[PLAN_3] Training modes: 40% full_timestamp, 30% partial_timestamp, 30% no_timestamp")
 
     # Multi-epoch support (repeat dataset)
     if num_epoch > 1:
-        max_logging.log(f"[DATA_LOADING_PLAN_3] WARNING: Multi-epoch repeat not yet implemented for ArrayRecord")
-        max_logging.log(f"[DATA_LOADING_PLAN_3] Will use single epoch. Implement repeat in training loop instead.")
+        max_logging.log(f"[PLAN_3] WARNING: Multi-epoch repeat not yet implemented for ArrayRecord")
+        max_logging.log(f"[PLAN_3] Will use single epoch. Implement repeat in training loop instead.")
 
     # Distributed loading support
     if dataloading_host_count > 1:
-        max_logging.log(f"[DATA_LOADING_PLAN_3] WARNING: Distributed loading across {dataloading_host_count} hosts")
-        max_logging.log(f"[DATA_LOADING_PLAN_3] ArrayRecord sharding not yet implemented - all hosts will read same data")
-        max_logging.log(f"[DATA_LOADING_PLAN_3] For distributed training, pre-shard ArrayRecord files by host")
+        max_logging.log(f"[PLAN_3] WARNING: Distributed loading across {dataloading_host_count} hosts")
+        max_logging.log(f"[PLAN_3] ArrayRecord sharding not yet implemented - all hosts will read same data")
+        max_logging.log(f"[PLAN_3] For distributed training, pre-shard ArrayRecord files by host")
 
     # Create probe row pipeline
     dataset = build_probe_chunk_dataset(
@@ -99,7 +99,7 @@ def create_probe_chunk_dataset(
         prefetch_buffer_size=grain_per_worker_buffer_size,
     )
 
-    max_logging.log(f"[DATA_LOADING_PLAN_3] Probe row dataset created successfully")
-    max_logging.log(f"[DATA_LOADING_PLAN_3] Benefits: minimal padding, multi-scale temporal learning, runtime tokenization")
+    max_logging.log(f"[PLAN_3] Probe row dataset created successfully")
+    max_logging.log(f"[PLAN_3] Benefits: minimal padding, multi-scale temporal learning, runtime tokenization")
 
     return dataset
