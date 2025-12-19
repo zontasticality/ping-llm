@@ -146,6 +146,7 @@ class DatasetType(str, Enum):
   HF = "hf"
   GRAIN = "grain"
   TFDS = "tfds"
+  NETWORK = "network"
 
 
 class SamplingStrategy(str, Enum):
@@ -923,6 +924,16 @@ class GrainDataset(BaseModel):
   )
 
 
+class NetworkDataset(BaseModel):
+  """Configuration specific to Network measurement datasets."""
+
+  network_data_format: str = Field("probe_chunks", description="Format of network data: 'probe_chunks' or 'network_parquet'.")
+  network_train_files: PathStr = Field("", description="Path to network training files.")
+  network_eval_files: PathStr = Field("", description="Path to network evaluation files.")
+  grain_debug_mode: bool = Field(False, description="Enable Grain debug mode for performance analysis.")
+  grain_visualization_dir: PathStr = Field("", description="Directory for Grain pipeline visualization output.")
+
+
 class FineTuning(BaseModel):
   """Configuration for fine-tuning methods like DPO, SFT, and GRPO."""
 
@@ -1597,6 +1608,7 @@ class MaxTextConfig(
     TfdsDataset,
     HfDataset,
     GrainDataset,
+    NetworkDataset,
     Tokenizer,
     # Inference
     InferenceGeneral,

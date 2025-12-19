@@ -24,6 +24,7 @@ from MaxText.input_pipeline._grain_data_processing import make_grain_train_itera
 from MaxText.input_pipeline._hf_data_processing import make_hf_train_iterator, make_hf_eval_iterator
 from MaxText.input_pipeline._tfds_data_processing import make_tfds_train_iterator, make_tfds_eval_iterator
 from MaxText.input_pipeline._tfds_data_processing_c4_mlperf import make_c4_mlperf_train_iterator, make_c4_mlperf_eval_iterator
+from MaxText.input_pipeline._network_data_processing import make_network_train_iterator, make_network_eval_iterator
 from MaxText.input_pipeline.synthetic_data_processing import SyntheticDataIterator, PlaceHolderDataIterator
 
 
@@ -65,17 +66,18 @@ def create_data_iterator(config: pyconfig.HyperParameters, mesh):
       "grain": (make_grain_train_iterator, make_grain_eval_iterator),
       "hf": (make_hf_train_iterator, make_hf_eval_iterator),
       "c4_mlperf": (make_c4_mlperf_train_iterator, make_c4_mlperf_eval_iterator),
+      "network": (make_network_train_iterator, make_network_eval_iterator),
   }
 
   # Collect train and eval iterators
-  if config.dataset_type in ["tfds", "grain", "hf", "c4_mlperf"]:
+  if config.dataset_type in ["tfds", "grain", "hf", "c4_mlperf", "network"]:
     if config.dataset_type == "c4_mlperf":
       assert config.packing, "c4_mlperf dataloader only works with packing. For padded version, use tfds dataloader"
     train_iterator, eval_iterator = dataset_type_to_train_eval_iterator[config.dataset_type]
   else:
     max_logging.log(
         f"WARNING: '{config.dataset_type}' is not a supported dataset type."
-        "Using synthetic data. Please choose from 'tfds', 'grain', 'hf', or 'c4_mlperf'."
+        "Using synthetic data. Please choose from 'tfds', 'grain', 'hf', 'c4_mlperf', or 'network'."
     )
     output_train_iterator, output_eval_iterator = SyntheticDataIterator(config, mesh), None
     return output_train_iterator, output_eval_iterator

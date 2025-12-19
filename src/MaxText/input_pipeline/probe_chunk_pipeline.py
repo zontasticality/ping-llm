@@ -38,6 +38,8 @@ def build_probe_chunk_dataset(
     shuffle_seed: int = 42,
     num_workers: int = 0,
     prefetch_buffer_size: int = 2,
+    use_multiprocessing: bool = True,
+    ram_budget_mb: int = 8192,
 ) -> grain.IterDataset:
     """
     Construct the probe-row Grain pipeline (DATA_LOADING_PLAN_3).
@@ -50,10 +52,14 @@ def build_probe_chunk_dataset(
         shuffle_seed: Seed for shuffle + sampler RNG
         num_workers: Grain read threads (0 disables threading)
         prefetch_buffer_size: Prefetch buffer per worker
+        use_multiprocessing: Whether to use mp_prefetch for parallel processing
+        ram_budget_mb: RAM budget for auto-tuning multiprocessing workers
 
     Returns:
         grain.IterDataset ready for consumption (training or analysis)
     """
+    from grain.experimental import pick_performance_config
+
     path = Path(arrayrecord_path).expanduser().resolve()
     if not path.exists():
         raise FileNotFoundError(f"ArrayRecord file not found: {path}")
@@ -64,17 +70,20 @@ def build_probe_chunk_dataset(
     if shuffle:
         dataset = dataset.shuffle(seed=shuffle_seed)
 
+    # Repeat infinitely - with data augmentation, same rows generate different contexts
+    dataset = dataset.repeat(None)
+
     sampler = ProbeRowSampler(
         crop_size=crop_size,
         seed=shuffle_seed,
     )
-    # Use random_map to generate one context per row
-    # Note: This generates 1 context per row. For K contexts, repeat the dataset
-    # or iterate multiple epochs
-    dataset = dataset.random_map(sampler, seed=shuffle_seed)
+    # Apply FlatMapTransform to generate K contexts per row
+    # K is calculated based on row size (larger rows = more contexts)
+    # With repeat(), each row generates fresh random samples on each epoch
+    dataset = dataset.apply(sampler)
 
-    dataset = dataset.batch(batch_size, drop_remainder=True)
-
+    # IMPORTANT FIX: Convert to IterDataset BEFORE batching
+    # This allows parallel processing of individual elements
     if num_workers > 0:
         dataset = dataset.to_iter_dataset(
             read_options=grain.ReadOptions(
@@ -84,5 +93,19 @@ def build_probe_chunk_dataset(
         )
     else:
         dataset = dataset.to_iter_dataset()
+
+    # Batch AFTER converting to IterDataset (correct ordering)
+    dataset = dataset.batch(batch_size, drop_remainder=True)
+
+    # Add multiprocessing for parallel tokenization (CRITICAL for performance)
+    if use_multiprocessing:
+        multiprocessing_options = pick_performance_config(
+            ds=dataset,
+            ram_budget_mb=ram_budget_mb,
+            max_workers=None,  # Auto-tune
+            max_buffer_size=None,  # Auto-tune
+        ).multiprocessing_options
+
+        dataset = dataset.mp_prefetch(multiprocessing_options)
 
     return dataset

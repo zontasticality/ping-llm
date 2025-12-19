@@ -97,6 +97,8 @@ def sample_rows(
     seed: int = 42,
     measure_throughput: bool = True,
     throughput_batches: int = 100,
+    num_workers: int = 0,
+    worker_buffer_size: int = 16,
 ):
     """
     Sample random cropped token windows from train/test ArrayRecord files and print them.
@@ -109,6 +111,8 @@ def sample_rows(
         seed: RNG seed for reproducibility
         measure_throughput: Whether to measure tokens/second throughput
         throughput_batches: Number of batches to use for throughput measurement
+        num_workers: Number of Grain worker processes (0=single-threaded, recommend 4+ for throughput test)
+        worker_buffer_size: Prefetch buffer size per worker
     """
     sys.path.insert(0, str(Path(WORKDIR)))  # ensure repo imports work
 
@@ -188,30 +192,73 @@ def sample_rows(
 
         # Measure throughput if requested
         if measure_throughput and n > 0:
-            print(f"\n  === Throughput Test ({throughput_batches} batches, crop_size={crop_size}) ===")
+            if num_workers > 0:
+                # Use Grain pipeline with multiprocessing for realistic throughput test
+                from src.MaxText.input_pipeline.probe_chunk_pipeline import build_probe_chunk_dataset
 
-            start_time = time.time()
-            total_tokens = 0
+                print(f"\n  === Throughput Test ({throughput_batches} batches, crop_size={crop_size}, workers={num_workers}) ===")
+                print(f"    Using Grain multiprocessing pipeline (matches training)")
 
-            for batch_idx in range(throughput_batches):
-                # Sample random row
-                row_idx = rng.randrange(n)
-                row = source[row_idx]
+                batch_size = 32
+                dataset = build_probe_chunk_dataset(
+                    arrayrecord_path=str(arrayrecord_file),
+                    batch_size=batch_size,
+                    crop_size=crop_size,
+                    shuffle=True,
+                    shuffle_seed=seed,
+                    num_workers=num_workers,
+                    prefetch_buffer_size=worker_buffer_size,
+                )
 
-                # Generate context
-                context = sampler.random_map(row, rng)
+                start_time = time.time()
+                total_tokens = 0
+                batches_consumed = 0
 
-                # Count real tokens (not padding)
-                seg = context["inputs_segmentation"]
-                total_tokens += seg.sum()
+                for batch in dataset:
+                    # Count real tokens in batch (not padding)
+                    seg = batch["inputs_segmentation"]
+                    total_tokens += seg.sum()
+                    batches_consumed += 1
 
-            elapsed = time.time() - start_time
-            tokens_per_sec = total_tokens / elapsed
+                    if batches_consumed >= throughput_batches:
+                        break
 
-            print(f"    Total tokens generated: {total_tokens:,}")
-            print(f"    Time elapsed: {elapsed:.2f}s")
-            print(f"    Throughput: {tokens_per_sec:,.0f} tokens/sec")
-            print(f"    Throughput: {tokens_per_sec / 1000:.1f}K tokens/sec")
+                elapsed = time.time() - start_time
+                tokens_per_sec = total_tokens / elapsed
+
+                print(f"    Batches consumed: {batches_consumed}")
+                print(f"    Total tokens generated: {total_tokens:,}")
+                print(f"    Time elapsed: {elapsed:.2f}s")
+                print(f"    Throughput: {tokens_per_sec:,.0f} tokens/sec")
+                print(f"    Throughput: {tokens_per_sec / 1000:.1f}K tokens/sec")
+                print(f"    Throughput: {tokens_per_sec / 1_000_000:.2f}M tokens/sec")
+            else:
+                # Single-threaded fallback
+                print(f"\n  === Throughput Test ({throughput_batches} batches, crop_size={crop_size}, single-threaded) ===")
+                print(f"    WARNING: Running single-threaded. Use --num-workers for parallel test.")
+
+                start_time = time.time()
+                total_tokens = 0
+
+                for batch_idx in range(throughput_batches):
+                    # Sample random row
+                    row_idx = rng.randrange(n)
+                    row = source[row_idx]
+
+                    # Generate context
+                    context = sampler.random_map(row, rng)
+
+                    # Count real tokens (not padding)
+                    seg = context["inputs_segmentation"]
+                    total_tokens += seg.sum()
+
+                elapsed = time.time() - start_time
+                tokens_per_sec = total_tokens / elapsed
+
+                print(f"    Total tokens generated: {total_tokens:,}")
+                print(f"    Time elapsed: {elapsed:.2f}s")
+                print(f"    Throughput: {tokens_per_sec:,.0f} tokens/sec")
+                print(f"    Throughput: {tokens_per_sec / 1000:.1f}K tokens/sec")
 
 
 @app.local_entrypoint()

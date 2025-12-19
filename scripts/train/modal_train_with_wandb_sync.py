@@ -2,18 +2,21 @@
 
 Prereqs:
   - Modal volume `ping-llm` (or set MODAL_VOLUME) with:
-      data/sharded/train/*.parquet
-      data/sharded/test/*.parquet
+      data/probe_rows/train.arrayrecord  (PLAN_3)
+      data/probe_rows/test.arrayrecord   (PLAN_3)
   - WANDB_API_KEY provided via environment or Modal secret (set MODAL_WANDB_SECRET name).
 
 Usage:
   modal run scripts/train/modal_train_with_wandb_sync.py::run \
-    --run-name plan2_modal_wb_sync \
-    --steps 200000 \
-    --batch-size 32 \
-    --grain-workers 8 \
-    --wandb-project ping-llm-plan2 \
-    --wandb-mode online
+    --run-name plan3_modal_test \
+    --steps 5000 \
+    --batch-size 128 \
+    --wandb-project ping-llm-plan3
+
+Note:
+  - Uses latency_network.yml (64 workers for 64-core A100-80GB)
+  - Multiprocessing enabled for parallel tokenization (PLAN_3)
+  - Expected throughput: ~320K-850K tokens/sec
 """
 
 import os
@@ -84,7 +87,7 @@ image = (
     )
     .pip_install("wandb")
     # Stage 3: Copy the rest of the code (fast layer that rebuilds on code changes)
-    # CACHE BUST: 2025-12-16-12 - Changed to SIGINT in train_with_wandb_sync.py
+    # CACHE BUST: 2025-12-18-04 - Fix Grain mp_prefetch worker state initialization
     .add_local_dir(".", WORKDIR, ignore=IGNORE_PATTERNS, copy=True)
 )
 
@@ -94,17 +97,17 @@ shared_vol = modal.Volume.from_name(VOLUME_NAME, create_if_missing=True)
 
 @app.function(
     image=image,
-    gpu="A100-40GB",
-    cpu=16,  # Allocate 16 CPUs for data loading (12 grain workers + 4 for GPU/system)
+    gpu="B200",
+    cpu=8,  # A100-80GB with 64 CPUs for parallel data loading
     volumes={"/mnt": shared_vol},
     secrets=[modal.Secret.from_name("wandb-secret")],
     timeout=60 * 60 * 24,  # 24 hours (Modal max 86400s)
 )
 def run(
-    run_name: str = "plan2_modal_wb_sync",
-    steps: int = 200_000,
-    batch_size: int = 32,
-    wandb_project: str = "ping-llm-plan2",
+    run_name: str = "full_run",
+    steps: int = 5_000,
+    batch_size: int = 128,
+    wandb_project: str = "full_run",
 ):
     import signal
     import atexit
@@ -140,9 +143,11 @@ def run(
     # Register cleanup handler to send SIGINT on exit
     def cleanup_handler():
         if process.poll() is None:  # Process still running
-            print("\n" + "="*80)
-            print("⚠️  Container shutting down - sending interrupt to training process...")
-            print("="*80)
+            print("\n" + "=" * 80)
+            print(
+                "⚠️  Container shutting down - sending interrupt to training process..."
+            )
+            print("=" * 80)
             process.send_signal(signal.SIGINT)
             try:
                 process.wait(timeout=25)  # Modal gives 30s grace period
@@ -150,7 +155,7 @@ def run(
             except subprocess.TimeoutExpired:
                 print("⚠️  Training did not exit in time")
                 process.kill()
-            print("="*80)
+            print("=" * 80)
 
     atexit.register(cleanup_handler)
 

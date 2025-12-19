@@ -47,6 +47,7 @@ class ProbeRowDataSource(grain.RandomAccessDataSource):
     - Random access to rows via ArrayRecord
     - Efficient deserialization of PyArrow IPC measurements
     - Returns raw measurements for runtime tokenization
+    - Pickleable for multiprocessing (recreates reader per process)
     """
 
     def __init__(self, arrayrecord_path: str):
@@ -55,11 +56,35 @@ class ProbeRowDataSource(grain.RandomAccessDataSource):
             arrayrecord_path: Path to ArrayRecord file (e.g., data/probe_rows/train.arrayrecord)
         """
         self.arrayrecord_path = arrayrecord_path
-        self.reader = array_record_module.ArrayRecordReader(arrayrecord_path)
-        self._length = self.reader.num_records()
+        self._reader = None
+        self._length = None
+
+    @property
+    def reader(self):
+        """Lazy-load reader (recreated after unpickling)."""
+        if self._reader is None:
+            self._reader = array_record_module.ArrayRecordReader(self.arrayrecord_path)
+            self._length = self._reader.num_records()
+        return self._reader
 
     def __len__(self):
+        if self._length is None:
+            # Initialize reader to get length
+            _ = self.reader
         return self._length
+
+    def __getstate__(self):
+        """Return state for pickling (exclude unpickleable reader)."""
+        return {
+            'arrayrecord_path': self.arrayrecord_path,
+            '_length': self._length,
+        }
+
+    def __setstate__(self, state):
+        """Restore state after unpickling (reader will be recreated lazily)."""
+        self.arrayrecord_path = state['arrayrecord_path']
+        self._length = state['_length']
+        self._reader = None  # Will be recreated on first access
 
     def _deserialize_measurements(self, measurements_bytes: bytes) -> List[dict]:
         """Deserialize measurements from PyArrow IPC format."""
@@ -121,13 +146,19 @@ class ProbeRowDataSource(grain.RandomAccessDataSource):
         }
 
 
-class ProbeRowSampler(grain.RandomMapTransform):
+class ProbeRowSampler(grain.experimental.FlatMapTransform):
     """
-    Generate ONE training context per row with PLAN_3 sampling.
+    Generate K training contexts per row with PLAN_3 sampling.
 
-    This will be called K times per row via dataset repetition.
+    For each row, generates K contexts where K is based on row size.
+    Each context uses different random sampling with data augmentation.
 
-    For each call:
+    Data augmentation ensures same row generates different contexts on each pass:
+    - Random window sampling (log-uniform for large rows)
+    - Random timestamp modes (40% full, 30% partial, 30% none)
+    - Random field ordering
+
+    For each context:
     1. Sample measurement window (small row: all, large row: log-uniform)
     2. Select timestamp mode (40% full, 30% partial, 30% none)
     3. Tokenize with field randomization
@@ -155,23 +186,15 @@ class ProbeRowSampler(grain.RandomMapTransform):
         self.max_K = max_contexts_per_row
         self.mode_weights = mode_weights
         self.seed = seed
+        self.max_fan_out = max_contexts_per_row  # Required by FlatMapTransform
+        self._call_count = 0  # Track calls for seed variation
 
-    def random_map(self, row: dict, rng: random.Random) -> dict:
+    def flat_map(self, row: dict) -> List[dict]:
         """
-        Generate ONE context from a row.
+        Generate K contexts from a row.
 
-        Args:
-            row: Row dictionary from ProbeRowDataSource
-            rng: Random number generator from Grain
-
-        Returns:
-            Single context dictionary
-        """
-        return self._generate_one_context(row, rng)
-
-    def map(self, row: dict) -> List[dict]:
-        """
-        Generate K contexts from a row (for testing/analysis).
+        With repeat(), same row can generate different contexts on each epoch
+        due to varying seed based on call count.
 
         Args:
             row: Row dictionary from ProbeRowDataSource
@@ -186,7 +209,15 @@ class ProbeRowSampler(grain.RandomMapTransform):
         K = min(ceil(n / self.avg_tokens_per_meas), self.max_K)
         K = max(K, 1)  # At least 1 context
 
-        rng = random.Random(self.seed)
+        # Vary seed per call to generate different contexts on repeat
+        # Combine: base_seed + src_id + call_count
+        row_seed = self.seed if self.seed is not None else 0
+        src_id = row.get('src_id', 0)
+        combined_seed = (row_seed * 1000000) + (src_id * 1000) + self._call_count
+        self._call_count += 1
+
+        # Use numpy Generator for random sampling (has 'integers' method for RNG detection)
+        rng = np.random.default_rng(combined_seed)
         contexts = []
         for _ in range(K):
             context = self._generate_one_context(row, rng)

@@ -52,36 +52,37 @@ eval_steps: 100           # Run 100 eval steps
 enable_tensorboard: true  # Enable TensorBoard logging
 tensorboard_dir: ""       # Auto-set to base_output_directory/tensorboard
 
-# Dataset
-# Two data loading modes available:
+# Dataset - Network Backend
+# Uses custom network data processing pipeline for network measurement data
 #
-# MODE 1 (RECOMMENDED): Probe-centric chunks (DATA_LOADING_PLAN_1)
-#   - 50-100x faster I/O than parquet
-#   - Pre-tokenized probe-centric 5-minute buckets
-#   - Perfect for federated/decentralized training
-#   - Requires running: python scripts/data/create_probe_chunks.py
-#   - Set grain_file_type: "probe_chunks"
+# Available data formats:
+#   - probe_chunks: Probe-centric rows with runtime tokenization (PLAN_3) - RECOMMENDED
+#     * Multi-scale temporal learning (log-uniform window sampling)
+#     * Minimal padding (<5% vs 50-90% in previous plans)
+#     * Data augmentation with 3 timestamp modes
+#     * Requires: modal run scripts/data/modal_create_probe_rows_parallel_streaming.py
+#   - network_parquet: Legacy parquet shards (PLAN_2) - Not yet implemented
 #
-# MODE 2 (Legacy): Parquet shards with window-based sampling (PLAN_2)
-#   - Good for testing and development
-#   - 64 measurements sampled at training time
-#   - Set grain_file_type: "network_parquet"
-#
-dataset_type: "grain"
+dataset_type: "network"
 packing: False  # Disable packing to avoid SequenceDescriptor incompatibility with cudnn_flash_te
 
-# ACTIVE MODE: Probe chunks (DATA_LOADING_PLAN_1) - RECOMMENDED
-grain_file_type: "probe_chunks"
-grain_train_files: "data/probe_chunks/train.arrayrecord"
-grain_eval_files: "data/probe_chunks/test.arrayrecord"
+# Network data configuration
+network_data_format: "probe_chunks"
+network_train_files: "data/probe_rows/train.arrayrecord"
+network_eval_files: "data/probe_rows/test.arrayrecord"
 
-# LEGACY MODE: Parquet shards (PLAN_2) - Uncomment to use
-# grain_file_type: "network_parquet"
-# grain_train_files: "data/sharded/train/*.parquet"
-# grain_eval_files: "data/sharded/test/*.parquet"
+# Data loading parallelism
+# OPTIMIZED: Increased workers to reduce source bottleneck (was 4)
+grain_worker_count: 16  # Parallel ArrayRecord reads (increased for B200)
+grain_per_worker_buffer_size: 8  # Larger buffer for better throughput
+grain_worker_count_eval: 8  # Same for eval
+grain_per_worker_buffer_size_eval: 8
+grain_ram_budget_mb: 16384  # 16GB RAM budget for mp_prefetch auto-tuning
 
-grain_worker_count: 12  # Use 12 workers (out of 16 cores, leaving 4 for GPU/system)
-grain_per_worker_buffer_size: 32  # Large buffer per worker for maximum throughput (12 workers * 32 = 384 batches buffered)
+# Grain debugging (optional - enable for performance analysis)
+# Uncomment to enable:
+grain_debug_mode: true  # Log execution metrics every 60s (identifies bottlenecks)
+# grain_visualization_dir: "/tmp/grain_viz"  # Generate pipeline visualization graph
 
 # Attention & Positional Encoding
 attention: "cudnn_flash_te"
