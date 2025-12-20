@@ -285,6 +285,7 @@ def decode_batch_with_engine(
     stop_token,
     rng,
     temperature=1.0,
+    sampling_strategy=None,
     progress_interval=1,
     batch_label="",
 ):
@@ -309,6 +310,7 @@ def decode_batch_with_engine(
             rng=rng_prefill,
             slot=slot,
             temperature=temperature,
+            algorithm=sampling_strategy,
         )
         decode_state = engine.insert(
             prefix=prefix, decode_state=decode_state, slot=slot
@@ -346,6 +348,7 @@ def decode_batch_with_engine(
             decode_state=decode_state,
             rng=rng_gen,
             temperature=temperature,
+            algorithm=sampling_strategy,
         )
         tokens = np.asarray(result_tokens.data)[:, result_tokens.tokens_idx[0]]
 
@@ -379,6 +382,7 @@ def decode_streams_with_engine(
     stop_token,
     rng,
     temperature=1.0,
+    sampling_strategy=None,
     progress_interval=1,
 ):
     """Decode sequences in chunks that fit the engine's max concurrent decodes."""
@@ -400,6 +404,7 @@ def decode_streams_with_engine(
             stop_token,
             rng,
             temperature=temperature,
+            sampling_strategy=sampling_strategy,
             progress_interval=progress_interval,
             batch_label=f"batch {batch_idx}",
         )
@@ -422,6 +427,7 @@ def run_eval(
     seed=42,
     max_new_tokens=20,
     temperature=1.0,
+    sampling_strategy="weighted",
     progress_interval=1,
     print_per_variant=2,
     print_max_tokens=120,
@@ -485,6 +491,7 @@ def run_eval(
             stop_token=MEASUREMENT_START,
             rng=rng,
             temperature=temperature,
+            sampling_strategy=sampling_strategy,
             progress_interval=progress_interval,
         )
 
@@ -582,6 +589,12 @@ def main():
         "--temperature", type=float, default=1.0, help="Sampling temperature"
     )
     parser.add_argument(
+        "--sampling-strategy",
+        type=str,
+        default="weighted",
+        help="Sampling strategy: greedy, weighted, nucleus, topk, or composite",
+    )
+    parser.add_argument(
         "--progress-interval",
         type=int,
         default=1,
@@ -609,6 +622,7 @@ def main():
         num_samples=args.num_samples,
         max_new_tokens=args.max_new_tokens,
         temperature=args.temperature,
+        sampling_strategy=args.sampling_strategy,
         progress_interval=args.progress_interval,
         print_per_variant=args.print_per_variant,
         print_max_tokens=args.print_max_tokens,
@@ -645,6 +659,7 @@ if MODAL_AVAILABLE:
         num_samples: int = 100,
         max_new_tokens: int = 20,
         temperature: float = 1.0,
+        sampling_strategy: str = "weighted",
         progress_interval: int = 1,
         print_per_variant: int = 2,
         print_max_tokens: int = 120,
@@ -700,6 +715,8 @@ if MODAL_AVAILABLE:
             str(max_new_tokens),
             "--temperature",
             str(temperature),
+            "--sampling-strategy",
+            str(sampling_strategy),
             "--progress-interval",
             str(progress_interval),
             "--print-per-variant",

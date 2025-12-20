@@ -50,7 +50,69 @@ INTERPRETATION:
   - Higher likelihood = model learned that conditional better
 ```
 
-## Step 2B: Evaluate with Live Pings (KL Divergence)
+## Step 2B: Evaluate Next-Token Predictions (Pretty-Printed)
+
+This script shows exactly what the model predicts vs actual tokens at each position, helping you understand where the model succeeds and fails.
+
+**Local CPU:**
+```bash
+python scripts/eval_next_token_predictions.py \
+    --checkpoint checkpoints/full_run/checkpoints/2000 \
+    --data data/probe_rows/test.arrayrecord \
+    --num-sequences 5 \
+    --max-length 100
+```
+
+**Modal GPU (faster):**
+```bash
+modal run scripts/eval_next_token_predictions.py::eval_on_modal \
+    --num-sequences 10 \
+    --max-length 150
+```
+
+**What it does:**
+- Loads evaluation sequences from arrayrecord data
+- For each position in the sequence, predicts the next token
+- Shows predicted vs actual tokens in color-coded format
+- Reports accuracy metrics
+
+**Example output:**
+```
+SEQUENCE 1/5
+Length: 89 tokens
+
+Sequence: MEASUREMENT_START SRC_IPV4 Byte(0xC0/192) Byte(0xA8/168) ...
+
+Evaluating next-token predictions...
+
+Accuracy: 87.5% (77/88 correct)
+
+First 20 predictions:
+  ✓ Pos   0: Actual=SRC_IPV4             | Predicted=SRC_IPV4
+  ✓ Pos   1: Actual=Byte(0xC0/192)       | Predicted=Byte(0xC0/192)
+  ✗ Pos   2: Actual=Byte(0xA8/168)       | Predicted=Byte(0xA9/169)
+  ✓ Pos   3: Actual=Byte(0x01/  1)       | Predicted=Byte(0x01/  1)
+  ...
+
+SUMMARY
+Sequences evaluated: 5
+Average accuracy: 85.3%
+Min accuracy: 78.9%
+Max accuracy: 91.2%
+```
+
+**Benefits:**
+- **Track training progress:** Run on different checkpoints to see improvement
+- **Identify failure modes:** See which token types (IPs, RTTs, timestamps) are hard to predict
+- **Debug model behavior:** Understand exactly where predictions go wrong
+- **Validate field shuffling:** Confirm model isn't just memorizing positions
+
+**Quick demo (no model required):**
+```bash
+python scripts/test_eval_format.py
+```
+
+## Step 2C: Evaluate with Live Pings (KL Divergence)
 
 This script pings random IPs and compares the model's predicted latency distribution with real measurements.
 

@@ -31,7 +31,7 @@ steps: 5000
 per_device_batch_size: 128 # Increased from 32 to utilize A100 (70% GPU memory was idle)
 learning_rate: 3.0e-4 # Scaled up 2x for 4x larger batch (sqrt scaling rule)
 learning_rate_schedule: 'cosine'
-learning_rate_schedule_steps: 5000 # Decay over full training duration
+learning_rate_schedule_steps: 1000 # Decay over full training duration
 warmup_steps: 20
 alpha: 0.1 # Minimum LR = 10% of peak (1e-5) to prevent decay to zero
 adam_b1: 0.9
@@ -43,7 +43,7 @@ dropout_rate: 0.1
 
 # Checkpointing
 enable_checkpointing: true
-checkpoint_period: 1000 # Save checkpoint every 1000 steps
+checkpoint_period: 200 # Save checkpoint every 1000 steps
 save_checkpoint_on_completion: true # Save final checkpoint when training completes/terminates
 # Note: train.py also saves checkpoint on KeyboardInterrupt/SystemExit to prevent data loss
 

@@ -345,10 +345,17 @@ class ProbeRowSampler(grain.experimental.FlatMapTransform):
         if mode == 'full':
             # Include all timestamps
             for meas in measurements:
+                # Generate random shuffle seed for this measurement
+                if is_numpy:
+                    shuffle_seed = int(rng.integers(0, 2**31))
+                else:
+                    shuffle_seed = rng.randint(0, 2**31 - 1)
+
                 meas_tokens = encode_measurement(
                     meas,
                     prev_timestamp=prev_timestamp,
                     include_timestamp=True,
+                    shuffle_seed=shuffle_seed,
                 )
                 tokens.extend(meas_tokens)
                 prev_timestamp = meas['event_time']
@@ -408,10 +415,18 @@ class ProbeRowSampler(grain.experimental.FlatMapTransform):
             # Tokenize
             for typ, meas in all_meas:
                 include_ts = (typ == 'ts')
+
+                # Generate random shuffle seed for this measurement
+                if is_numpy:
+                    shuffle_seed = int(rng.integers(0, 2**31))
+                else:
+                    shuffle_seed = rng.randint(0, 2**31 - 1)
+
                 meas_tokens = encode_measurement(
                     meas,
                     prev_timestamp=prev_timestamp if include_ts else None,
                     include_timestamp=include_ts,
+                    shuffle_seed=shuffle_seed,
                 )
                 tokens.extend(meas_tokens)
                 if include_ts:
@@ -423,10 +438,17 @@ class ProbeRowSampler(grain.experimental.FlatMapTransform):
             rng.shuffle(shuffled)
 
             for meas in shuffled:
+                # Generate random shuffle seed for this measurement
+                if is_numpy:
+                    shuffle_seed = int(rng.integers(0, 2**31))
+                else:
+                    shuffle_seed = rng.randint(0, 2**31 - 1)
+
                 meas_tokens = encode_measurement(
                     meas,
                     prev_timestamp=None,
                     include_timestamp=False,
+                    shuffle_seed=shuffle_seed,
                 )
                 tokens.extend(meas_tokens)
 
@@ -456,11 +478,24 @@ class ProbeRowSampler(grain.experimental.FlatMapTransform):
         # Position IDs
         positions = np.arange(self.crop_size, dtype=np.int32)
 
+        # CRITICAL: Shift targets by 1 for autoregressive training
+        # The model should predict token[i+1] given tokens[0:i+1]
+        # inputs: [0, 1, 2, ..., n-2] - exclude last token
+        # targets: [1, 2, 3, ..., n-1] - exclude first token, shifted left
+        inputs = tokens[:-1]
+        targets = tokens[1:]
+
+        # Adjust segmentation and positions to match shifted sequences
+        inputs_segmentation = segmentation[:-1]
+        targets_segmentation = segmentation[1:]
+        inputs_position = positions[:-1]
+        targets_position = positions[1:]
+
         return {
-            "inputs": tokens,
-            "inputs_segmentation": segmentation,
-            "inputs_position": positions,
-            "targets": tokens,
-            "targets_segmentation": segmentation,
-            "targets_position": positions,
+            "inputs": inputs,
+            "inputs_segmentation": inputs_segmentation,
+            "inputs_position": inputs_position,
+            "targets": targets,
+            "targets_segmentation": targets_segmentation,
+            "targets_position": targets_position,
         }

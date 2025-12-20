@@ -480,7 +480,8 @@ def shuffle_blocks_deterministic(blocks: List[List[int]], seed: int) -> List[Lis
 def encode_measurement(
     row: Dict[str, Any],
     prev_timestamp: Optional[datetime] = None,
-    include_timestamp: bool = True
+    include_timestamp: bool = True,
+    shuffle_seed: Optional[int] = None
 ) -> List[int]:
     """
     Encode a single network measurement.
@@ -489,6 +490,8 @@ def encode_measurement(
         row: Parquet row with src_addr, dst_addr, ip_version, rtt, event_time
         prev_timestamp: Previous measurement timestamp (for delta encoding)
         include_timestamp: Whether to include timestamp in this measurement
+        shuffle_seed: Optional external seed for field shuffling. If None, uses
+                     deterministic seed based on (src, dst, timestamp)
 
     Returns:
         List of token IDs
@@ -502,8 +505,9 @@ def encode_measurement(
         - Result: [RTT_START, 2 bytes] or [FAILED]
         - Timestamp (optional): [TIMESTAMP_ABS/DELTA1/DELTA4, bytes...]
 
-    The field blocks are shuffled deterministically using (src, dst, timestamp)
-    as the RNG seed to force joint distribution learning.
+    When shuffle_seed is None, field blocks are shuffled deterministically
+    using (src, dst, timestamp) as the RNG seed. When shuffle_seed is provided,
+    uses that seed instead for random augmentation.
     """
     # Extract fields
     src_addr = row['src_addr']
@@ -547,8 +551,11 @@ def encode_measurement(
         timestamp_block = encode_timestamp_delta(event_time, prev_timestamp)
         field_blocks.append(timestamp_block)
 
-    # Deterministic shuffle using (src_ip, dst_ip, timestamp) as seed
-    shuffle_seed = compute_shuffle_seed(src_addr, dst_addr, event_time)
+    # Shuffle field blocks
+    # If external seed provided, use it for random augmentation
+    # Otherwise, use deterministic seed based on measurement content
+    if shuffle_seed is None:
+        shuffle_seed = compute_shuffle_seed(src_addr, dst_addr, event_time)
     shuffled_blocks = shuffle_blocks_deterministic(field_blocks, shuffle_seed)
 
     # Build final sequence
