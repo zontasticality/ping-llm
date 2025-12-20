@@ -29,12 +29,8 @@ except ImportError:
 import pyarrow as pa
 import pyarrow.ipc as ipc
 
-# Import tokenization (from project root)
-import sys
-from pathlib import Path
-project_root = Path(__file__).parent.parent.parent.parent
-sys.path.insert(0, str(project_root))
-from tokenization import encode_measurement
+# Import tokenization (from same package)
+from MaxText.input_pipeline.network_tokenization import encode_measurement
 
 
 class ProbeRowDataSource(grain.RandomAccessDataSource):

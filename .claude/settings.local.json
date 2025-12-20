@@ -60,7 +60,10 @@
       "Bash(.venv/bin/modal app logs:*)",
       "Bash(find:*)",
       "WebFetch(domain:google-grain.readthedocs.io)",
-      "Bash(PYTHONPATH=src DECOUPLE_GCLOUD=TRUE python:*)"
+      "Bash(PYTHONPATH=src DECOUPLE_GCLOUD=TRUE python:*)",
+      "Bash(mv:*)",
+      "Bash(mkdir:*)",
+      "Bash(tree:*)"
     ]
   },
   "sandbox": {

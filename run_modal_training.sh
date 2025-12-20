@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Run training on Modal with network backend
 
-modal run scripts/train/modal_train_with_wandb_sync.py::run \
+modal run scripts/train/modal.py::run \
   --run-name network_backend_test \
   --steps 5000 \
   --batch-size 128 \

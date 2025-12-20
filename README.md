@@ -115,3 +115,35 @@ MaxText aims to provide you with the best OSS models, whether as a reference imp
 ## Get involved
 
 Please join our [Discord Channel](https://discord.com/invite/2H9PhvTcDU) and if you have feedback, you can file a feature request, documentation request, or bug report [here](https://github.com/AI-Hypercomputer/maxtext/issues/new/choose).
+
+## Network Training Pipeline
+
+This repository extends MaxText with a custom network measurement training pipeline.
+
+**Quick Start**:
+```bash
+# Local training
+python scripts/train.py \
+  --config src/MaxText/configs/latency_network.yml \
+  --project my-project --name my-run --steps 5000
+
+# Modal training
+modal run scripts/train/modal.py::run \
+  --run-name my-run --steps 5000 --wandb-project my-project
+```
+
+**Documentation**: See [docs/network-training/](docs/network-training/) for complete documentation.
+
+### Architecture
+
+The network backend is implemented as a separate MaxText backend with minimal core modifications:
+- Custom backend: `src/MaxText/input_pipeline/_network_data_processing.py`
+- MaxText integration: ~20 lines across 3 files
+- Fully modular and upstream-compatible
+
+### Key Features
+
+- **PLAN_3 Design**: Probe-centric big-row data loading
+- **<5% Padding**: Minimal overhead vs 50-90% in alternative approaches
+- **Multi-scale Learning**: Log-uniform window sampling for temporal patterns
+- **Performance**: 320K-850K tokens/sec on B200 GPU

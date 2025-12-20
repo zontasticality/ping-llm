@@ -1,4 +1,4 @@
-"""Modal wrapper to run train_with_wandb_sync.py on a single A100 with a shared volume.
+"""Modal wrapper to run scripts/train.py on a single GPU with a shared volume.
 
 Prereqs:
   - Modal volume `ping-llm` (or set MODAL_VOLUME) with:
@@ -7,7 +7,7 @@ Prereqs:
   - WANDB_API_KEY provided via environment or Modal secret (set MODAL_WANDB_SECRET name).
 
 Usage:
-  modal run scripts/train/modal_train_with_wandb_sync.py::run \
+  modal run scripts/train/modal.py::run \
     --run-name plan3_modal_test \
     --steps 5000 \
     --batch-size 128 \
@@ -121,7 +121,7 @@ def run(
 
     cmd = [
         "python",
-        "scripts/train_with_wandb_sync.py",
+        "scripts/train.py",
         "--config",
         CONFIG_PATH,
         "--project",
