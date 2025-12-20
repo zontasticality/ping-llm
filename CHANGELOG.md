@@ -10,7 +10,7 @@
 
 ### Changed
 - **BREAKING**: Renamed `scripts/train_with_wandb_sync.py` → `scripts/train.py`
-- **BREAKING**: Renamed `scripts/train/modal_train_with_wandb_sync.py` → `scripts/train/modal.py`
+- **BREAKING**: Renamed `scripts/train/modal_train_with_wandb_sync.py` → `scripts/train/modal_wrapper.py`
 - Moved `tokenization.py` → `src/MaxText/input_pipeline/network_tokenization.py`
 - Updated `run_modal_training.sh` to use new script paths
 - Organized documentation into structured hierarchy
@@ -36,7 +36,7 @@ modal run scripts/train/modal_train_with_wandb_sync.py::run ...
 
 # NEW:
 python scripts/train.py ...
-modal run scripts/train/modal.py::run ...
+modal run scripts/train/modal_wrapper.py::run ...
 ```
 
 ### Update Documentation References

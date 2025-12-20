@@ -128,7 +128,7 @@ python scripts/train.py \
   --project my-project --name my-run --steps 5000
 
 # Modal training
-modal run scripts/train/modal.py::run \
+modal run scripts/train/modal_wrapper.py::run \
   --run-name my-run --steps 5000 --wandb-project my-project
 ```
 

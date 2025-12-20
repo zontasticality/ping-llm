@@ -206,7 +206,7 @@ def main():
     # Auto-resume: Check for existing checkpoints (unless --no-resume is set)
     checkpoint_path = None
     if not args.no_resume:
-        checkpoints_dir = output_dir / run_name / "checkpoints"
+        checkpoints_dir = output_dir / "checkpoints"
         if checkpoints_dir.exists():
             # Find the most recent checkpoint (highest numbered directory)
             checkpoint_dirs = sorted([d for d in checkpoints_dir.iterdir() if d.is_dir()],

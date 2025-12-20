@@ -17,7 +17,7 @@
 
 3. **Renamed training scripts (Option A)**
    - `scripts/train_with_wandb_sync.py` → `scripts/train.py`
-   - `scripts/train/modal_train_with_wandb_sync.py` → `scripts/train/modal.py`
+   - `scripts/train/modal_train_with_wandb_sync.py` → `scripts/train/modal_wrapper.py`
    - Updated `run_modal_training.sh` with new paths
    - Updated docstrings in modal wrapper
 
@@ -69,7 +69,7 @@
 ### Added Files (15)
 - `src/MaxText/input_pipeline/network_tokenization.py`
 - `scripts/train.py`
-- `scripts/train/modal.py`
+- `scripts/train/modal_wrapper.py`
 - `CHANGELOG.md`
 - `docs/network-training/README.md`
 - `docs/network-training/architecture.md`
@@ -102,7 +102,7 @@ modal run scripts/train/modal_train_with_wandb_sync.py::run ...
 
 # NEW:
 python scripts/train.py --config ... --project ... --name ...
-modal run scripts/train/modal.py::run ...
+modal run scripts/train/modal_wrapper.py::run ...
 ```
 
 **Update documentation references**:
@@ -134,7 +134,7 @@ from MaxText.input_pipeline.network_tokenization import encode_measurement
 - Clean separation of concerns
 
 ### Developer Experience ⭐⭐⭐⭐⭐
-- Clear script naming (`train.py` vs `modal.py`)
+- Clear script naming (`train.py` vs `modal_wrapper.py`)
 - Organized documentation structure
 - Easy to find relevant docs
 - Migration guide provided
@@ -162,7 +162,7 @@ python -c "from MaxText.input_pipeline.network_tokenization import encode_measur
 python scripts/train.py --help
 
 # Test modal wrapper
-modal run scripts/train/modal.py::run --help
+modal run scripts/train/modal_wrapper.py::run --help
 
 # View docs
 tree docs/network-training/

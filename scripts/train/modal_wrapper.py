@@ -1,5 +1,8 @@
 """Modal wrapper to run scripts/train.py on a single GPU with a shared volume.
 
+Note: This file is named modal_wrapper.py (not modal.py) to avoid shadowing
+      the modal Python module when Modal CLI runs the script.
+
 Prereqs:
   - Modal volume `ping-llm` (or set MODAL_VOLUME) with:
       data/probe_rows/train.arrayrecord  (PLAN_3)

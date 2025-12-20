@@ -16,7 +16,7 @@ python scripts/train.py \
 
 ### Modal Training
 ```bash
-modal run scripts/train/modal.py::run \
+modal run scripts/train/modal_wrapper.py::run \
   --run-name my-run \
   --steps 5000 \
   --batch-size 128 \
@@ -81,3 +81,30 @@ Expected throughput on B200 GPU:
 - **Multiprocessing enabled** for parallel tokenization
 
 See [troubleshooting/performance.md](troubleshooting/performance.md) for optimization tips.
+
+## Checkpointing
+
+Training automatically saves checkpoints periodically and on interruption. Each run has its own checkpoint directory.
+
+**Quick reference**:
+```bash
+# List all checkpoints across all runs
+modal run scripts/inspect_modal_checkpoints.py::inspect_checkpoints
+
+# List checkpoints for a specific run
+modal run scripts/inspect_modal_checkpoints.py::inspect_checkpoints --run-name my_run
+
+# Inspect specific checkpoint
+modal run scripts/inspect_modal_checkpoints.py::inspect_checkpoint \
+  --run-name my_run --step 1000
+```
+
+**Note**: The Modal training script is named `modal_wrapper.py` to avoid shadowing the `modal` Python module.
+
+**Checkpoint structure**: `/mnt/outputs/latency_network/<run_name>/checkpoints/<step>/`
+
+See [checkpointing.md](checkpointing.md) for complete details on:
+- How checkpointing works
+- Step tracking and resume logic
+- Warmup steps interaction
+- Checkpoint management
