@@ -105,12 +105,19 @@ shared_vol = modal.Volume.from_name(VOLUME_NAME, create_if_missing=True)
     volumes={"/mnt": shared_vol},
     secrets=[modal.Secret.from_name("wandb-secret")],
     timeout=60 * 60 * 24,  # 24 hours (Modal max 86400s)
+    env={
+        # Suppress TensorFlow/CUDA plugin registration warnings
+        # These occur because TensorFlow and JAX both register CUDA plugins
+        "TF_CPP_MIN_LOG_LEVEL": "2",  # Suppress TF warnings (0=all, 1=info, 2=warning, 3=error)
+        # Suppress redundant XLA warnings
+        "XLA_FLAGS": "--xla_gpu_force_compilation_parallelism=1",
+    },
 )
 def run(
     run_name: str = "full_run",
     steps: int = 5_000,
     batch_size: int = 128,
-    wandb_project: str = "full_run",
+    wandb_project: str = "ping-llm",
 ):
     import signal
     import atexit

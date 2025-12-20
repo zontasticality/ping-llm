@@ -8,7 +8,20 @@ Purpose:
 - Measures tokens/second throughput
 
 Usage:
+  # Sample with default 1024 token context windows
   modal run scripts/data/modal_sample_probe_chunks.py::sample_rows
+
+  # Custom crop size (e.g., 512 tokens)
+  modal run scripts/data/modal_sample_probe_chunks.py::sample_rows --crop-size 512
+
+  # More samples and workers
+  modal run scripts/data/modal_sample_probe_chunks.py::sample_rows \
+    --num-samples-per-split 5 \
+    --num-workers 8
+
+  # Quick check without throughput test
+  modal run scripts/data/modal_sample_probe_chunks.py::sample_rows \
+    --measure-throughput False
 
 Assumes:
 - Modal volume (default: ping-llm) has probe_rows/train.arrayrecord and probe_rows/test.arrayrecord
@@ -89,15 +102,21 @@ shared_vol = Volume.from_name(VOLUME_NAME, create_if_missing=True)
     cpu=4,
     memory=8 * 1024,
     timeout=60 * 15,
+    env={
+        # Force JAX to CPU-only mode to avoid CUDA initialization errors
+        # This prevents multiprocessing fork issues with CUDA contexts
+        "JAX_PLATFORMS": "cpu",
+        "XLA_PYTHON_CLIENT_PREALLOCATE": "false",
+    }
 )
 def sample_rows(
     data_dir: str = "/mnt/data/probe_rows",
     num_samples_per_split: int = 3,
-    crop_size: int = 128,
+    crop_size: int = 1024,
     seed: int = 42,
     measure_throughput: bool = True,
     throughput_batches: int = 100,
-    num_workers: int = 0,
+    num_workers: int = 4,
     worker_buffer_size: int = 16,
 ):
     """
@@ -120,7 +139,7 @@ def sample_rows(
         ProbeRowDataSource,
         ProbeRowSampler,
     )
-    from tokenization import (
+    from src.MaxText.input_pipeline.network_tokenization import (
         decode_token_stream_pretty,
         decode_tokens_to_measurements,
     )
@@ -159,8 +178,11 @@ def sample_rows(
         for i, idx in enumerate(indices, 1):
             row = source[idx]
 
-            # Generate one context using the sampler
-            context = sampler.random_map(row, rng)
+            # Generate one context using the sampler (FlatMapTransform)
+            contexts = list(sampler.flat_map(row))
+            if not contexts:
+                continue
+            context = contexts[0]  # Take first context
 
             # Extract token stream and segmentation
             tokens = context["inputs"].tolist()
@@ -246,7 +268,10 @@ def sample_rows(
                     row = source[row_idx]
 
                     # Generate context
-                    context = sampler.random_map(row, rng)
+                    contexts = list(sampler.flat_map(row))
+                    if not contexts:
+                        continue
+                    context = contexts[0]
 
                     # Count real tokens (not padding)
                     seg = context["inputs_segmentation"]

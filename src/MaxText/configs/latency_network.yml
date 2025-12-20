@@ -16,21 +16,21 @@ base_output_directory: outputs/latency_network
 
 # Model architecture - PLAN_2: ~95M param decoder-only transformer
 # Optimized for generalization (deep + narrow MLP ratio)
-vocab_size: 267  # 11 role tokens + 256 byte tokens (PLAN_2)
-base_num_decoder_layers: 20  # Deep for multi-step reasoning (inverse search)
-base_emb_dim: 640  # Optimized for small vocab
-base_num_query_heads: 10  # 640 / 64 = 10 heads
-base_num_kv_heads: 10  # Standard attention (not MQA/GQA)
-head_dim: 64  # Standard head dimension
-base_mlp_dim: 2048  # 3.2x ratio (vs standard 4x) for generalization
+vocab_size: 267 # 11 role tokens + 256 byte tokens (PLAN_2)
+base_num_decoder_layers: 20 # Deep for multi-step reasoning (inverse search)
+base_emb_dim: 640 # Optimized for small vocab
+base_num_query_heads: 10 # 640 / 64 = 10 heads
+base_num_kv_heads: 10 # Standard attention (not MQA/GQA)
+head_dim: 64 # Standard head dimension
+base_mlp_dim: 2048 # 3.2x ratio (vs standard 4x) for generalization
 max_target_length: 1024
 max_prefill_predict_length: 1024
 
 # Training - PLAN_2 hyperparameters
 steps: 200000
-per_device_batch_size: 128  # Increased from 32 to utilize A100 (70% GPU memory was idle)
-learning_rate: 6.0e-4  # Scaled up 2x for 4x larger batch (sqrt scaling rule)
-learning_rate_schedule: "cosine"
+per_device_batch_size: 128 # Increased from 32 to utilize A100 (70% GPU memory was idle)
+learning_rate: 1.0e-4 # Scaled up 2x for 4x larger batch (sqrt scaling rule)
+learning_rate_schedule: 'cosine'
 warmup_steps: 2000
 adam_b1: 0.9
 adam_b2: 0.999
@@ -41,16 +41,16 @@ dropout_rate: 0.1
 
 # Checkpointing
 enable_checkpointing: true
-checkpoint_period: 1000  # Save checkpoint every 1000 steps
-save_checkpoint_on_completion: true  # Save final checkpoint when training completes/terminates
+checkpoint_period: 1000 # Save checkpoint every 1000 steps
+save_checkpoint_on_completion: true # Save final checkpoint when training completes/terminates
 # Note: train.py also saves checkpoint on KeyboardInterrupt/SystemExit to prevent data loss
 
 # Logging & Monitoring
-log_period: 100           # Log metrics every 100 steps
-eval_interval: 1000       # Evaluate every 1000 steps
-eval_steps: 100           # Run 100 eval steps
-enable_tensorboard: true  # Enable TensorBoard logging
-tensorboard_dir: ""       # Auto-set to base_output_directory/tensorboard
+log_period: 100 # Log metrics every 100 steps
+eval_interval: 1000 # Evaluate every 1000 steps
+eval_steps: 100 # Run 100 eval steps
+enable_tensorboard: true # Enable TensorBoard logging
+tensorboard_dir: '' # Auto-set to base_output_directory/tensorboard
 
 # Dataset - Network Backend
 # Uses custom network data processing pipeline for network measurement data
@@ -63,37 +63,37 @@ tensorboard_dir: ""       # Auto-set to base_output_directory/tensorboard
 #     * Requires: modal run scripts/data/modal_create_probe_rows_parallel_streaming.py
 #   - network_parquet: Legacy parquet shards (PLAN_2) - Not yet implemented
 #
-dataset_type: "network"
-packing: False  # Disable packing to avoid SequenceDescriptor incompatibility with cudnn_flash_te
+dataset_type: 'network'
+packing: False # Disable packing to avoid SequenceDescriptor incompatibility with cudnn_flash_te
 
 # Network data configuration
-network_data_format: "probe_chunks"
-network_train_files: "data/probe_rows/train.arrayrecord"
-network_eval_files: "data/probe_rows/test.arrayrecord"
+network_data_format: 'probe_chunks'
+network_train_files: 'data/probe_rows/train.arrayrecord'
+network_eval_files: 'data/probe_rows/test.arrayrecord'
 
 # Data loading parallelism
 # OPTIMIZED: Increased workers to reduce source bottleneck (was 4)
-grain_worker_count: 16  # Parallel ArrayRecord reads (increased for B200)
-grain_per_worker_buffer_size: 8  # Larger buffer for better throughput
-grain_worker_count_eval: 8  # Same for eval
+grain_worker_count: 16 # Parallel ArrayRecord reads (increased for B200)
+grain_per_worker_buffer_size: 8 # Larger buffer for better throughput
+grain_worker_count_eval: 8 # Same for eval
 grain_per_worker_buffer_size_eval: 8
-grain_ram_budget_mb: 16384  # 16GB RAM budget for mp_prefetch auto-tuning
+grain_ram_budget_mb: 16384 # 16GB RAM budget for mp_prefetch auto-tuning
 
 # Grain debugging (optional - enable for performance analysis)
 # Uncomment to enable:
-grain_debug_mode: true  # Log execution metrics every 60s (identifies bottlenecks)
+grain_debug_mode: true # Log execution metrics every 60s (identifies bottlenecks)
 # grain_visualization_dir: "/tmp/grain_viz"  # Generate pipeline visualization graph
 
 # Attention & Positional Encoding
-attention: "cudnn_flash_te"
+attention: 'cudnn_flash_te'
 scan_layers: true
-position_embedding: "rope"  # RoPE for relative position encoding (PLAN_2)
+position_embedding: 'rope' # RoPE for relative position encoding (PLAN_2)
 
 # Precision
-dtype: "bfloat16"
+dtype: 'bfloat16'
 
 # Hardware (override via CLI: hardware=cpu or hardware=gpu)
-hardware: "cpu"
+hardware: 'cpu'
 
 # Skip distributed JAX setup for single-process local testing
 skip_jax_distributed_system: true

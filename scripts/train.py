@@ -141,6 +141,11 @@ def main():
                         help="Wandb mode")
     args = parser.parse_args()
 
+    # Suppress TensorFlow/CUDA plugin registration warnings
+    # These occur because TensorFlow and JAX both try to register CUDA plugins
+    # Safe to suppress - they're harmless warnings that don't affect functionality
+    os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "2")  # Suppress TF warnings
+
     # Check wandb login (soft check - wandb.init will fail with better error if not logged in)
     if args.wandb_mode != "disabled":
         if not check_wandb_login():
@@ -154,6 +159,14 @@ def main():
     # Load config
     print(f"Loading config: {args.config}")
     config = load_config(args.config)
+
+    # Print full config at startup for debugging
+    print("\n" + "=" * 80)
+    print("FULL CONFIGURATION:")
+    print("=" * 80)
+    import pprint
+    pprint.pprint(config, width=100, compact=False)
+    print("=" * 80 + "\n")
 
     # Get peak TFLOPs for MFU calculation
     peak_tflops = get_peak_tflops()
@@ -306,6 +319,11 @@ def main():
                     if "loss:" in line:
                         loss_str = line.split("loss:")[1].split(",")[0].strip()
                         metrics["train/loss"] = float(loss_str)
+
+                    # Parse learning rate
+                    if "learning_rate:" in line:
+                        lr_str = line.split("learning_rate:")[1].split(",")[0].strip()
+                        metrics["train/learning_rate"] = float(lr_str)
 
                     # Parse TFLOP/s/device
                     if "TFLOP/s/device:" in line:
