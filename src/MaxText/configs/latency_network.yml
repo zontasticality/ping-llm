@@ -31,7 +31,9 @@ steps: 200000
 per_device_batch_size: 128 # Increased from 32 to utilize A100 (70% GPU memory was idle)
 learning_rate: 1.0e-4 # Scaled up 2x for 4x larger batch (sqrt scaling rule)
 learning_rate_schedule: 'cosine'
-warmup_steps: 2000
+learning_rate_schedule_steps: 200000 # Decay over full training duration
+warmup_steps: 100
+alpha: 0.1 # Minimum LR = 10% of peak (1e-5) to prevent decay to zero
 adam_b1: 0.9
 adam_b2: 0.999
 adam_eps: 1.0e-8
