@@ -12,7 +12,7 @@ Setup:
 
 Usage (in SLURM script):
     export ENABLE_WANDB=true
-    export WANDB_PROJECT="ping-llm-plan2"
+    export WANDB_PROJECT="ping-llm"
     export WANDB_ENTITY="your-username"  # Optional
 """
 
@@ -49,7 +49,7 @@ def init_wandb(config_file: str, run_name: str):
         entity=os.getenv("WANDB_ENTITY", None),
         name=run_name,
         config=config,
-        tags=["plan2", "network-measurement", "maxtext"],
+        tags=["network-measurement", "maxtext"],
     )
 
     print(f"✓ wandb initialized: {wandb.run.url}")

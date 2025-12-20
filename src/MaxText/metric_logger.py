@@ -254,6 +254,10 @@ class MetricLogger:
       if full_log and jax.process_index() == 0:
         max_logging.log(f"To see full metrics 'tensorboard --logdir={self.config.tensorboard_dir}'")
         self.writer.flush()
+    else:
+      # Flush eval metrics immediately so they appear in wandb
+      if jax.process_index() == 0:
+        self.writer.flush()
 
   def write_metrics_to_managed_mldiagnostics(self, metrics, step):
     """Write metrics to managed profiler."""

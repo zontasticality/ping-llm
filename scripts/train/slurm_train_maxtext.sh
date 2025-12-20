@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH --job-name=ping-llm-plan2
+#SBATCH --job-name=ping-llm
 #SBATCH --partition=gpu          # Override with: sbatch --partition=<gpu-partition> scripts/...
 #SBATCH --gres=gpu:a100:1
 #SBATCH --cpus-per-task=16
@@ -75,7 +75,7 @@ export DECOUPLE_GCLOUD=TRUE
 # Optional: Enable Weights & Biases monitoring
 # Uncomment to use wandb instead of/alongside TensorBoard
 # export ENABLE_WANDB=true
-# export WANDB_PROJECT="ping-llm-plan2"
+# export WANDB_PROJECT="ping-llm"
 # export WANDB_ENTITY="your-username"  # Optional
 
 # Directories

@@ -25,9 +25,12 @@ Usage (Modal GPU):
 import os
 from pathlib import Path
 
+
 # Conditionally force CPU usage (only for local runs, not Modal).
 def _in_modal_runtime():
-    return bool(os.environ.get("MODAL_IS_REMOTE")) or (Path("/workspace") / "src").exists()
+    return (
+        bool(os.environ.get("MODAL_IS_REMOTE")) or (Path("/workspace") / "src").exists()
+    )
 
 
 IN_MODAL_RUNTIME = _in_modal_runtime()
@@ -38,6 +41,7 @@ os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"  # Suppress TensorFlow warnings
 
 import argparse
 import sys
+import time
 from collections import defaultdict
 
 # Add project root to path (must be before imports from src).
@@ -53,15 +57,18 @@ import jax.numpy as jnp
 import pandas as pd
 import numpy as np
 
-from src.MaxText.input_pipeline.network_tokenization import MEASUREMENT_START, FAILED
-from src.MaxText import pyconfig, model_creation_utils, maxtext_utils, max_utils
-from flax.linen import partitioning as nn_partitioning
+from src.MaxText.input_pipeline.network_tokenization import (
+    MEASUREMENT_START,
+    FAILED,
+    decode_token_stream_pretty,
+)
 
 # ============================================================================
 # Modal Setup (for GPU acceleration)
 # ============================================================================
 try:
     import modal
+
     MODAL_AVAILABLE = True
 except ImportError:
     MODAL_AVAILABLE = False
@@ -72,10 +79,23 @@ if MODAL_AVAILABLE:
     VOLUME_NAME = os.environ.get("MODAL_VOLUME", "ping-llm")
 
     IGNORE_PATTERNS = [
-        ".git", ".venv", "__pycache__", ".mypy_cache", ".pytest_cache",
-        "outputs", "logs", "data", "local_datasets", "archive",
-        "tests", "docs", "benchmarks", "end_to_end",
-        "*.parquet", "*.arrayrecord", ".DS_Store",
+        ".git",
+        ".venv",
+        "__pycache__",
+        ".mypy_cache",
+        ".pytest_cache",
+        "outputs",
+        "logs",
+        "data",
+        "local_datasets",
+        "archive",
+        "tests",
+        "docs",
+        "benchmarks",
+        "end_to_end",
+        "*.parquet",
+        "*.arrayrecord",
+        ".DS_Store",
     ]
 
     # Build image in stages to optimize caching.
@@ -92,20 +112,36 @@ if MODAL_AVAILABLE:
         .add_local_file("README.md", f"{WORKDIR}/README.md", copy=True)
         .add_local_file("build_hooks.py", f"{WORKDIR}/build_hooks.py", copy=True)
         .add_local_dir("dependencies", f"{WORKDIR}/dependencies", copy=True)
-        .add_local_file("src/MaxText/__init__.py", f"{WORKDIR}/src/MaxText/__init__.py", copy=True)
-        .add_local_dir("src/install_maxtext_extra_deps", f"{WORKDIR}/src/install_maxtext_extra_deps", copy=True)
+        .add_local_file(
+            "src/MaxText/__init__.py", f"{WORKDIR}/src/MaxText/__init__.py", copy=True
+        )
+        .add_local_dir(
+            "src/install_maxtext_extra_deps",
+            f"{WORKDIR}/src/install_maxtext_extra_deps",
+            copy=True,
+        )
         # Stage 2: Install dependencies
         .run_commands(
             f"cd {WORKDIR} && CC=gcc CXX=g++ uv pip install --system -e '.[cuda12]' --resolution=lowest",
             f"cd {WORKDIR} && install_maxtext_github_deps",
         )
-        .pip_install("pandas", "pyarrow")
+        .uv_pip_install("pandas", "pyarrow", "google-jetstream")
         # Stage 3: Copy code
         .add_local_dir(".", WORKDIR, ignore=IGNORE_PATTERNS, copy=True)
     )
 
     app = modal.App(APP_NAME)
     shared_vol = modal.Volume.from_name(VOLUME_NAME, create_if_missing=True)
+
+PARAM_ONLY_CHECKPOINT_MODAL = (
+    "/mnt/outputs/latency_network/param_only_checkpoint/checkpoints/0/items"
+)
+PARAM_ONLY_CHECKPOINT_LOCAL = (
+    "outputs/latency_network/param_only_checkpoint/checkpoints/0/items"
+)
+DEFAULT_CHECKPOINT = (
+    PARAM_ONLY_CHECKPOINT_MODAL if IN_MODAL_RUNTIME else PARAM_ONLY_CHECKPOINT_LOCAL
+)
 
 
 BASE_FIELDS = ["src", "dst", "rtt", "timestamp"]
@@ -130,21 +166,28 @@ def create_ordered_measurement(row, field_order, prev_timestamp=None):
         List of token IDs with fields in specified order
     """
     from src.MaxText.input_pipeline.network_tokenization import (
-        encode_ip_merged, encode_rtt_exponent_mantissa,
-        encode_timestamp_delta
+        encode_ip_merged,
+        encode_rtt_exponent_mantissa,
+        encode_timestamp_delta,
     )
 
     # Build field blocks
     field_blocks = {}
-    field_blocks['src'] = encode_ip_merged(row['src_addr'], row['ip_version'], is_src=True)
-    field_blocks['dst'] = encode_ip_merged(row['dst_addr'], row['ip_version'], is_src=False)
+    field_blocks["src"] = encode_ip_merged(
+        row["src_addr"], row["ip_version"], is_src=True
+    )
+    field_blocks["dst"] = encode_ip_merged(
+        row["dst_addr"], row["ip_version"], is_src=False
+    )
 
-    if row['rtt'] < 0:
-        field_blocks['rtt'] = [FAILED]
+    if row["rtt"] < 0:
+        field_blocks["rtt"] = [FAILED]
     else:
-        field_blocks['rtt'] = encode_rtt_exponent_mantissa(row['rtt'])
+        field_blocks["rtt"] = encode_rtt_exponent_mantissa(row["rtt"])
 
-    field_blocks['timestamp'] = encode_timestamp_delta(row['event_time'], prev_timestamp)
+    field_blocks["timestamp"] = encode_timestamp_delta(
+        row["event_time"], prev_timestamp
+    )
 
     # Build token sequence in specified order
     tokens = [MEASUREMENT_START]
@@ -165,8 +208,16 @@ def build_measurement_variants(row_dict):
     return variants
 
 
-def build_config(checkpoint_path, config_path, use_gpu=False):
+def build_config(
+    checkpoint_path,
+    config_path,
+    use_gpu=False,
+    max_prefill_length=None,
+    max_target_length=None,
+):
     """Build a MaxText config with resolved paths and eval overrides."""
+    from src.MaxText import pyconfig as maxtext_pyconfig
+
     checkpoint_path = str(Path(checkpoint_path).resolve())
     config_path = str(Path(config_path).resolve())
 
@@ -174,95 +225,59 @@ def build_config(checkpoint_path, config_path, use_gpu=False):
     # and argv[2:] to be key=value overrides
     argv = [
         "eval_script",  # argv[0] - program name (ignored)
-        config_path,    # argv[1] - config file path
-        f"load_full_state_path={checkpoint_path}",  # Use load_full_state_path for full checkpoint
+        config_path,  # argv[1] - config file path
+        f"load_parameters_path={checkpoint_path}",
         f"hardware={'gpu' if use_gpu else 'cpu'}",
         "skip_jax_distributed_system=true",
     ]
 
-    # Use simpler attention for CPU
-    if not use_gpu:
-        argv.append("attention=dot_product")
+    if max_prefill_length is not None:
+        argv.append(f"max_prefill_predict_length={max_prefill_length}")
+    if max_target_length is not None:
+        argv.append(f"max_target_length={max_target_length}")
 
-    config = pyconfig.initialize(argv)
+    # MaxEngine decode path requires dot_product attention.
+    argv.append("attention=dot_product")
+
+    config = maxtext_pyconfig.initialize(argv)
     return config, checkpoint_path
 
 
-def load_model_and_params(checkpoint_path, config):
-    """Load model and parameters from checkpoint using MaxText's native approach."""
-    # Create model
-    model = model_creation_utils.from_config(config)
-    mesh = model.mesh
+def setup_engine(config):
+    """Create a MaxEngine and load parameters."""
+    from src.MaxText import maxengine
 
-    # Get abstract params structure (just shapes, no actual arrays - minimal memory)
-    print("Getting abstract parameter structure...")
-    with mesh, nn_partitioning.axis_rules(config.logical_axis_rules):
-        abstract_params = maxtext_utils.get_abstract_param(model, config)
-
-    # Load ONLY params from checkpoint using Orbax directly (skip optimizer state)
-    print(f"Loading parameters only from checkpoint (this saves memory)...")
-    import orbax.checkpoint as ocp
-    from etils import epath
-
-    with mesh, nn_partitioning.axis_rules(config.logical_axis_rules):
-        # Create checkpointer
-        ckptr = ocp.Checkpointer(
-            ocp.PyTreeCheckpointHandler(
-                restore_concurrent_gb=config.checkpoint_storage_concurrent_gb,
-                use_ocdbt=True,
-                use_zarr3=True,
-            )
-        )
-
-        # Restore only the params field from items/params
-        # The checkpoint structure is: checkpoint/items/{params, opt_state, step, ...}
-        # We only want params
-        restore_args = ocp.checkpoint_utils.construct_restore_args(abstract_params['params'])
-
-        # Restore from checkpoint_path/items (the items subdirectory)
-        checkpoint_items_path = epath.Path(checkpoint_path) / "items"
-
-        restored = ckptr.restore(
-            checkpoint_items_path,
-            item={'params': abstract_params['params']},
-            transforms={},
-            restore_args={'params': restore_args},
-        )
-
-        params = restored['params']
-
-    print("✓ Parameters loaded successfully (optimizer state skipped to save memory)")
-    return model, params, mesh
+    engine = maxengine.MaxEngine(config)
+    rng = jax.random.PRNGKey(0)
+    params = engine.load_params(rng=rng)
+    return engine, params
 
 
-def build_batch_inputs(sequences, max_len):
-    """Pad variable-length sequences into a batch for model.apply."""
-    batch_size = len(sequences)
-    input_tokens = np.zeros((batch_size, max_len), dtype=np.int32)
-    positions = np.zeros((batch_size, max_len), dtype=np.int32)
-    segment_ids = np.zeros((batch_size, max_len), dtype=np.int32)
-    lengths = np.zeros((batch_size,), dtype=np.int32)
-
-    for i, seq in enumerate(sequences):
-        seq_trim = seq[:max_len]
-        length = len(seq_trim)
-        if length == 0:
-            continue
-        lengths[i] = length
-        input_tokens[i, :length] = seq_trim
-        positions[i, :length] = np.arange(length, dtype=np.int32)
-        segment_ids[i, :length] = 1
-
-    return (
-        jnp.array(input_tokens),
-        jnp.array(positions),
-        jnp.array(segment_ids),
-        jnp.array(lengths),
-    )
+def pad_tokens(tokens, target_len):
+    """Pad a token list to target_len with zeros."""
+    seq = tokens[:target_len]
+    padded = np.zeros(target_len, dtype=np.int32)
+    padded[: len(seq)] = seq
+    return padded, len(seq)
 
 
-def batched_generate(
-    model,
+def extract_token(result_tokens, slot):
+    """Extract the sampled token for a slot from ResultTokens."""
+    token_idx = result_tokens.tokens_idx[0]
+    return int(np.asarray(result_tokens.data)[slot, token_idx])
+
+
+def format_pretty_tokens(tokens, max_tokens=120):
+    """Format tokens as readable labels with truncation."""
+    pretty = decode_token_stream_pretty(tokens)
+    if len(pretty) > max_tokens:
+        remaining = len(pretty) - max_tokens
+        pretty = pretty[:max_tokens] + [f"...(+{remaining} more)"]
+    return " ".join(pretty)
+
+
+def decode_batch_with_engine(
+    engine,
     params,
     sequences,
     config,
@@ -270,63 +285,147 @@ def batched_generate(
     stop_token,
     rng,
     temperature=1.0,
+    progress_interval=1,
+    batch_label="",
 ):
-    """Generate tokens in batch until stop token or timeout."""
-    generated_counts = [0] * len(sequences)
-    stop_reasons = [None] * len(sequences)
-    active = [True] * len(sequences)
-    max_len = config.max_target_length
+    """Generate tokens for a batch of sequences using MaxEngine decode."""
+    batch_size = len(sequences)
+    completions = [[] for _ in range(batch_size)]
+    generated_counts = [0] * batch_size
+    stop_reasons = [None] * batch_size
+    active = [True] * batch_size
 
-    for _ in range(max_new_tokens):
-        active_indices = [i for i, is_active in enumerate(active) if is_active]
-        if not active_indices:
+    rng, rng_state = jax.random.split(rng)
+    decode_state = engine.init_decode_state(rng=rng_state)
+
+    start_time = time.time()
+    for slot, seq in enumerate(sequences):
+        padded, true_length = pad_tokens(seq, config.max_prefill_predict_length)
+        rng, rng_prefill = jax.random.split(rng)
+        prefix, first_tokens = engine.prefill(
+            params=params,
+            padded_tokens=jnp.array(padded),
+            true_length=true_length,
+            rng=rng_prefill,
+            slot=slot,
+            temperature=temperature,
+        )
+        decode_state = engine.insert(
+            prefix=prefix, decode_state=decode_state, slot=slot
+        )
+        token = extract_token(first_tokens, 0)
+        completions[slot].append(token)
+        generated_counts[slot] += 1
+        if token == stop_token:
+            active[slot] = False
+            stop_reasons[slot] = "stop_token"
+            engine.release_pages(slot=slot)
+        elif generated_counts[slot] >= max_new_tokens:
+            active[slot] = False
+            stop_reasons[slot] = "timeout"
+            engine.release_pages(slot=slot)
+
+    remaining_steps = max(0, max_new_tokens - 1)
+    for step in range(remaining_steps):
+        active_slots = [i for i, is_active in enumerate(active) if is_active]
+        if not active_slots:
             break
 
-        pruned_indices = []
-        for idx in active_indices:
-            if len(sequences[idx]) >= max_len:
-                active[idx] = False
-                stop_reasons[idx] = "max_len"
-            else:
-                pruned_indices.append(idx)
-        active_indices = pruned_indices
-        if not active_indices:
-            continue
+        if progress_interval and step % progress_interval == 0:
+            elapsed = time.time() - start_time
+            label = f"{batch_label} " if batch_label else ""
+            print(
+                f"  {label}Step {step + 1}/{remaining_steps} | "
+                f"active slots: {len(active_slots)} | "
+                f"elapsed: {elapsed:.1f}s"
+            )
 
-        batch_sequences = [sequences[i] for i in active_indices]
-        input_tokens, positions, segment_ids, lengths = build_batch_inputs(batch_sequences, max_len)
-
-        logits, _ = model.apply(
-            params,
-            input_tokens,
-            positions,
-            decoder_segment_ids=segment_ids,
-            enable_dropout=False,
-            rngs={"dropout": rng, "params": rng},
-            mutable=["intermediates"],
+        rng, rng_gen = jax.random.split(rng)
+        decode_state, result_tokens = engine.generate(
+            params=params,
+            decode_state=decode_state,
+            rng=rng_gen,
+            temperature=temperature,
         )
+        tokens = np.asarray(result_tokens.data)[:, result_tokens.tokens_idx[0]]
 
-        rng, step_rng = jax.random.split(rng)
-        next_logits = logits[jnp.arange(len(active_indices)), lengths - 1, :]
-        next_tokens = jax.random.categorical(step_rng, next_logits / temperature)
-        next_tokens = np.asarray(next_tokens, dtype=np.int32).tolist()
+        for slot in active_slots:
+            token = int(tokens[slot])
+            completions[slot].append(token)
+            generated_counts[slot] += 1
+            if token == stop_token:
+                active[slot] = False
+                stop_reasons[slot] = "stop_token"
+                engine.release_pages(slot=slot)
+            elif generated_counts[slot] >= max_new_tokens:
+                active[slot] = False
+                stop_reasons[slot] = "timeout"
+                engine.release_pages(slot=slot)
 
-        for idx, token in zip(active_indices, next_tokens):
-            sequences[idx].append(int(token))
-            generated_counts[idx] += 1
-            if int(token) == stop_token:
-                active[idx] = False
-                stop_reasons[idx] = "stop_token"
-
-    for idx, is_active in enumerate(active):
+    for slot, is_active in enumerate(active):
         if is_active:
-            stop_reasons[idx] = "timeout"
-            active[idx] = False
+            stop_reasons[slot] = "timeout"
+            engine.release_pages(slot=slot)
 
-    return generated_counts, stop_reasons, sequences
+    return generated_counts, stop_reasons, completions, rng
 
 
-def run_eval(checkpoint, config, data, num_samples=100, seed=42, max_new_tokens=20, temperature=1.0):
+def decode_streams_with_engine(
+    engine,
+    params,
+    sequences,
+    config,
+    max_new_tokens,
+    stop_token,
+    rng,
+    temperature=1.0,
+    progress_interval=1,
+):
+    """Decode sequences in chunks that fit the engine's max concurrent decodes."""
+    max_slots = engine.max_concurrent_decodes
+    all_counts = [0] * len(sequences)
+    all_reasons = [None] * len(sequences)
+    all_completions = [[] for _ in range(len(sequences))]
+
+    for batch_idx, start in enumerate(range(0, len(sequences), max_slots), start=1):
+        end = min(start + max_slots, len(sequences))
+        batch_sequences = sequences[start:end]
+        print(f"\nDecoding batch {batch_idx} ({len(batch_sequences)} streams)...")
+        counts, reasons, completions, rng = decode_batch_with_engine(
+            engine,
+            params,
+            batch_sequences,
+            config,
+            max_new_tokens,
+            stop_token,
+            rng,
+            temperature=temperature,
+            progress_interval=progress_interval,
+            batch_label=f"batch {batch_idx}",
+        )
+        for offset, (count, reason, completion) in enumerate(
+            zip(counts, reasons, completions)
+        ):
+            idx = start + offset
+            all_counts[idx] = count
+            all_reasons[idx] = reason
+            all_completions[idx] = completion
+
+    return all_counts, all_reasons, all_completions
+
+
+def run_eval(
+    checkpoint,
+    config,
+    data,
+    num_samples=100,
+    seed=42,
+    max_new_tokens=20,
+    temperature=1.0,
+    progress_interval=1,
+    print_per_variant=2,
+    print_max_tokens=120,
+):
     """
     Core evaluation logic (can be called from CLI or Modal).
 
@@ -337,46 +436,61 @@ def run_eval(checkpoint, config, data, num_samples=100, seed=42, max_new_tokens=
         num_samples: Number of measurements to evaluate
         seed: Random seed
     """
-    print("Loading model and checkpoint...")
+    from src.MaxText import max_utils
+
+    print(f"\nLoading data from {data}...")
+    columns = ["src_addr", "dst_addr", "ip_version", "rtt", "event_time"]
+    df = pd.read_parquet(data, columns=columns)
+    print(f"✓ Loaded {len(df)} measurements")
+
+    samples = df.sample(n=min(num_samples, len(df)), random_state=seed)
+    streams = []
+    stream_meta = []
+    initial_streams = []
+
+    print("\nPreparing measurement variants...")
+    for idx, row in enumerate(samples.itertuples(index=False)):
+        if idx % 10 == 0:
+            print(f"  Processing sample {idx+1}/{len(samples)}...")
+        row_dict = row._asdict()
+        for label, tokens in build_measurement_variants(row_dict):
+            streams.append(tokens)
+            initial_streams.append(tokens.copy())
+            stream_meta.append({"variant": label, "sample_index": idx})
+
+    max_prompt_len = max(len(tokens) for tokens in streams)
+    max_target_len = max_prompt_len + max_new_tokens
+
+    print("\nLoading MaxEngine and checkpoint...")
     use_gpu = IN_MODAL_RUNTIME or os.environ.get("JAX_PLATFORMS") == "gpu"
-    config_obj, checkpoint_path = build_config(checkpoint, config, use_gpu=use_gpu)
+    config_obj, checkpoint_path = build_config(
+        checkpoint,
+        config,
+        use_gpu=use_gpu,
+        max_prefill_length=max_prompt_len,
+        max_target_length=max_target_len,
+    )
     with max_utils.maybe_get_transformer_engine_context(config_obj):
-        model, params, mesh = load_model_and_params(checkpoint_path, config_obj)
-        print(f"✓ Model loaded from {checkpoint_path}")
-
-        print(f"\nLoading data from {data}...")
-        columns = ["src_addr", "dst_addr", "ip_version", "rtt", "event_time"]
-        df = pd.read_parquet(data, columns=columns)
-        print(f"✓ Loaded {len(df)} measurements")
-
-        samples = df.sample(n=min(num_samples, len(df)), random_state=seed)
-        streams = []
-        stream_meta = []
-
-        print("\nPreparing measurement variants...")
-        for idx, row in enumerate(samples.itertuples(index=False)):
-            if idx % 10 == 0:
-                print(f"  Processing sample {idx+1}/{len(samples)}...")
-            row_dict = row._asdict()
-            for label, tokens in build_measurement_variants(row_dict):
-                streams.append(tokens)
-                stream_meta.append({"variant": label, "sample_index": idx})
+        engine, params = setup_engine(config_obj)
+        print(f"✓ Engine initialized with params from {checkpoint_path}")
 
         print(f"\nGenerating up to {max_new_tokens} tokens per stream...")
         rng = jax.random.PRNGKey(seed)
-        with mesh, nn_partitioning.axis_rules(config_obj.logical_axis_rules):
-            generated_counts, stop_reasons, _ = batched_generate(
-                model,
-                params,
-                streams,
-                config_obj,
-                max_new_tokens=max_new_tokens,
-                stop_token=MEASUREMENT_START,
-                rng=rng,
-                temperature=temperature,
-            )
+        generated_counts, stop_reasons, completions = decode_streams_with_engine(
+            engine,
+            params,
+            streams,
+            config_obj,
+            max_new_tokens=max_new_tokens,
+            stop_token=MEASUREMENT_START,
+            rng=rng,
+            temperature=temperature,
+            progress_interval=progress_interval,
+        )
 
-    stats = defaultdict(lambda: {"counts": [], "stop_token": 0, "timeout": 0, "max_len": 0})
+    stats = defaultdict(
+        lambda: {"counts": [], "stop_token": 0, "timeout": 0, "max_len": 0}
+    )
     for meta, count, reason in zip(stream_meta, generated_counts, stop_reasons):
         variant = meta["variant"]
         stats[variant]["counts"].append(count)
@@ -408,23 +522,83 @@ def run_eval(checkpoint, config, data, num_samples=100, seed=42, max_new_tokens=
     print("  - 'Timeout' means max-new-tokens was reached without a stop token.")
     print("  - 'MaxLen' means the sequence hit the model's max_target_length.")
 
+    if print_per_variant > 0:
+        print("\n" + "=" * 80)
+        print("SAMPLES: Contexts and Completions")
+        print("=" * 80)
+        shown = defaultdict(int)
+        for idx, meta in enumerate(stream_meta):
+            variant = meta["variant"]
+            if shown[variant] >= print_per_variant:
+                continue
+            shown[variant] += 1
+            context = initial_streams[idx]
+            completion = completions[idx]
+            print(
+                f"{variant} sample {shown[variant]} "
+                f"(generated={generated_counts[idx]}, stop={stop_reasons[idx]})"
+            )
+            print(
+                f"  context:   {format_pretty_tokens(context, max_tokens=print_max_tokens)}"
+            )
+            print(
+                f"  completion: {format_pretty_tokens(completion, max_tokens=print_max_tokens)}"
+            )
+
 
 def main():
     """CLI entry point."""
-    parser = argparse.ArgumentParser(description="Evaluate model continuations by end field")
-    parser.add_argument("--checkpoint",
-                       default="outputs/latency_network/full_run/full_run/checkpoints/2000",
-                       help="Path to checkpoint directory")
-    parser.add_argument("--config", default="src/MaxText/configs/latency_network.yml",
-                       help="Config file path")
-    parser.add_argument("--data", default="data/training_data.parquet",
-                       help="Path to training data parquet file")
-    parser.add_argument("--num-samples", type=int, default=100,
-                       help="Number of measurements to evaluate")
-    parser.add_argument("--max-new-tokens", type=int, default=20,
-                       help="Maximum tokens to generate per stream")
-    parser.add_argument("--temperature", type=float, default=1.0,
-                       help="Sampling temperature")
+    parser = argparse.ArgumentParser(
+        description="Evaluate model continuations by end field"
+    )
+    parser.add_argument(
+        "--checkpoint",
+        default=DEFAULT_CHECKPOINT,
+        help="Path to param-only checkpoint items directory",
+    )
+    parser.add_argument(
+        "--config",
+        default="src/MaxText/configs/latency_network.yml",
+        help="Config file path",
+    )
+    parser.add_argument(
+        "--data",
+        default="data/training_data.parquet",
+        help="Path to training data parquet file",
+    )
+    parser.add_argument(
+        "--num-samples",
+        type=int,
+        default=100,
+        help="Number of measurements to evaluate",
+    )
+    parser.add_argument(
+        "--max-new-tokens",
+        type=int,
+        default=20,
+        help="Maximum tokens to generate per stream",
+    )
+    parser.add_argument(
+        "--temperature", type=float, default=1.0, help="Sampling temperature"
+    )
+    parser.add_argument(
+        "--progress-interval",
+        type=int,
+        default=1,
+        help="Print progress every N generation steps (0 to disable)",
+    )
+    parser.add_argument(
+        "--print-per-variant",
+        type=int,
+        default=2,
+        help="How many samples to print per variant (0 to disable)",
+    )
+    parser.add_argument(
+        "--print-max-tokens",
+        type=int,
+        default=120,
+        help="Maximum tokens to display per context/completion",
+    )
     parser.add_argument("--seed", type=int, default=42, help="Random seed")
     args = parser.parse_args()
 
@@ -435,6 +609,9 @@ def main():
         num_samples=args.num_samples,
         max_new_tokens=args.max_new_tokens,
         temperature=args.temperature,
+        progress_interval=args.progress_interval,
+        print_per_variant=args.print_per_variant,
+        print_max_tokens=args.print_max_tokens,
         seed=args.seed,
     )
 
@@ -447,6 +624,7 @@ if __name__ == "__main__":
 # Modal GPU Function
 # ============================================================================
 if MODAL_AVAILABLE:
+
     @app.function(
         image=image,
         gpu="A100",  # Use A100 for fast inference
@@ -461,24 +639,30 @@ if MODAL_AVAILABLE:
         },
     )
     def eval_on_modal(
-        checkpoint_dir: str = "full_run/full_run/checkpoints/2000",
+        checkpoint_path: str = PARAM_ONLY_CHECKPOINT_MODAL,
         config: str = "src/MaxText/configs/latency_network.yml",
         data_file: str = "training_data.parquet",
         num_samples: int = 100,
         max_new_tokens: int = 20,
         temperature: float = 1.0,
+        progress_interval: int = 1,
+        print_per_variant: int = 2,
+        print_max_tokens: int = 120,
         seed: int = 42,
     ):
         """
         Run eval_ordering_likelihood on Modal with GPU acceleration.
 
         Args:
-            checkpoint_dir: Relative path within /mnt/outputs (e.g., "full_run/full_run/checkpoints/2000")
+            checkpoint_path: Param-only checkpoint items path
             config: Config file path (relative to workspace)
             data_file: Data file name within /mnt/data (e.g., "training_data.parquet")
             num_samples: Number of measurements to evaluate
             max_new_tokens: Maximum tokens to generate per stream
             temperature: Sampling temperature
+            progress_interval: Print progress every N generation steps (0 to disable)
+            print_per_variant: How many samples to print per variant (0 to disable)
+            print_max_tokens: Maximum tokens to display per context/completion
             seed: Random seed
         """
         import sys
@@ -489,25 +673,41 @@ if MODAL_AVAILABLE:
 
         # Link outputs and data from volume
         if not os.path.exists(f"{WORKDIR}/outputs/latency_network"):
-            os.symlink("/mnt/outputs/latency_network", f"{WORKDIR}/outputs/latency_network")
+            os.symlink(
+                "/mnt/outputs/latency_network", f"{WORKDIR}/outputs/latency_network"
+            )
         if not os.path.exists(f"{WORKDIR}/data/{data_file}"):
             os.symlink(f"/mnt/data/{data_file}", f"{WORKDIR}/data/{data_file}")
 
-        # Build checkpoint path
-        checkpoint_path = f"/mnt/outputs/latency_network/{checkpoint_dir}"
+        # Resolve checkpoint path
+        if not checkpoint_path.startswith("/"):
+            checkpoint_path = f"{WORKDIR}/{checkpoint_path}"
         data_path = f"{WORKDIR}/data/{data_file}"
         config_path = f"{WORKDIR}/{config}"
 
         # Prepare argv for main()
         sys.argv = [
             "eval_ordering_likelihood.py",
-            "--checkpoint", checkpoint_path,
-            "--config", config_path,
-            "--data", data_path,
-            "--num-samples", str(num_samples),
-            "--max-new-tokens", str(max_new_tokens),
-            "--temperature", str(temperature),
-            "--seed", str(seed),
+            "--checkpoint",
+            checkpoint_path,
+            "--config",
+            config_path,
+            "--data",
+            data_path,
+            "--num-samples",
+            str(num_samples),
+            "--max-new-tokens",
+            str(max_new_tokens),
+            "--temperature",
+            str(temperature),
+            "--progress-interval",
+            str(progress_interval),
+            "--print-per-variant",
+            str(print_per_variant),
+            "--print-max-tokens",
+            str(print_max_tokens),
+            "--seed",
+            str(seed),
         ]
 
         # Set environment to indicate GPU usage

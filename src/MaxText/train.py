@@ -457,8 +457,9 @@ def train_loop(config, recorder, state=None):
 
       if config.eval_interval > 0 and step > start_step and (step + 1) % config.eval_interval == 0:
         assert eval_data_iterator
-        # Explicitly reset the eval iterator and counters before starting the eval loop
-        eval_data_iterator.reset()
+        # NOTE: No need to reset eval iterator - it repeats infinitely via dataset.repeat(None)
+        # Resetting causes grain pool shutdown/restart spam with frequent evals
+        # eval_data_iterator.reset()  # ← REMOVED: causes unnecessary grain pool restarts
         metric_logger.reset_eval_metrics()
 
         eval_step_count = 0
@@ -517,7 +518,11 @@ def initialize(argv: Sequence[str]) -> tuple[pyconfig.HyperParameters, Any, Any]
   # TF allocates extraneous GPU memory when using TFDS data
   # this leads to CUDA OOMs. WAR for now is to hide GPUs from TF
   tf.config.set_visible_devices([], "GPU")
-  os.environ["TF_CPP_MIN_LOG_LEVEL"] = "0"
+  # DEBUG: Log current TF_CPP_MIN_LOG_LEVEL before and after setdefault
+  before = os.environ.get("TF_CPP_MIN_LOG_LEVEL", "not set")
+  os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "0")  # Respect existing value if set
+  after = os.environ.get("TF_CPP_MIN_LOG_LEVEL")
+  max_logging.log(f"[DEBUG] TF_CPP_MIN_LOG_LEVEL: before={before}, after={after}")
   if "xla_tpu_spmd_rng_bit_generator_unsafe" not in os.environ.get("LIBTPU_INIT_ARGS", ""):
     os.environ["LIBTPU_INIT_ARGS"] = (
         os.environ.get("LIBTPU_INIT_ARGS", "") + " --xla_tpu_spmd_rng_bit_generator_unsafe=true"

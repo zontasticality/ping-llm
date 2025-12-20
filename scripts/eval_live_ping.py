@@ -63,13 +63,9 @@ from scipy.stats import entropy
 
 from src.MaxText.input_pipeline.network_tokenization import (
     encode_ip_merged, encode_timestamp_delta,
-    MEASUREMENT_START, SRC_IPV4, DST_IPV4, RTT_START,
-    byte_to_token, token_to_byte, encode_rtt_exponent_mantissa,
-    decode_rtt_exponent_mantissa,
+    MEASUREMENT_START, RTT_START,
+    token_to_byte, decode_rtt_exponent_mantissa,
 )
-from src.MaxText import pyconfig, model_creation_utils, maxtext_utils, checkpointing, max_utils
-from src.MaxText.inference_utils import sampling
-from flax.linen import partitioning as nn_partitioning
 
 # ============================================================================
 # Modal Setup (for GPU acceleration)
@@ -112,6 +108,7 @@ if MODAL_AVAILABLE:
         .run_commands(
             f"cd {WORKDIR} && CC=gcc CXX=g++ uv pip install --system -e '.[cuda12]' --resolution=lowest",
             f"cd {WORKDIR} && install_maxtext_github_deps",
+            "uv pip install --system 'google-jetstream @ https://github.com/AI-Hypercomputer/JetStream/archive/29329e8e73820993f77cfc8efe34eb2a73f5de98.zip' --resolution=lowest",
         )
         .pip_install("scipy")
         # Stage 3: Copy code
@@ -121,9 +118,23 @@ if MODAL_AVAILABLE:
     app = modal.App(APP_NAME)
     shared_vol = modal.Volume.from_name(VOLUME_NAME, create_if_missing=True)
 
+PARAM_ONLY_CHECKPOINT_MODAL = "/mnt/outputs/latency_network/param_only_checkpoint/checkpoints/0/items"
+PARAM_ONLY_CHECKPOINT_LOCAL = "outputs/latency_network/param_only_checkpoint/checkpoints/0/items"
+DEFAULT_CHECKPOINT = (
+    PARAM_ONLY_CHECKPOINT_MODAL if IN_MODAL_RUNTIME else PARAM_ONLY_CHECKPOINT_LOCAL
+)
 
-def build_config(checkpoint_path, config_path, use_gpu=False):
+
+def build_config(
+    checkpoint_path,
+    config_path,
+    use_gpu=False,
+    max_prefill_length=None,
+    max_target_length=None,
+):
     """Build a MaxText config with resolved paths and eval overrides."""
+    from src.MaxText import pyconfig as maxtext_pyconfig
+
     checkpoint_path = str(Path(checkpoint_path).resolve())
     config_path = str(Path(config_path).resolve())
 
@@ -132,64 +143,31 @@ def build_config(checkpoint_path, config_path, use_gpu=False):
     argv = [
         "eval_script",  # argv[0] - program name (ignored)
         config_path,    # argv[1] - config file path
-        f"load_full_state_path={checkpoint_path}",  # Use load_full_state_path for full checkpoint
+        f"load_parameters_path={checkpoint_path}",
         f"hardware={'gpu' if use_gpu else 'cpu'}",
         "skip_jax_distributed_system=true",
     ]
 
-    # Use simpler attention for CPU
-    if not use_gpu:
-        argv.append("attention=dot_product")
+    if max_prefill_length is not None:
+        argv.append(f"max_prefill_predict_length={max_prefill_length}")
+    if max_target_length is not None:
+        argv.append(f"max_target_length={max_target_length}")
 
-    config = pyconfig.initialize(argv)
+    # MaxEngine decode path requires dot_product attention.
+    argv.append("attention=dot_product")
+
+    config = maxtext_pyconfig.initialize(argv)
     return config, checkpoint_path
 
 
-def load_model_and_params(checkpoint_path, config):
-    """Load model and parameters from checkpoint using MaxText's native approach."""
-    # Create model
-    model = model_creation_utils.from_config(config)
-    mesh = model.mesh
+def setup_engine(config):
+    """Create a MaxEngine and load parameters."""
+    from src.MaxText import maxengine
 
-    # Get abstract params structure (just shapes, no actual arrays - minimal memory)
-    print("Getting abstract parameter structure...")
-    with mesh, nn_partitioning.axis_rules(config.logical_axis_rules):
-        abstract_params = maxtext_utils.get_abstract_param(model, config)
-
-    # Load ONLY params from checkpoint using Orbax directly (skip optimizer state)
-    print(f"Loading parameters only from checkpoint (this saves memory)...")
-    import orbax.checkpoint as ocp
-    from etils import epath
-
-    with mesh, nn_partitioning.axis_rules(config.logical_axis_rules):
-        # Create checkpointer
-        ckptr = ocp.Checkpointer(
-            ocp.PyTreeCheckpointHandler(
-                restore_concurrent_gb=config.checkpoint_storage_concurrent_gb,
-                use_ocdbt=True,
-                use_zarr3=True,
-            )
-        )
-
-        # Restore only the params field from items/params
-        # The checkpoint structure is: checkpoint/items/{params, opt_state, step, ...}
-        # We only want params
-        restore_args = ocp.checkpoint_utils.construct_restore_args(abstract_params['params'])
-
-        # Restore from checkpoint_path/items (the items subdirectory)
-        checkpoint_items_path = epath.Path(checkpoint_path) / "items"
-
-        restored = ckptr.restore(
-            checkpoint_items_path,
-            item={'params': abstract_params['params']},
-            transforms={},
-            restore_args={'params': restore_args},
-        )
-
-        params = restored['params']
-
-    print("✓ Parameters loaded successfully (optimizer state skipped to save memory)")
-    return model, params, mesh
+    engine = maxengine.MaxEngine(config)
+    rng = jax.random.PRNGKey(0)
+    params = engine.load_params(rng=rng)
+    return engine, params
 
 
 def ping_host(ip, timeout=2):
@@ -298,12 +276,26 @@ def create_conditioning_tokens(src_ip, dst_ip, include_timestamp=False):
     return tokens
 
 
-def sample_rtt_from_model(model, params, config, conditioning_tokens, num_samples=100, temperature=1.0):
+def pad_tokens(tokens, target_len):
+    """Pad a token list to target_len with zeros."""
+    seq = tokens[:target_len]
+    padded = np.zeros(target_len, dtype=np.int32)
+    padded[: len(seq)] = seq
+    return padded, len(seq)
+
+
+def extract_token(result_tokens, slot):
+    """Extract the sampled token for a slot from ResultTokens."""
+    token_idx = result_tokens.tokens_idx[0]
+    return int(np.asarray(result_tokens.data)[slot, token_idx])
+
+
+def sample_rtt_from_model(engine, params, config, conditioning_tokens, num_samples=100, temperature=1.0, rng=None):
     """
     Sample RTT values from the model's conditional distribution.
 
     Args:
-        model: Flax model
+        engine: MaxEngine instance
         params: Model parameters
         config: Config
         conditioning_tokens: Context tokens (src, dst, RTT_START)
@@ -314,79 +306,53 @@ def sample_rtt_from_model(model, params, config, conditioning_tokens, num_sample
         List of RTT values in milliseconds
     """
     rtt_samples = []
-    rng = jax.random.PRNGKey(int(time.time() * 1000) % 2**31)
-    max_len = config.max_target_length
+    if rng is None:
+        rng = jax.random.PRNGKey(int(time.time() * 1000) % 2**31)
 
-    # Sample num_samples 2-grams (byte1, byte2) for RTT
-    for i in range(num_samples):
-        rng, rng_byte1, rng_byte2 = jax.random.split(rng, 3)
+    max_slots = engine.max_concurrent_decodes
+    padded_tokens, true_length = pad_tokens(conditioning_tokens, config.max_prefill_predict_length)
+    padded_tokens = jnp.array(padded_tokens)
 
-        # Prepare inputs for first byte
-        tokens_list = conditioning_tokens
-        input_tokens = jnp.array([tokens_list], dtype=jnp.int32)
-        positions = jnp.arange(len(tokens_list), dtype=jnp.int32)[None, :]
-        segment_ids = jnp.ones((1, len(tokens_list)), dtype=jnp.int32)
+    for start in range(0, num_samples, max_slots):
+        batch_size = min(max_slots, num_samples - start)
+        rng, rng_state = jax.random.split(rng)
+        decode_state = engine.init_decode_state(rng=rng_state)
 
-        # Pad to max length
-        if len(tokens_list) < max_len:
-            pad_len = max_len - len(tokens_list)
-            input_tokens = jnp.pad(input_tokens, ((0, 0), (0, pad_len)), constant_values=0)
-            positions = jnp.pad(positions, ((0, 0), (0, pad_len)), constant_values=0)
-            segment_ids = jnp.pad(segment_ids, ((0, 0), (0, pad_len)), constant_values=0)
+        first_tokens = []
+        for slot in range(batch_size):
+            rng, rng_prefill = jax.random.split(rng)
+            prefix, first = engine.prefill(
+                params=params,
+                padded_tokens=padded_tokens,
+                true_length=true_length,
+                rng=rng_prefill,
+                slot=slot,
+                temperature=temperature,
+            )
+            decode_state = engine.insert(prefix=prefix, decode_state=decode_state, slot=slot)
+            first_tokens.append(extract_token(first, 0))
 
-        # Get logits for first RTT byte
-        logits, _ = model.apply(
-            params,
-            input_tokens,
-            positions,
-            decoder_segment_ids=segment_ids,
-            enable_dropout=False,
-            rngs={"dropout": rng_byte1, "params": rng_byte1},
-            mutable=["intermediates"],
+        rng, rng_gen = jax.random.split(rng)
+        decode_state, result_tokens = engine.generate(
+            params=params,
+            decode_state=decode_state,
+            rng=rng_gen,
+            temperature=temperature,
         )
+        second_tokens = np.asarray(result_tokens.data)[:batch_size, result_tokens.tokens_idx[0]]
 
-        # Sample first RTT byte (predict token after last position)
-        logits_byte1 = logits[0, len(tokens_list) - 1, :]
-        byte1_token = sampling(logits_byte1, rng_byte1, "weighted", temperature=temperature)
-        byte1_token = int(byte1_token)
-
-        # Add byte1 to sequence and get logits for second byte
-        tokens_list2 = conditioning_tokens + [byte1_token]
-        input_tokens2 = jnp.array([tokens_list2], dtype=jnp.int32)
-        positions2 = jnp.arange(len(tokens_list2), dtype=jnp.int32)[None, :]
-        segment_ids2 = jnp.ones((1, len(tokens_list2)), dtype=jnp.int32)
-
-        # Pad to max length
-        if len(tokens_list2) < max_len:
-            pad_len = max_len - len(tokens_list2)
-            input_tokens2 = jnp.pad(input_tokens2, ((0, 0), (0, pad_len)), constant_values=0)
-            positions2 = jnp.pad(positions2, ((0, 0), (0, pad_len)), constant_values=0)
-            segment_ids2 = jnp.pad(segment_ids2, ((0, 0), (0, pad_len)), constant_values=0)
-
-        logits2, _ = model.apply(
-            params,
-            input_tokens2,
-            positions2,
-            decoder_segment_ids=segment_ids2,
-            enable_dropout=False,
-            rngs={"dropout": rng_byte2, "params": rng_byte2},
-            mutable=["intermediates"],
-        )
-
-        # Sample second RTT byte
-        logits_byte2 = logits2[0, len(tokens_list2) - 1, :]
-        byte2_token = sampling(logits_byte2, rng_byte2, "weighted", temperature=temperature)
-        byte2_token = int(byte2_token)
-
-        # Decode RTT from 2-byte encoding
-        try:
-            byte1 = token_to_byte(byte1_token)
-            byte2 = token_to_byte(byte2_token)
-            rtt_ms = decode_rtt_exponent_mantissa(byte1, byte2)
-            rtt_samples.append(rtt_ms)
-        except:
-            # Invalid token, skip
-            continue
+        for slot in range(batch_size):
+            byte1_token = int(first_tokens[slot])
+            byte2_token = int(second_tokens[slot])
+            try:
+                byte1 = token_to_byte(byte1_token)
+                byte2 = token_to_byte(byte2_token)
+                rtt_ms = decode_rtt_exponent_mantissa(byte1, byte2)
+                rtt_samples.append(rtt_ms)
+            except Exception:
+                continue
+            finally:
+                engine.release_pages(slot=slot)
 
     return rtt_samples
 
@@ -442,10 +408,12 @@ def kl_divergence(p, q, epsilon=1e-10):
 
 
 def main():
+    from src.MaxText import max_utils
+
     parser = argparse.ArgumentParser(description="Live ping evaluation with KL divergence")
     parser.add_argument("--checkpoint",
-                       default="outputs/latency_network/full_run/full_run/checkpoints/2000",
-                       help="Path to checkpoint directory")
+                       default=DEFAULT_CHECKPOINT,
+                       help="Path to param-only checkpoint items directory")
     parser.add_argument("--config", default="src/MaxText/configs/latency_network.yml",
                        help="Config file path")
     parser.add_argument("--num-ips", type=int, default=10,
@@ -459,20 +427,33 @@ def main():
     parser.add_argument("--seed", type=int, default=42, help="Random seed")
     args = parser.parse_args()
 
-    print("Loading model and checkpoint...")
+    # Get source IP
+    src_ip = get_src_ip()
+    print(f"\nSource IP: {src_ip}")
+
+    # Generate random destination IPs
+    print(f"\nGenerating {args.num_ips} random public IPv4 addresses...")
+    dst_ips = generate_random_ipv4(count=args.num_ips, seed=args.seed)
+
+    # Compute prompt lengths for config overrides
+    sample_dst = dst_ips[0] if dst_ips else "1.1.1.1"
+    tokens_no_ts = create_conditioning_tokens(src_ip, sample_dst, include_timestamp=False)
+    tokens_with_ts = create_conditioning_tokens(src_ip, sample_dst, include_timestamp=True)
+    max_prefill_len = max(len(tokens_no_ts), len(tokens_with_ts))
+    max_target_len = max_prefill_len + 2
+
+    print("Loading MaxEngine and checkpoint...")
     use_gpu = IN_MODAL_RUNTIME or os.environ.get("JAX_PLATFORMS") == "gpu"
-    config, checkpoint_path = build_config(args.checkpoint, args.config, use_gpu=use_gpu)
+    config, checkpoint_path = build_config(
+        args.checkpoint,
+        args.config,
+        use_gpu=use_gpu,
+        max_prefill_length=max_prefill_len,
+        max_target_length=max_target_len,
+    )
     with max_utils.maybe_get_transformer_engine_context(config):
-        model, params, mesh = load_model_and_params(checkpoint_path, config)
-        print(f"✓ Model loaded from {checkpoint_path}")
-
-        # Get source IP
-        src_ip = get_src_ip()
-        print(f"\nSource IP: {src_ip}")
-
-        # Generate random destination IPs
-        print(f"\nGenerating {args.num_ips} random public IPv4 addresses...")
-        dst_ips = generate_random_ipv4(count=args.num_ips, seed=args.seed)
+        engine, params = setup_engine(config)
+        print(f"✓ Engine initialized with params from {checkpoint_path}")
 
         # Results storage
         results_no_ts = []
@@ -482,63 +463,62 @@ def main():
         print("Starting live ping evaluation...")
         print("="*80)
 
-        with mesh, nn_partitioning.axis_rules(config.logical_axis_rules):
-            for idx, dst_ip in enumerate(dst_ips):
-                print(f"\n[{idx+1}/{args.num_ips}] Testing {dst_ip}...")
+        for idx, dst_ip in enumerate(dst_ips):
+            print(f"\n[{idx+1}/{args.num_ips}] Testing {dst_ip}...")
 
-                # Ping the host
-                print(f"  Pinging {args.pings_per_ip} times...")
-                real_rtts = []
-                for _ in range(args.pings_per_ip):
-                    rtt = ping_host(dst_ip)
-                    real_rtts.append(rtt)
+            # Ping the host
+            print(f"  Pinging {args.pings_per_ip} times...")
+            real_rtts = []
+            for _ in range(args.pings_per_ip):
+                rtt = ping_host(dst_ip)
+                real_rtts.append(rtt)
 
-                success_count = sum(1 for r in real_rtts if r >= 0)
-                print(f"  Real pings: {success_count}/{args.pings_per_ip} successful")
+            success_count = sum(1 for r in real_rtts if r >= 0)
+            print(f"  Real pings: {success_count}/{args.pings_per_ip} successful")
 
-                if success_count < 5:
-                    print("  Skipping (too few successful pings)")
-                    continue
+            if success_count < 5:
+                print("  Skipping (too few successful pings)")
+                continue
 
-                # Get real distribution
-                real_dist = discretize_rtt(real_rtts)
+            # Get real distribution
+            real_dist = discretize_rtt(real_rtts)
 
-                # Test without timestamp
-                print("  Sampling model (no timestamp)...")
-                cond_tokens_no_ts = create_conditioning_tokens(src_ip, dst_ip, include_timestamp=False)
-                model_rtts_no_ts = sample_rtt_from_model(
-                    model, params, config, cond_tokens_no_ts,
-                    num_samples=args.model_samples, temperature=args.temperature
-                )
-                model_dist_no_ts = discretize_rtt(model_rtts_no_ts)
-                kl_no_ts = kl_divergence(real_dist, model_dist_no_ts)
+            # Test without timestamp
+            print("  Sampling model (no timestamp)...")
+            cond_tokens_no_ts = create_conditioning_tokens(src_ip, dst_ip, include_timestamp=False)
+            model_rtts_no_ts = sample_rtt_from_model(
+                engine, params, config, cond_tokens_no_ts,
+                num_samples=args.model_samples, temperature=args.temperature
+            )
+            model_dist_no_ts = discretize_rtt(model_rtts_no_ts)
+            kl_no_ts = kl_divergence(real_dist, model_dist_no_ts)
 
-                # Test with timestamp
-                print("  Sampling model (with timestamp)...")
-                cond_tokens_with_ts = create_conditioning_tokens(src_ip, dst_ip, include_timestamp=True)
-                model_rtts_with_ts = sample_rtt_from_model(
-                    model, params, config, cond_tokens_with_ts,
-                    num_samples=args.model_samples, temperature=args.temperature
-                )
-                model_dist_with_ts = discretize_rtt(model_rtts_with_ts)
-                kl_with_ts = kl_divergence(real_dist, model_dist_with_ts)
+            # Test with timestamp
+            print("  Sampling model (with timestamp)...")
+            cond_tokens_with_ts = create_conditioning_tokens(src_ip, dst_ip, include_timestamp=True)
+            model_rtts_with_ts = sample_rtt_from_model(
+                engine, params, config, cond_tokens_with_ts,
+                num_samples=args.model_samples, temperature=args.temperature
+            )
+            model_dist_with_ts = discretize_rtt(model_rtts_with_ts)
+            kl_with_ts = kl_divergence(real_dist, model_dist_with_ts)
 
-                print(f"  KL divergence (no timestamp):   {kl_no_ts:.4f}")
-                print(f"  KL divergence (with timestamp):  {kl_with_ts:.4f}")
+            print(f"  KL divergence (no timestamp):   {kl_no_ts:.4f}")
+            print(f"  KL divergence (with timestamp):  {kl_with_ts:.4f}")
 
-                results_no_ts.append({
-                    'dst_ip': dst_ip,
-                    'kl': kl_no_ts,
-                    'real_mean': np.mean([r for r in real_rtts if r >= 0]),
-                    'model_mean': np.mean(model_rtts_no_ts) if model_rtts_no_ts else float('nan'),
-                })
+            results_no_ts.append({
+                'dst_ip': dst_ip,
+                'kl': kl_no_ts,
+                'real_mean': np.mean([r for r in real_rtts if r >= 0]),
+                'model_mean': np.mean(model_rtts_no_ts) if model_rtts_no_ts else float('nan'),
+            })
 
-                results_with_ts.append({
-                    'dst_ip': dst_ip,
-                    'kl': kl_with_ts,
-                    'real_mean': np.mean([r for r in real_rtts if r >= 0]),
-                    'model_mean': np.mean(model_rtts_with_ts) if model_rtts_with_ts else float('nan'),
-                })
+            results_with_ts.append({
+                'dst_ip': dst_ip,
+                'kl': kl_with_ts,
+                'real_mean': np.mean([r for r in real_rtts if r >= 0]),
+                'model_mean': np.mean(model_rtts_with_ts) if model_rtts_with_ts else float('nan'),
+            })
 
     # Summary statistics
     print("\n" + "="*80)
@@ -600,7 +580,7 @@ if MODAL_AVAILABLE:
         },
     )
     def eval_on_modal(
-        checkpoint_dir: str = "full_run/full_run/checkpoints/2000",
+        checkpoint_path: str = PARAM_ONLY_CHECKPOINT_MODAL,
         config: str = "src/MaxText/configs/latency_network.yml",
         num_ips: int = 10,
         pings_per_ip: int = 20,
@@ -612,7 +592,7 @@ if MODAL_AVAILABLE:
         Run eval_live_ping on Modal with GPU acceleration.
 
         Args:
-            checkpoint_dir: Relative path within /mnt/outputs (e.g., "full_run/full_run/checkpoints/2000")
+            checkpoint_path: Param-only checkpoint items path
             config: Config file path (relative to workspace)
             num_ips: Number of random IPs to test
             pings_per_ip: Number of pings per IP
@@ -629,8 +609,9 @@ if MODAL_AVAILABLE:
         if not os.path.exists(f"{WORKDIR}/outputs/latency_network"):
             os.symlink("/mnt/outputs/latency_network", f"{WORKDIR}/outputs/latency_network")
 
-        # Build checkpoint path
-        checkpoint_path = f"/mnt/outputs/latency_network/{checkpoint_dir}"
+        # Resolve checkpoint path
+        if not checkpoint_path.startswith("/"):
+            checkpoint_path = f"{WORKDIR}/{checkpoint_path}"
         config_path = f"{WORKDIR}/{config}"
 
         # Prepare argv for main()

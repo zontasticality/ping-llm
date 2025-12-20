@@ -10,27 +10,41 @@ Usage:
     wandb login
 
     # Run training with wandb:
-    python scripts/train_with_wandb_sync.py \
+    python scripts/train.py \
         --config src/MaxText/configs/latency_network.yml \
-        --project ping-llm-plan2 \
-        --name test_run \
         --steps 10 \
         --batch-size 2
 
-    # Or for full training:
-    python scripts/train_with_wandb_sync.py \
+    # Or for full training (uses defaults: project=ping-llm, name=full-run):
+    python scripts/train.py \
         --config src/MaxText/configs/latency_network.yml \
-        --project ping-llm-plan2 \
-        --name full_plan2_training \
-        --steps 200000 \
-        --batch-size 32
+        --steps 5000 \
+        --batch-size 128
 """
 
-import argparse
+# CRITICAL: Set logging environment variables BEFORE any imports
+# This must come before importing TensorFlow, JAX, or any Google libraries
 import os
+os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "3")  # Suppress TF warnings (3 = errors only)
+os.environ.setdefault("JAX_LOG_COMPILES", "0")  # Disable JAX compilation logs
+os.environ.setdefault("JAX_PLATFORMS", "")  # Let JAX auto-detect
+
+# DEBUG: Verify environment variables are set
+print(f"[DEBUG] TF_CPP_MIN_LOG_LEVEL={os.environ.get('TF_CPP_MIN_LOG_LEVEL')}")
+print(f"[DEBUG] JAX_LOG_COMPILES={os.environ.get('JAX_LOG_COMPILES')}")
+print(f"[DEBUG] PYTHONWARNINGS={os.environ.get('PYTHONWARNINGS')}")
+
+import argparse
 import sys
 import subprocess
 from pathlib import Path
+import logging
+
+# Configure Python logging to suppress noisy libraries
+logging.getLogger("absl").setLevel(logging.ERROR)  # Suppress ABSL (used by JAX/TF)
+logging.getLogger("grain").setLevel(logging.WARNING)  # Suppress Grain info logs
+logging.getLogger("tensorflow").setLevel(logging.ERROR)
+logging.getLogger("jax").setLevel(logging.WARNING)
 
 try:
     import wandb
@@ -128,9 +142,9 @@ def get_peak_tflops():
 def main():
     parser = argparse.ArgumentParser(description="Run MaxText with Wandb TensorBoard sync")
     parser.add_argument("--config", required=True, help="MaxText config file")
-    parser.add_argument("--project", default="ping-llm-plan2", help="Wandb project name")
+    parser.add_argument("--project", default="ping-llm", help="Wandb project name")
     parser.add_argument("--entity", default=None, help="Wandb entity (team name)")
-    parser.add_argument("--name", default=None, help="Run name (auto-generated if not provided)")
+    parser.add_argument("--name", default="full-run", help="Run name")
     parser.add_argument("--tags", nargs="+", default=[], help="Wandb tags")
     parser.add_argument("--steps", type=int, default=200000, help="Training steps")
     parser.add_argument("--batch-size", type=int, default=32, help="Per-device batch size")
@@ -140,11 +154,6 @@ def main():
     parser.add_argument("--wandb-mode", default="online", choices=["online", "offline", "disabled"],
                         help="Wandb mode")
     args = parser.parse_args()
-
-    # Suppress TensorFlow/CUDA plugin registration warnings
-    # These occur because TensorFlow and JAX both try to register CUDA plugins
-    # Safe to suppress - they're harmless warnings that don't affect functionality
-    os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "2")  # Suppress TF warnings
 
     # Check wandb login (soft check - wandb.init will fail with better error if not logged in)
     if args.wandb_mode != "disabled":
@@ -175,15 +184,21 @@ def main():
     else:
         print("WARNING: Could not detect GPU peak TFLOPs. MFU will not be tracked.")
 
-    # Auto-generate run name if not provided
-    run_name = args.name or f"maxtext_plan2_{wandb.util.generate_id()}"
+    # Use provided run name (defaults to "full-run")
+    run_name = args.name
+
+    # Build output directory path BEFORE wandb.init
+    project_root = Path(__file__).parent.parent
+    output_dir = (project_root / "outputs" / "latency_network" / run_name).resolve()
+    tensorboard_dir = output_dir / "tensorboard"
 
     # Initialize wandb with TensorBoard sync
     print(f"\nInitializing Wandb (mode: {args.wandb_mode})...")
+    print(f"TensorBoard directory: {tensorboard_dir}")
 
-    # Patch TensorBoard to sync to wandb
+    # Patch TensorBoard to sync to wandb (use correct path!)
     if args.wandb_mode != "disabled":
-        wandb.tensorboard.patch(root_logdir="outputs/latency_network", pytorch=False, tensorboard_x=False)
+        wandb.tensorboard.patch(root_logdir=str(tensorboard_dir), pytorch=False, tensorboard_x=False)
 
     run = wandb.init(
         project=args.project,
@@ -198,7 +213,7 @@ def main():
             "enable_checkpointing": args.enable_checkpointing,
             "peak_tflops_bf16": peak_tflops if peak_tflops else "unknown",
         },
-        tags=["maxtext", "plan2", "network-measurement"] + args.tags,
+        tags=["maxtext", "network-measurement"] + args.tags,
         sync_tensorboard=True,  # Enable TensorBoard sync
     )
 
@@ -211,10 +226,7 @@ def main():
     print()
 
     # Build MaxText command
-    project_root = Path(__file__).parent.parent
-
-    # Use absolute path for base_output_directory to fix Orbax checkpoint error
-    output_dir = (project_root / "outputs" / "latency_network" / run_name).resolve()
+    # (output_dir already created above before wandb.init)
 
     # Auto-resume: Check for existing checkpoints (unless --no-resume is set)
     checkpoint_path = None
@@ -297,7 +309,7 @@ def main():
         for line in process.stdout:
             print(line, end='')  # Print to console
 
-            # Parse MaxText metrics from stdout
+            # Parse MaxText training metrics from stdout
             # Example: "completed step: 0, seconds: 9.020, TFLOP/s/device: 0.170, Tokens/s/device: 227.052, total_weights: 70, loss: 5.544"
             if "completed step:" in line:
                 try:
@@ -382,6 +394,35 @@ def main():
                     # Log to wandb
                     if metrics:
                         wandb.log(metrics, step=step)
+
+                except Exception as e:
+                    # Parsing failed, skip this line
+                    pass
+
+            # Parse MaxText eval metrics from stdout
+            # Example: "eval metrics after step: 39, loss=4.733, total_weights=8751"
+            if "eval metrics after step:" in line:
+                try:
+                    # Extract step number
+                    step_str = line.split("eval metrics after step:")[1].split(",")[0].strip()
+                    step = int(step_str)
+
+                    eval_metrics = {}
+
+                    # Parse eval loss
+                    if "loss=" in line:
+                        loss_str = line.split("loss=")[1].split(",")[0].strip()
+                        eval_metrics["eval/avg_loss"] = float(loss_str)
+
+                    # Parse total weights
+                    if "total_weights=" in line:
+                        weights_str = line.split("total_weights=")[1].split(",")[0].strip()
+                        eval_metrics["eval/total_weights"] = float(weights_str)
+
+                    # Log to wandb
+                    if eval_metrics:
+                        wandb.log(eval_metrics, step=step)
+                        print(f"  → Logged eval metrics to wandb at step {step}: {eval_metrics}")
 
                 except Exception as e:
                     # Parsing failed, skip this line

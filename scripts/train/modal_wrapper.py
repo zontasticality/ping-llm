@@ -10,11 +10,14 @@ Prereqs:
   - WANDB_API_KEY provided via environment or Modal secret (set MODAL_WANDB_SECRET name).
 
 Usage:
-  modal run scripts/train/modal.py::run \
-    --run-name plan3_modal_test \
+  # Basic usage (uses defaults: wandb-project=ping-llm, run-name=full-run):
+  modal run scripts/train/modal_wrapper.py::run
+
+  # Custom parameters:
+  modal run scripts/train/modal_wrapper.py::run \
+    --run-name my-test \
     --steps 5000 \
-    --batch-size 128 \
-    --wandb-project ping-llm-plan3
+    --batch-size 128
 
 Note:
   - Uses latency_network.yml (64 workers for 64-core A100-80GB)
@@ -89,9 +92,12 @@ image = (
         f"cd {WORKDIR} && install_maxtext_github_deps",
     )
     .pip_install("wandb")
-    # Stage 3: Copy the rest of the code (fast layer that rebuilds on code changes)
-    # CACHE BUST: 2025-12-18-04 - Fix Grain mp_prefetch worker state initialization
+    # Stage 3a: Copy training script separately to force rebuild on changes
+    .add_local_file("scripts/train.py", f"{WORKDIR}/scripts/train.py", copy=True)
+    # Stage 3b: Copy the rest of the code (fast layer that rebuilds on code changes)
     .add_local_dir(".", WORKDIR, ignore=IGNORE_PATTERNS, copy=True)
+    # CACHE BUST: Force rebuild by running a unique command
+    .run_commands("echo 'Cache bust: 2025-12-20-09 - Reduce eval overhead (100 steps, 5 eval)'")
 )
 
 app = modal.App(APP_NAME)
@@ -100,21 +106,26 @@ shared_vol = modal.Volume.from_name(VOLUME_NAME, create_if_missing=True)
 
 @app.function(
     image=image,
-    gpu="B200",
+    gpu="A100",
     cpu=8,  # A100-80GB with 64 CPUs for parallel data loading
     volumes={"/mnt": shared_vol},
     secrets=[modal.Secret.from_name("wandb-secret")],
     timeout=60 * 60 * 24,  # 24 hours (Modal max 86400s)
     env={
-        # Suppress TensorFlow/CUDA plugin registration warnings
-        # These occur because TensorFlow and JAX both register CUDA plugins
-        "TF_CPP_MIN_LOG_LEVEL": "2",  # Suppress TF warnings (0=all, 1=info, 2=warning, 3=error)
-        # Suppress redundant XLA warnings
-        "XLA_FLAGS": "--xla_gpu_force_compilation_parallelism=1",
+        # Suppress TensorFlow/CUDA/JAX warnings
+        # Note: scripts/train.py also configures Python logging for ABSL/Grain
+        "TF_CPP_MIN_LOG_LEVEL": "3",  # Errors only (0=all, 1=info, 2=warning, 3=error)
+        "JAX_LOG_COMPILES": "0",  # Disable JAX compilation logs
+        # Suppress XLA C++ warnings (computation_placer, etc)
+        "XLA_FLAGS": "--xla_gpu_force_compilation_parallelism=1 --xla_cpu_multi_thread_eigen=false",
+        # Suppress Python warnings
+        "PYTHONWARNINGS": "ignore",
+        # Redirect stderr to suppress C++ warnings that bypass TF_CPP_MIN_LOG_LEVEL
+        "TF_CPP_VMODULE": "",  # Disable verbose C++ logging
     },
 )
 def run(
-    run_name: str = "full_run",
+    run_name: str = "full-run",
     steps: int = 5_000,
     batch_size: int = 128,
     wandb_project: str = "ping-llm",
@@ -147,8 +158,15 @@ def run(
         "--enable-checkpointing",  # Enable checkpointing to save progress
     ]
 
-    # Start the training subprocess
-    process = subprocess.Popen(cmd, cwd=WORKDIR)
+    # Start the training subprocess with output streaming
+    process = subprocess.Popen(
+        cmd,
+        cwd=WORKDIR,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        universal_newlines=True,
+        bufsize=1,  # Line buffered
+    )
 
     # Register cleanup handler to send SIGINT on exit
     def cleanup_handler():
@@ -168,6 +186,10 @@ def run(
             print("=" * 80)
 
     atexit.register(cleanup_handler)
+
+    # Stream output line by line to Modal logs
+    for line in process.stdout:
+        print(line, end='', flush=True)
 
     # Wait for the process to complete
     exit_code = process.wait()
