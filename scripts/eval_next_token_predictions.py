@@ -24,9 +24,13 @@ Usage (Modal GPU):
 import os
 from pathlib import Path
 
+
 # Conditionally force CPU usage (only for local runs, not Modal).
 def _in_modal_runtime():
-    return bool(os.environ.get("MODAL_IS_REMOTE")) or (Path("/workspace") / "src").exists()
+    return (
+        bool(os.environ.get("MODAL_IS_REMOTE")) or (Path("/workspace") / "src").exists()
+    )
+
 
 IN_MODAL_RUNTIME = _in_modal_runtime()
 if not IN_MODAL_RUNTIME:
@@ -58,13 +62,17 @@ from src.MaxText.input_pipeline.network_tokenization import (
     BYTE_TOKEN_OFFSET,
     VOCAB_SIZE,
 )
-from src.MaxText.input_pipeline._probe_chunk_datasource import ProbeRowDataSource, ProbeRowSampler
+from src.MaxText.input_pipeline._probe_chunk_datasource import (
+    ProbeRowDataSource,
+    ProbeRowSampler,
+)
 
 # ============================================================================
 # Modal Setup (for GPU acceleration)
 # ============================================================================
 try:
     import modal
+
     MODAL_AVAILABLE = True
 except ImportError:
     MODAL_AVAILABLE = False
@@ -146,7 +154,10 @@ DEFAULT_DATA = DEFAULT_DATA_MODAL if IN_MODAL_RUNTIME else DEFAULT_DATA_LOCAL
 # Token Pretty Printing
 # ============================================================================
 
-def format_token_comparison(pos: int, actual: int, predicted: int, correct: bool) -> str:
+
+def format_token_comparison(
+    pos: int, actual: int, predicted: int, correct: bool
+) -> str:
     """Format a single token comparison for display."""
     actual_str = _token_to_str(actual)
     predicted_str = _token_to_str(predicted)
@@ -172,6 +183,7 @@ def _token_to_str(token: int) -> str:
 # ============================================================================
 # Model Evaluation
 # ============================================================================
+
 
 def build_config(checkpoint_path, config_path, use_gpu=False, max_length=None):
     """Build a MaxText config with resolved paths and eval overrides."""
@@ -233,7 +245,10 @@ def get_logits_for_sequence(engine, params, config, tokens: np.ndarray) -> np.nd
         np.ndarray of shape [seq_len, vocab_size] with logits
     """
     from flax.linen import partitioning as nn_partitioning
-    from MaxText.common_types import MODEL_MODE_PREFILL, DECODING_ACTIVE_SEQUENCE_INDICATOR
+    from MaxText.common_types import (
+        MODEL_MODE_PREFILL,
+        DECODING_ACTIVE_SEQUENCE_INDICATOR,
+    )
 
     # Pad sequence
     padded_tokens, true_length = pad_tokens(tokens, config.max_prefill_predict_length)
@@ -244,7 +259,9 @@ def get_logits_for_sequence(engine, params, config, tokens: np.ndarray) -> np.nd
 
     # Create sequence indicator (marks valid tokens)
     ones_to_keep = jnp.arange(input_tokens.shape[1]) < true_length
-    sequence_indicator = jnp.expand_dims(ones_to_keep * DECODING_ACTIVE_SEQUENCE_INDICATOR, 0)
+    sequence_indicator = jnp.expand_dims(
+        ones_to_keep * DECODING_ACTIVE_SEQUENCE_INDICATOR, 0
+    )
 
     # Call model.apply directly to get ALL logits (not just last token)
     rng = jax.random.PRNGKey(0)
@@ -265,17 +282,15 @@ def get_logits_for_sequence(engine, params, config, tokens: np.ndarray) -> np.nd
 
     # Extract logits for valid positions only
     # flat_logits has shape [1, seq_len, vocab_size]
-    logits = np.array(flat_logits[0, :true_length, :])  # Shape: [true_length, vocab_size]
+    logits = np.array(
+        flat_logits[0, :true_length, :]
+    )  # Shape: [true_length, vocab_size]
 
     return logits
 
 
 def evaluate_sequence(
-    engine,
-    params,
-    config,
-    tokens: np.ndarray,
-    max_positions: int = None
+    engine, params, config, tokens: np.ndarray, max_positions: int = None
 ) -> Tuple[List[Tuple[int, int, int, bool]], float]:
     """
     Evaluate next-token prediction for a sequence.
@@ -304,7 +319,7 @@ def evaluate_sequence(
     for pos in range(seq_len - 1):  # Don't predict beyond sequence
         actual_next = int(tokens[pos + 1])
         predicted_next = int(np.argmax(logits[pos]))
-        correct = (actual_next == predicted_next)
+        correct = actual_next == predicted_next
 
         comparisons.append((pos, actual_next, predicted_next, correct))
         if correct:
@@ -319,7 +334,10 @@ def evaluate_sequence(
 # Data Loading
 # ============================================================================
 
-def load_sequences_from_arrayrecord(arrayrecord_path: str, num_sequences: int, seed: int = 42) -> List[np.ndarray]:
+
+def load_sequences_from_arrayrecord(
+    arrayrecord_path: str, num_sequences: int, seed: int = 42
+) -> List[np.ndarray]:
     """Load sequences from arrayrecord file."""
     datasource = ProbeRowDataSource(arrayrecord_path)
     sampler = ProbeRowSampler(
@@ -331,7 +349,9 @@ def load_sequences_from_arrayrecord(arrayrecord_path: str, num_sequences: int, s
 
     sequences = []
     random.seed(seed)
-    row_indices = random.sample(range(len(datasource)), min(num_sequences * 2, len(datasource)))
+    row_indices = random.sample(
+        range(len(datasource)), min(num_sequences * 2, len(datasource))
+    )
 
     for idx in row_indices:
         if len(sequences) >= num_sequences:
@@ -355,6 +375,7 @@ def load_sequences_from_arrayrecord(arrayrecord_path: str, num_sequences: int, s
 # ============================================================================
 # Main Evaluation Function
 # ============================================================================
+
 
 def run_eval(
     checkpoint: str,
@@ -387,7 +408,9 @@ def run_eval(
 
     print(f"\nLoading engine and checkpoint...")
     use_gpu = IN_MODAL_RUNTIME or os.environ.get("JAX_PLATFORMS") == "gpu"
-    config, checkpoint_path = build_config(checkpoint, config_path, use_gpu=use_gpu, max_length=max_length)
+    config, checkpoint_path = build_config(
+        checkpoint, config_path, use_gpu=use_gpu, max_length=max_length
+    )
 
     with max_utils.maybe_get_transformer_engine_context(config):
         engine, params = setup_engine(config)
@@ -415,7 +438,9 @@ def run_eval(
             )
             all_accuracies.append(accuracy)
 
-            print(f"\nAccuracy: {accuracy*100:.1f}% ({sum(1 for _, _, _, c in comparisons if c)}/{len(comparisons)} correct)")
+            print(
+                f"\nAccuracy: {accuracy*100:.1f}% ({sum(1 for _, _, _, c in comparisons if c)}/{len(comparisons)} correct)"
+            )
 
             # Show first N predictions
             print(f"\nFirst 20 predictions:")
@@ -428,7 +453,9 @@ def run_eval(
                 # Show last few
                 print(f"\nLast 10 predictions:")
                 for pos, actual, predicted, correct in comparisons[-10:]:
-                    print(f"  {format_token_comparison(pos, actual, predicted, correct)}")
+                    print(
+                        f"  {format_token_comparison(pos, actual, predicted, correct)}"
+                    )
 
         # Summary
         print(f"\n{'='*80}")
@@ -492,6 +519,7 @@ if __name__ == "__main__":
 # Modal GPU Function
 # ============================================================================
 if MODAL_AVAILABLE:
+
     @app.function(
         image=image,
         gpu="A100",  # Use A100 for fast inference

@@ -25,7 +25,10 @@ Usage:
 # CRITICAL: Set logging environment variables BEFORE any imports
 # This must come before importing TensorFlow, JAX, or any Google libraries
 import os
-os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "3")  # Suppress TF warnings (3 = errors only)
+
+os.environ.setdefault(
+    "TF_CPP_MIN_LOG_LEVEL", "3"
+)  # Suppress TF warnings (3 = errors only)
 os.environ.setdefault("JAX_LOG_COMPILES", "0")  # Disable JAX compilation logs
 os.environ.setdefault("JAX_PLATFORMS", "")  # Let JAX auto-detect
 
@@ -126,8 +129,13 @@ def get_peak_tflops():
         # Try partial matches
         device_kind_lower = device_kind.lower()
         for gpu_name, peak_tflops in gpu_specs.items():
-            if gpu_name.lower() in device_kind_lower or device_kind_lower in gpu_name.lower():
-                print(f"Matched GPU '{device_kind}' to '{gpu_name}' (Peak: {peak_tflops} TFLOPS)")
+            if (
+                gpu_name.lower() in device_kind_lower
+                or device_kind_lower in gpu_name.lower()
+            ):
+                print(
+                    f"Matched GPU '{device_kind}' to '{gpu_name}' (Peak: {peak_tflops} TFLOPS)"
+                )
                 return peak_tflops
 
         print(f"WARNING: Unknown GPU type '{device_kind}'. MFU will not be calculated.")
@@ -140,40 +148,68 @@ def get_peak_tflops():
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Run MaxText with Wandb TensorBoard sync")
+    parser = argparse.ArgumentParser(
+        description="Run MaxText with Wandb TensorBoard sync"
+    )
     parser.add_argument("--config", required=True, help="MaxText config file")
     parser.add_argument("--project", default="ping-llm", help="Wandb project name")
     parser.add_argument("--entity", default=None, help="Wandb entity (team name)")
     parser.add_argument("--name", default="full-run", help="Run name")
     parser.add_argument("--tags", nargs="+", default=[], help="Wandb tags")
     parser.add_argument("--steps", type=int, default=200000, help="Training steps")
-    parser.add_argument("--batch-size", type=int, default=32, help="Per-device batch size")
-    parser.add_argument("--hardware", default="gpu", choices=["gpu", "cpu"], help="Hardware to use")
-    parser.add_argument("--enable-checkpointing", action="store_true", help="Enable checkpointing")
-    parser.add_argument("--no-resume", action="store_true", help="Start fresh training even if checkpoints exist")
-    parser.add_argument("--wandb-mode", default="online", choices=["online", "offline", "disabled"],
-                        help="Wandb mode")
+    parser.add_argument(
+        "--batch-size", type=int, default=32, help="Per-device batch size"
+    )
+    parser.add_argument(
+        "--hardware", default="gpu", choices=["gpu", "cpu"], help="Hardware to use"
+    )
+    parser.add_argument(
+        "--enable-checkpointing", action="store_true", help="Enable checkpointing"
+    )
+    parser.add_argument(
+        "--no-resume",
+        action="store_true",
+        help="Start fresh training even if checkpoints exist",
+    )
+    parser.add_argument(
+        "--wandb-mode",
+        default="online",
+        choices=["online", "offline", "disabled"],
+        help="Wandb mode",
+    )
     args = parser.parse_args()
 
     # Check wandb login (soft check - wandb.init will fail with better error if not logged in)
     if args.wandb_mode != "disabled":
         if not check_wandb_login():
-            print("\n" + "="*60)
+            print("\n" + "=" * 60)
             print("WARNING: wandb login check uncertain")
-            print("="*60)
+            print("=" * 60)
             print("wandb says you're logged in, but API check failed.")
             print("Proceeding anyway - wandb.init() will show proper error if needed.")
-            print("="*60 + "\n")
+            print("=" * 60 + "\n")
 
     # Load config
     print(f"Loading config: {args.config}")
     config = load_config(args.config)
+
+    # Sync learning_rate_schedule_steps with steps override
+    # This ensures the learning rate schedule matches the actual training duration
+    if args.steps != 200000:  # Only if steps was explicitly changed from default
+        original_schedule_steps = config.get(
+            "learning_rate_schedule_steps", config.get("steps", 5000)
+        )
+        config["learning_rate_schedule_steps"] = args.steps
+        print(
+            f"ℹ  Syncing learning_rate_schedule_steps: {original_schedule_steps} → {args.steps}"
+        )
 
     # Print full config at startup for debugging
     print("\n" + "=" * 80)
     print("FULL CONFIGURATION:")
     print("=" * 80)
     import pprint
+
     pprint.pprint(config, width=100, compact=False)
     print("=" * 80 + "\n")
 
@@ -191,6 +227,35 @@ def main():
     project_root = Path(__file__).parent.parent
     output_dir = (project_root / "outputs" / "latency_network" / run_name).resolve()
     tensorboard_dir = output_dir / "tensorboard"
+    wandb_run_id_file = output_dir / "wandb_run_id.txt"
+
+    # Auto-resume: Check for existing checkpoints (unless --no-resume is set)
+    checkpoint_path = None
+    resume_wandb_run_id = None
+    if not args.no_resume:
+        checkpoints_dir = output_dir / "checkpoints"
+        if checkpoints_dir.exists():
+            # Find the most recent checkpoint (highest numbered directory)
+            checkpoint_dirs = sorted(
+                [d for d in checkpoints_dir.iterdir() if d.is_dir()],
+                key=lambda x: int(x.name) if x.name.isdigit() else -1,
+            )
+            if checkpoint_dirs:
+                latest_checkpoint = checkpoint_dirs[-1]
+                checkpoint_path = str(latest_checkpoint)
+                print(f"✓ Found existing checkpoint: {checkpoint_path}")
+                print(f"  Resuming training from step {latest_checkpoint.name}")
+
+                # Check if we have a wandb run ID to resume
+                if wandb_run_id_file.exists():
+                    resume_wandb_run_id = wandb_run_id_file.read_text().strip()
+                    print(f"  Resuming wandb run: {resume_wandb_run_id}")
+                print()
+    elif args.no_resume:
+        print(
+            "ℹ  --no-resume flag set: Starting fresh training (ignoring existing checkpoints)"
+        )
+        print()
 
     # Initialize wandb with TensorBoard sync
     print(f"\nInitializing Wandb (mode: {args.wandb_mode})...")
@@ -198,14 +263,17 @@ def main():
 
     # Patch TensorBoard to sync to wandb (use correct path!)
     if args.wandb_mode != "disabled":
-        wandb.tensorboard.patch(root_logdir=str(tensorboard_dir), pytorch=False, tensorboard_x=False)
+        wandb.tensorboard.patch(
+            root_logdir=str(tensorboard_dir), pytorch=False, tensorboard_x=False
+        )
 
-    run = wandb.init(
-        project=args.project,
-        entity=args.entity,
-        name=run_name,
-        mode=args.wandb_mode,
-        config={
+    # Prepare wandb.init arguments
+    wandb_init_kwargs = {
+        "project": args.project,
+        "entity": args.entity,
+        "name": run_name,
+        "mode": args.wandb_mode,
+        "config": {
             **config,
             "steps": args.steps,
             "per_device_batch_size": args.batch_size,
@@ -213,9 +281,17 @@ def main():
             "enable_checkpointing": args.enable_checkpointing,
             "peak_tflops_bf16": peak_tflops if peak_tflops else "unknown",
         },
-        tags=["maxtext", "network-measurement"] + args.tags,
-        sync_tensorboard=True,  # Enable TensorBoard sync
-    )
+        "tags": ["maxtext", "network-measurement"] + args.tags,
+        "sync_tensorboard": True,
+    }
+
+    # If resuming from checkpoint with existing wandb run, resume that run
+    if resume_wandb_run_id:
+        wandb_init_kwargs["id"] = resume_wandb_run_id
+        wandb_init_kwargs["resume"] = "must"
+        print(f"  Resuming existing wandb run with ID: {resume_wandb_run_id}")
+
+    run = wandb.init(**wandb_init_kwargs)
 
     print(f"✓ Wandb run initialized")
     if args.wandb_mode == "online":
@@ -225,34 +301,22 @@ def main():
     print(f"  Run ID: {run.id}")
     print()
 
-    # Build MaxText command
-    # (output_dir already created above before wandb.init)
-
-    # Auto-resume: Check for existing checkpoints (unless --no-resume is set)
-    checkpoint_path = None
-    if not args.no_resume:
-        checkpoints_dir = output_dir / "checkpoints"
-        if checkpoints_dir.exists():
-            # Find the most recent checkpoint (highest numbered directory)
-            checkpoint_dirs = sorted([d for d in checkpoints_dir.iterdir() if d.is_dir()],
-                                    key=lambda x: int(x.name) if x.name.isdigit() else -1)
-            if checkpoint_dirs:
-                latest_checkpoint = checkpoint_dirs[-1]
-                checkpoint_path = str(latest_checkpoint)
-                print(f"✓ Found existing checkpoint: {checkpoint_path}")
-                print(f"  Resuming training from step {latest_checkpoint.name}")
-                print()
-    elif args.no_resume:
-        print("ℹ  --no-resume flag set: Starting fresh training (ignoring existing checkpoints)")
-        print()
+    # Save wandb run ID for future resumption
+    output_dir.mkdir(parents=True, exist_ok=True)
+    wandb_run_id_file.write_text(run.id)
+    print(f"  Saved wandb run ID to: {wandb_run_id_file}")
+    print()
 
     maxtext_cmd = [
-        "python", "-m", "MaxText.train",
+        "python",
+        "-m",
+        "MaxText.train",
         args.config,
         f"run_name={run_name}",
         f"base_output_directory={output_dir}",  # Absolute path for Orbax
         f"hardware={args.hardware}",
         f"steps={args.steps}",
+        f"learning_rate_schedule_steps={config['learning_rate_schedule_steps']}",
         f"per_device_batch_size={args.batch_size}",
         f"enable_checkpointing={'true' if args.enable_checkpointing else 'false'}",
     ]
@@ -302,12 +366,13 @@ def main():
 
         # Track timing for ETA calculation
         from collections import deque
+
         step_times = deque(maxlen=50)  # Track last 50 step times for moving average
         checkpoint_period = 5000  # From config (TODO: parse from config if needed)
 
         # Stream output and parse for metrics
         for line in process.stdout:
-            print(line, end='')  # Print to console
+            print(line, end="")  # Print to console
 
             # Parse MaxText training metrics from stdout
             # Example: "completed step: 0, seconds: 9.020, TFLOP/s/device: 0.170, Tokens/s/device: 227.052, total_weights: 70, loss: 5.544"
@@ -339,7 +404,9 @@ def main():
 
                     # Parse TFLOP/s/device
                     if "TFLOP/s/device:" in line:
-                        tflops_str = line.split("TFLOP/s/device:")[1].split(",")[0].strip()
+                        tflops_str = (
+                            line.split("TFLOP/s/device:")[1].split(",")[0].strip()
+                        )
                         achieved_tflops = float(tflops_str)
                         metrics["train/tflops_per_device"] = achieved_tflops
 
@@ -350,12 +417,16 @@ def main():
 
                     # Parse Tokens/s/device
                     if "Tokens/s/device:" in line:
-                        tokens_str = line.split("Tokens/s/device:")[1].split(",")[0].strip()
+                        tokens_str = (
+                            line.split("Tokens/s/device:")[1].split(",")[0].strip()
+                        )
                         metrics["train/tokens_per_sec_per_device"] = float(tokens_str)
 
                     # Parse total_weights
                     if "total_weights:" in line:
-                        weights_str = line.split("total_weights:")[1].split(",")[0].strip()
+                        weights_str = (
+                            line.split("total_weights:")[1].split(",")[0].strip()
+                        )
                         metrics["train/total_weights"] = int(weights_str)
 
                     # Calculate and print ETA
@@ -365,7 +436,9 @@ def main():
                         eta_seconds = remaining_steps * avg_step_time
 
                         # Time to next checkpoint
-                        steps_to_checkpoint = checkpoint_period - (step % checkpoint_period)
+                        steps_to_checkpoint = checkpoint_period - (
+                            step % checkpoint_period
+                        )
                         checkpoint_eta_seconds = steps_to_checkpoint * avg_step_time
 
                         # Format ETAs
@@ -385,11 +458,15 @@ def main():
                         checkpoint_eta_str = format_time(checkpoint_eta_seconds)
 
                         # Print enhanced progress
-                        print(f"  → Step {step+1}/{args.steps} | ETA: {eta_str} | Next checkpoint: {checkpoint_eta_str}")
+                        print(
+                            f"  → Step {step+1}/{args.steps} | ETA: {eta_str} | Next checkpoint: {checkpoint_eta_str}"
+                        )
 
                         # Log ETAs to wandb
                         metrics["train/eta_seconds"] = eta_seconds
-                        metrics["train/eta_to_checkpoint_seconds"] = checkpoint_eta_seconds
+                        metrics["train/eta_to_checkpoint_seconds"] = (
+                            checkpoint_eta_seconds
+                        )
 
                     # Log to wandb
                     if metrics:
@@ -404,7 +481,9 @@ def main():
             if "eval metrics after step:" in line:
                 try:
                     # Extract step number
-                    step_str = line.split("eval metrics after step:")[1].split(",")[0].strip()
+                    step_str = (
+                        line.split("eval metrics after step:")[1].split(",")[0].strip()
+                    )
                     step = int(step_str)
 
                     eval_metrics = {}
@@ -416,13 +495,17 @@ def main():
 
                     # Parse total weights
                     if "total_weights=" in line:
-                        weights_str = line.split("total_weights=")[1].split(",")[0].strip()
+                        weights_str = (
+                            line.split("total_weights=")[1].split(",")[0].strip()
+                        )
                         eval_metrics["eval/total_weights"] = float(weights_str)
 
                     # Log to wandb
                     if eval_metrics:
                         wandb.log(eval_metrics, step=step)
-                        print(f"  → Logged eval metrics to wandb at step {step}: {eval_metrics}")
+                        print(
+                            f"  → Logged eval metrics to wandb at step {step}: {eval_metrics}"
+                        )
 
                 except Exception as e:
                     # Parsing failed, skip this line
@@ -442,15 +525,16 @@ def main():
         sys.exit(exit_code)
 
     except KeyboardInterrupt:
-        print("\n\n" + "="*80)
+        print("\n\n" + "=" * 80)
         print("⚠️  TRAINING INTERRUPTED BY USER (Ctrl+C)")
-        print("="*80)
+        print("=" * 80)
         print("Sending interrupt signal to MaxText training process...")
         print("Waiting for checkpoint save...")
 
         # Send SIGINT (not SIGTERM) so Python can catch it as KeyboardInterrupt
         # This allows MaxText's exception handler to save a checkpoint
         import signal
+
         process.send_signal(signal.SIGINT)
 
         # Wait for the process to exit (with timeout)
@@ -462,7 +546,7 @@ def main():
             process.kill()
             process.wait()
 
-        print("\n" + "="*80)
+        print("\n" + "=" * 80)
         wandb.log({"training_status": "interrupted"})
         wandb.finish()
         sys.exit(130)  # Standard exit code for SIGINT

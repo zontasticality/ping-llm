@@ -97,7 +97,9 @@ image = (
     # Stage 3b: Copy the rest of the code (fast layer that rebuilds on code changes)
     .add_local_dir(".", WORKDIR, ignore=IGNORE_PATTERNS, copy=True)
     # CACHE BUST: Force rebuild by running a unique command
-    .run_commands("echo 'Cache bust: 2025-12-20-09 - Reduce eval overhead (100 steps, 5 eval)'")
+    .run_commands(
+        "echo 'Cache bust: 2025-12-20-09 - Reduce eval overhead (100 steps, 5 eval)'"
+    )
 )
 
 app = modal.App(APP_NAME)
@@ -122,6 +124,10 @@ shared_vol = modal.Volume.from_name(VOLUME_NAME, create_if_missing=True)
         "PYTHONWARNINGS": "ignore",
         # Redirect stderr to suppress C++ warnings that bypass TF_CPP_MIN_LOG_LEVEL
         "TF_CPP_VMODULE": "",  # Disable verbose C++ logging
+        # JAX persistent compilation cache for faster startup (2-3x improvement)
+        "JAX_COMPILATION_CACHE_DIR": "/mnt/jax_cache",
+        "JAX_PERSISTENT_CACHE_MIN_ENTRY_SIZE_BYTES": "0",  # Cache everything
+        "JAX_PERSISTENT_CACHE_MIN_COMPILE_TIME_SECS": "0",  # Cache all compilations
     },
 )
 def run(
@@ -189,7 +195,7 @@ def run(
 
     # Stream output line by line to Modal logs
     for line in process.stdout:
-        print(line, end='', flush=True)
+        print(line, end="", flush=True)
 
     # Wait for the process to complete
     exit_code = process.wait()

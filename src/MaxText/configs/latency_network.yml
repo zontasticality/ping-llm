@@ -14,6 +14,10 @@ base_config: decoupled_base_test.yml
 run_name: latency_network_training
 base_output_directory: outputs/latency_network
 
+# JAX compilation cache for faster startup (2-3x improvement)
+# This is particularly important on Modal where containers restart frequently
+jax_cache_dir: '/mnt/jax_cache' # Use Modal volume for persistence
+
 # Model architecture - PLAN_2: ~95M param decoder-only transformer
 # Optimized for generalization (deep + narrow MLP ratio)
 vocab_size: 267 # 11 role tokens + 256 byte tokens (PLAN_2)
@@ -29,9 +33,9 @@ max_prefill_predict_length: 1024
 # Training - PLAN_2 hyperparameters
 steps: 5000
 per_device_batch_size: 128 # Increased from 32 to utilize A100 (70% GPU memory was idle)
-learning_rate: 3.0e-4 # Scaled up 2x for 4x larger batch (sqrt scaling rule)
+learning_rate: 1.0e-4 # Scaled up 2x for 4x larger batch (sqrt scaling rule)
 learning_rate_schedule: 'cosine'
-learning_rate_schedule_steps: 1000 # Decay over full training duration
+learning_rate_schedule_steps: 5000 # Decay over full training duration
 warmup_steps: 20
 alpha: 0.1 # Minimum LR = 10% of peak (1e-5) to prevent decay to zero
 adam_b1: 0.9
@@ -50,7 +54,7 @@ save_checkpoint_on_completion: true # Save final checkpoint when training comple
 # Logging & Monitoring
 log_period: 100 # Log metrics every 100 steps
 eval_interval: 100 # Evaluate every 100 steps (for grokking visualization)
-eval_steps: 5 # Run 5 eval steps (5% overhead: 50 evals * 5 steps / 5000 steps)
+eval_steps: 1 # Run 5 eval steps (5% overhead: 50 evals * 5 steps / 5000 steps)
 enable_tensorboard: true # Enable TensorBoard logging
 tensorboard_dir: '' # Auto-set to base_output_directory/tensorboard
 
@@ -66,7 +70,8 @@ tensorboard_dir: '' # Auto-set to base_output_directory/tensorboard
 #   - network_parquet: Legacy parquet shards (PLAN_2) - Not yet implemented
 #
 dataset_type: 'network'
-packing: False # Disable packing to avoid SequenceDescriptor incompatibility with cudnn_flash_te
+packing: True # EXPERIMENT: Enable packing to reduce padding waste (75-82% → <5%)
+max_segments_per_seq: 8 # Max sequences packed per batch (for cudnn_flash_te SequenceDescriptor)
 
 # Network data configuration
 network_data_format: 'probe_chunks'
@@ -87,7 +92,7 @@ grain_ram_budget_mb: 16384 # 16GB RAM budget for mp_prefetch auto-tuning
 # grain_visualization_dir: "/tmp/grain_viz"  # Generate pipeline visualization graph
 
 # Attention & Positional Encoding
-attention: 'cudnn_flash_te'
+attention: 'flash' # JAX Pallas FlashAttention (supports packing, ~10-20% slower than cudnn_flash_te)
 scan_layers: true
 position_embedding: 'rope' # RoPE for relative position encoding (PLAN_2)
 

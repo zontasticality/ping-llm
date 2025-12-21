@@ -29,7 +29,8 @@ import numpy as np
 
 import pathwaysutils  # pylint: disable=unused-import
 
-import tensorflow as tf
+# Note: TensorFlow removed - only needed for TFDS datasets (we use 'network' dataset type)
+# import tensorflow as tf
 
 import jax
 import jax.numpy as jnp
@@ -515,9 +516,7 @@ def initialize(argv: Sequence[str]) -> tuple[pyconfig.HyperParameters, Any, Any]
   """Initialization of hyperparameters and utilities"""
   pathwaysutils.initialize()
   jax.config.update("jax_default_prng_impl", "unsafe_rbg")
-  # TF allocates extraneous GPU memory when using TFDS data
-  # this leads to CUDA OOMs. WAR for now is to hide GPUs from TF
-  tf.config.set_visible_devices([], "GPU")
+  # Note: TensorFlow GPU hiding removed (TF not imported - we use 'network' dataset, not TFDS)
   # DEBUG: Log current TF_CPP_MIN_LOG_LEVEL before and after setdefault
   before = os.environ.get("TF_CPP_MIN_LOG_LEVEL", "not set")
   os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "0")  # Respect existing value if set

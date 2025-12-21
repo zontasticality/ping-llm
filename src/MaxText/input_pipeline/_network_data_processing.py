@@ -20,7 +20,8 @@ This backend provides specialized data loading for network latency measurement d
 """
 
 import ml_collections
-import jax
+# Note: JAX import moved to lazy import to avoid CUDA initialization in Grain workers
+# import jax
 import grain.python as grain
 
 from MaxText import max_logging
@@ -90,6 +91,9 @@ def make_network_train_iterator(
         "network_data_format not specified in config. "
         "Must be 'probe_chunks' or 'network_parquet'"
     )
+
+  # Lazy import JAX to avoid CUDA initialization in Grain worker processes
+  import jax
 
   data_format = config.network_data_format
   batch_size = config.global_batch_size_to_load // jax.process_count()
@@ -200,6 +204,9 @@ def make_network_eval_iterator(
         "network_data_format not specified in config. "
         "Must be 'probe_chunks' or 'network_parquet'"
     )
+
+  # Lazy import JAX to avoid CUDA initialization in Grain worker processes
+  import jax
 
   data_format = config.network_data_format
   batch_size = config.global_batch_size_to_load_eval // jax.process_count()

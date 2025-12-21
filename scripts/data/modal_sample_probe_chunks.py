@@ -107,7 +107,7 @@ shared_vol = Volume.from_name(VOLUME_NAME, create_if_missing=True)
         # This prevents multiprocessing fork issues with CUDA contexts
         "JAX_PLATFORMS": "cpu",
         "XLA_PYTHON_CLIENT_PREALLOCATE": "false",
-    }
+    },
 )
 def sample_rows(
     data_dir: str = "/mnt/data/probe_rows",
@@ -166,6 +166,7 @@ def sample_rows(
 
         # Sample random rows
         import random
+
         rng = random.Random(seed)
         n = len(source)
 
@@ -216,9 +217,13 @@ def sample_rows(
         if measure_throughput and n > 0:
             if num_workers > 0:
                 # Use Grain pipeline with multiprocessing for realistic throughput test
-                from src.MaxText.input_pipeline.probe_chunk_pipeline import build_probe_chunk_dataset
+                from src.MaxText.input_pipeline.probe_chunk_pipeline import (
+                    build_probe_chunk_dataset,
+                )
 
-                print(f"\n  === Throughput Test ({throughput_batches} batches, crop_size={crop_size}, workers={num_workers}) ===")
+                print(
+                    f"\n  === Throughput Test ({throughput_batches} batches, crop_size={crop_size}, workers={num_workers}) ==="
+                )
                 print(f"    Using Grain multiprocessing pipeline (matches training)")
 
                 batch_size = 32
@@ -256,8 +261,12 @@ def sample_rows(
                 print(f"    Throughput: {tokens_per_sec / 1_000_000:.2f}M tokens/sec")
             else:
                 # Single-threaded fallback
-                print(f"\n  === Throughput Test ({throughput_batches} batches, crop_size={crop_size}, single-threaded) ===")
-                print(f"    WARNING: Running single-threaded. Use --num-workers for parallel test.")
+                print(
+                    f"\n  === Throughput Test ({throughput_batches} batches, crop_size={crop_size}, single-threaded) ==="
+                )
+                print(
+                    f"    WARNING: Running single-threaded. Use --num-workers for parallel test."
+                )
 
                 start_time = time.time()
                 total_tokens = 0

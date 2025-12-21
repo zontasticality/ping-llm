@@ -27,9 +27,12 @@ Requires: root/sudo for raw ICMP pings (or uses socket-based ping as fallback)
 import os
 from pathlib import Path
 
+
 # Conditionally force CPU usage (only for local runs, not Modal).
 def _in_modal_runtime():
-    return bool(os.environ.get("MODAL_IS_REMOTE")) or (Path("/workspace") / "src").exists()
+    return (
+        bool(os.environ.get("MODAL_IS_REMOTE")) or (Path("/workspace") / "src").exists()
+    )
 
 
 IN_MODAL_RUNTIME = _in_modal_runtime()
@@ -62,9 +65,12 @@ import numpy as np
 from scipy.stats import entropy
 
 from src.MaxText.input_pipeline.network_tokenization import (
-    encode_ip_merged, encode_timestamp_delta,
-    MEASUREMENT_START, RTT_START,
-    token_to_byte, decode_rtt_exponent_mantissa,
+    encode_ip_merged,
+    encode_timestamp_delta,
+    MEASUREMENT_START,
+    RTT_START,
+    token_to_byte,
+    decode_rtt_exponent_mantissa,
 )
 
 # ============================================================================
@@ -72,6 +78,7 @@ from src.MaxText.input_pipeline.network_tokenization import (
 # ============================================================================
 try:
     import modal
+
     MODAL_AVAILABLE = True
 except ImportError:
     MODAL_AVAILABLE = False
@@ -82,10 +89,23 @@ if MODAL_AVAILABLE:
     VOLUME_NAME = os.environ.get("MODAL_VOLUME", "ping-llm")
 
     IGNORE_PATTERNS = [
-        ".git", ".venv", "__pycache__", ".mypy_cache", ".pytest_cache",
-        "outputs", "logs", "data", "local_datasets", "archive",
-        "tests", "docs", "benchmarks", "end_to_end",
-        "*.parquet", "*.arrayrecord", ".DS_Store",
+        ".git",
+        ".venv",
+        "__pycache__",
+        ".mypy_cache",
+        ".pytest_cache",
+        "outputs",
+        "logs",
+        "data",
+        "local_datasets",
+        "archive",
+        "tests",
+        "docs",
+        "benchmarks",
+        "end_to_end",
+        "*.parquet",
+        "*.arrayrecord",
+        ".DS_Store",
     ]
 
     # Build image in stages to optimize caching.
@@ -95,15 +115,23 @@ if MODAL_AVAILABLE:
             add_python="3.12",
         )
         .entrypoint([])
-        .apt_install("git", "build-essential", "cmake", "ninja-build", "iputils-ping")  # Add ping
+        .apt_install(
+            "git", "build-essential", "cmake", "ninja-build", "iputils-ping"
+        )  # Add ping
         .pip_install("uv")
         # Stage 1: Dependency files
         .add_local_file("pyproject.toml", f"{WORKDIR}/pyproject.toml", copy=True)
         .add_local_file("README.md", f"{WORKDIR}/README.md", copy=True)
         .add_local_file("build_hooks.py", f"{WORKDIR}/build_hooks.py", copy=True)
         .add_local_dir("dependencies", f"{WORKDIR}/dependencies", copy=True)
-        .add_local_file("src/MaxText/__init__.py", f"{WORKDIR}/src/MaxText/__init__.py", copy=True)
-        .add_local_dir("src/install_maxtext_extra_deps", f"{WORKDIR}/src/install_maxtext_extra_deps", copy=True)
+        .add_local_file(
+            "src/MaxText/__init__.py", f"{WORKDIR}/src/MaxText/__init__.py", copy=True
+        )
+        .add_local_dir(
+            "src/install_maxtext_extra_deps",
+            f"{WORKDIR}/src/install_maxtext_extra_deps",
+            copy=True,
+        )
         # Stage 2: Install dependencies
         .run_commands(
             f"cd {WORKDIR} && CC=gcc CXX=g++ uv pip install --system -e '.[cuda12]' --resolution=lowest",
@@ -118,8 +146,12 @@ if MODAL_AVAILABLE:
     app = modal.App(APP_NAME)
     shared_vol = modal.Volume.from_name(VOLUME_NAME, create_if_missing=True)
 
-PARAM_ONLY_CHECKPOINT_MODAL = "/mnt/outputs/latency_network/param_only_checkpoint/checkpoints/0/items"
-PARAM_ONLY_CHECKPOINT_LOCAL = "outputs/latency_network/param_only_checkpoint/checkpoints/0/items"
+PARAM_ONLY_CHECKPOINT_MODAL = (
+    "/mnt/outputs/latency_network/param_only_checkpoint/checkpoints/0/items"
+)
+PARAM_ONLY_CHECKPOINT_LOCAL = (
+    "outputs/latency_network/param_only_checkpoint/checkpoints/0/items"
+)
 DEFAULT_CHECKPOINT = (
     PARAM_ONLY_CHECKPOINT_MODAL if IN_MODAL_RUNTIME else PARAM_ONLY_CHECKPOINT_LOCAL
 )
@@ -142,7 +174,7 @@ def build_config(
     # and argv[2:] to be key=value overrides
     argv = [
         "eval_script",  # argv[0] - program name (ignored)
-        config_path,    # argv[1] - config file path
+        config_path,  # argv[1] - config file path
         f"load_parameters_path={checkpoint_path}",
         f"hardware={'gpu' if use_gpu else 'cpu'}",
         "skip_jax_distributed_system=true",
@@ -184,20 +216,24 @@ def ping_host(ip, timeout=2):
     try:
         # Use system ping (works without root)
         result = subprocess.run(
-            ['ping', '-c', '1', '-W', str(timeout), ip],
+            ["ping", "-c", "1", "-W", str(timeout), ip],
             capture_output=True,
             text=True,
-            timeout=timeout + 1
+            timeout=timeout + 1,
         )
 
         # Parse RTT from output
         # Format: "time=X.XXX ms" or "time=X ms"
-        match = re.search(r'time[=\s]+(\d+\.?\d*)\s*ms', result.stdout)
+        match = re.search(r"time[=\s]+(\d+\.?\d*)\s*ms", result.stdout)
         if match:
             return float(match.group(1))
         else:
             return -1.0  # Failed ping
-    except (subprocess.TimeoutExpired, subprocess.CalledProcessError, FileNotFoundError):
+    except (
+        subprocess.TimeoutExpired,
+        subprocess.CalledProcessError,
+        FileNotFoundError,
+    ):
         return -1.0
 
 
@@ -290,7 +326,15 @@ def extract_token(result_tokens, slot):
     return int(np.asarray(result_tokens.data)[slot, token_idx])
 
 
-def sample_rtt_from_model(engine, params, config, conditioning_tokens, num_samples=100, temperature=1.0, rng=None):
+def sample_rtt_from_model(
+    engine,
+    params,
+    config,
+    conditioning_tokens,
+    num_samples=100,
+    temperature=1.0,
+    rng=None,
+):
     """
     Sample RTT values from the model's conditional distribution.
 
@@ -310,7 +354,9 @@ def sample_rtt_from_model(engine, params, config, conditioning_tokens, num_sampl
         rng = jax.random.PRNGKey(int(time.time() * 1000) % 2**31)
 
     max_slots = engine.max_concurrent_decodes
-    padded_tokens, true_length = pad_tokens(conditioning_tokens, config.max_prefill_predict_length)
+    padded_tokens, true_length = pad_tokens(
+        conditioning_tokens, config.max_prefill_predict_length
+    )
     padded_tokens = jnp.array(padded_tokens)
 
     for start in range(0, num_samples, max_slots):
@@ -329,7 +375,9 @@ def sample_rtt_from_model(engine, params, config, conditioning_tokens, num_sampl
                 slot=slot,
                 temperature=temperature,
             )
-            decode_state = engine.insert(prefix=prefix, decode_state=decode_state, slot=slot)
+            decode_state = engine.insert(
+                prefix=prefix, decode_state=decode_state, slot=slot
+            )
             first_tokens.append(extract_token(first, 0))
 
         rng, rng_gen = jax.random.split(rng)
@@ -339,7 +387,9 @@ def sample_rtt_from_model(engine, params, config, conditioning_tokens, num_sampl
             rng=rng_gen,
             temperature=temperature,
         )
-        second_tokens = np.asarray(result_tokens.data)[:batch_size, result_tokens.tokens_idx[0]]
+        second_tokens = np.asarray(result_tokens.data)[
+            :batch_size, result_tokens.tokens_idx[0]
+        ]
 
         for slot in range(batch_size):
             byte1_token = int(first_tokens[slot])
@@ -410,20 +460,37 @@ def kl_divergence(p, q, epsilon=1e-10):
 def main():
     from src.MaxText import max_utils
 
-    parser = argparse.ArgumentParser(description="Live ping evaluation with KL divergence")
-    parser.add_argument("--checkpoint",
-                       default=DEFAULT_CHECKPOINT,
-                       help="Path to param-only checkpoint items directory")
-    parser.add_argument("--config", default="src/MaxText/configs/latency_network.yml",
-                       help="Config file path")
-    parser.add_argument("--num-ips", type=int, default=10,
-                       help="Number of random IPs to test (default 10 for speed)")
-    parser.add_argument("--pings-per-ip", type=int, default=20,
-                       help="Number of pings per IP (default 20 for speed)")
-    parser.add_argument("--model-samples", type=int, default=100,
-                       help="Number of model samples per IP")
-    parser.add_argument("--temperature", type=float, default=1.0,
-                       help="Sampling temperature")
+    parser = argparse.ArgumentParser(
+        description="Live ping evaluation with KL divergence"
+    )
+    parser.add_argument(
+        "--checkpoint",
+        default=DEFAULT_CHECKPOINT,
+        help="Path to param-only checkpoint items directory",
+    )
+    parser.add_argument(
+        "--config",
+        default="src/MaxText/configs/latency_network.yml",
+        help="Config file path",
+    )
+    parser.add_argument(
+        "--num-ips",
+        type=int,
+        default=10,
+        help="Number of random IPs to test (default 10 for speed)",
+    )
+    parser.add_argument(
+        "--pings-per-ip",
+        type=int,
+        default=20,
+        help="Number of pings per IP (default 20 for speed)",
+    )
+    parser.add_argument(
+        "--model-samples", type=int, default=100, help="Number of model samples per IP"
+    )
+    parser.add_argument(
+        "--temperature", type=float, default=1.0, help="Sampling temperature"
+    )
     parser.add_argument("--seed", type=int, default=42, help="Random seed")
     args = parser.parse_args()
 
@@ -437,8 +504,12 @@ def main():
 
     # Compute prompt lengths for config overrides
     sample_dst = dst_ips[0] if dst_ips else "1.1.1.1"
-    tokens_no_ts = create_conditioning_tokens(src_ip, sample_dst, include_timestamp=False)
-    tokens_with_ts = create_conditioning_tokens(src_ip, sample_dst, include_timestamp=True)
+    tokens_no_ts = create_conditioning_tokens(
+        src_ip, sample_dst, include_timestamp=False
+    )
+    tokens_with_ts = create_conditioning_tokens(
+        src_ip, sample_dst, include_timestamp=True
+    )
     max_prefill_len = max(len(tokens_no_ts), len(tokens_with_ts))
     max_target_len = max_prefill_len + 2
 
@@ -459,9 +530,9 @@ def main():
         results_no_ts = []
         results_with_ts = []
 
-        print("\n" + "="*80)
+        print("\n" + "=" * 80)
         print("Starting live ping evaluation...")
-        print("="*80)
+        print("=" * 80)
 
         for idx, dst_ip in enumerate(dst_ips):
             print(f"\n[{idx+1}/{args.num_ips}] Testing {dst_ip}...")
@@ -485,20 +556,32 @@ def main():
 
             # Test without timestamp
             print("  Sampling model (no timestamp)...")
-            cond_tokens_no_ts = create_conditioning_tokens(src_ip, dst_ip, include_timestamp=False)
+            cond_tokens_no_ts = create_conditioning_tokens(
+                src_ip, dst_ip, include_timestamp=False
+            )
             model_rtts_no_ts = sample_rtt_from_model(
-                engine, params, config, cond_tokens_no_ts,
-                num_samples=args.model_samples, temperature=args.temperature
+                engine,
+                params,
+                config,
+                cond_tokens_no_ts,
+                num_samples=args.model_samples,
+                temperature=args.temperature,
             )
             model_dist_no_ts = discretize_rtt(model_rtts_no_ts)
             kl_no_ts = kl_divergence(real_dist, model_dist_no_ts)
 
             # Test with timestamp
             print("  Sampling model (with timestamp)...")
-            cond_tokens_with_ts = create_conditioning_tokens(src_ip, dst_ip, include_timestamp=True)
+            cond_tokens_with_ts = create_conditioning_tokens(
+                src_ip, dst_ip, include_timestamp=True
+            )
             model_rtts_with_ts = sample_rtt_from_model(
-                engine, params, config, cond_tokens_with_ts,
-                num_samples=args.model_samples, temperature=args.temperature
+                engine,
+                params,
+                config,
+                cond_tokens_with_ts,
+                num_samples=args.model_samples,
+                temperature=args.temperature,
             )
             model_dist_with_ts = discretize_rtt(model_rtts_with_ts)
             kl_with_ts = kl_divergence(real_dist, model_dist_with_ts)
@@ -506,28 +589,38 @@ def main():
             print(f"  KL divergence (no timestamp):   {kl_no_ts:.4f}")
             print(f"  KL divergence (with timestamp):  {kl_with_ts:.4f}")
 
-            results_no_ts.append({
-                'dst_ip': dst_ip,
-                'kl': kl_no_ts,
-                'real_mean': np.mean([r for r in real_rtts if r >= 0]),
-                'model_mean': np.mean(model_rtts_no_ts) if model_rtts_no_ts else float('nan'),
-            })
+            results_no_ts.append(
+                {
+                    "dst_ip": dst_ip,
+                    "kl": kl_no_ts,
+                    "real_mean": np.mean([r for r in real_rtts if r >= 0]),
+                    "model_mean": (
+                        np.mean(model_rtts_no_ts) if model_rtts_no_ts else float("nan")
+                    ),
+                }
+            )
 
-            results_with_ts.append({
-                'dst_ip': dst_ip,
-                'kl': kl_with_ts,
-                'real_mean': np.mean([r for r in real_rtts if r >= 0]),
-                'model_mean': np.mean(model_rtts_with_ts) if model_rtts_with_ts else float('nan'),
-            })
+            results_with_ts.append(
+                {
+                    "dst_ip": dst_ip,
+                    "kl": kl_with_ts,
+                    "real_mean": np.mean([r for r in real_rtts if r >= 0]),
+                    "model_mean": (
+                        np.mean(model_rtts_with_ts)
+                        if model_rtts_with_ts
+                        else float("nan")
+                    ),
+                }
+            )
 
     # Summary statistics
-    print("\n" + "="*80)
+    print("\n" + "=" * 80)
     print("SUMMARY RESULTS")
-    print("="*80)
+    print("=" * 80)
 
     if results_no_ts:
-        kl_no_ts_vals = [r['kl'] for r in results_no_ts if not np.isnan(r['kl'])]
-        kl_with_ts_vals = [r['kl'] for r in results_with_ts if not np.isnan(r['kl'])]
+        kl_no_ts_vals = [r["kl"] for r in results_no_ts if not np.isnan(r["kl"])]
+        kl_with_ts_vals = [r["kl"] for r in results_with_ts if not np.isnan(r["kl"])]
 
         print(f"\nKL Divergence (lower is better):")
         print(f"  WITHOUT timestamp:")
@@ -548,14 +641,14 @@ def main():
         else:
             print(f"\n✓ Model performs better WITH timestamp (lower KL)")
 
-    print("\n" + "="*80)
+    print("\n" + "=" * 80)
     print("INTERPRETATION:")
     print("  - KL divergence measures how different the model's predicted distribution")
     print("    is from the real measured distribution")
     print("  - Lower KL = better match between model and reality")
     print("  - Compare 'with timestamp' vs 'without timestamp' to see if temporal")
     print("    information helps the model predict latencies")
-    print("="*80)
+    print("=" * 80)
 
 
 if __name__ == "__main__":
@@ -566,6 +659,7 @@ if __name__ == "__main__":
 # Modal GPU Function
 # ============================================================================
 if MODAL_AVAILABLE:
+
     @app.function(
         image=image,
         gpu="A100",  # Use A100 for fast inference
@@ -607,7 +701,9 @@ if MODAL_AVAILABLE:
 
         # Link outputs from volume
         if not os.path.exists(f"{WORKDIR}/outputs/latency_network"):
-            os.symlink("/mnt/outputs/latency_network", f"{WORKDIR}/outputs/latency_network")
+            os.symlink(
+                "/mnt/outputs/latency_network", f"{WORKDIR}/outputs/latency_network"
+            )
 
         # Resolve checkpoint path
         if not checkpoint_path.startswith("/"):
@@ -617,13 +713,20 @@ if MODAL_AVAILABLE:
         # Prepare argv for main()
         sys.argv = [
             "eval_live_ping.py",
-            "--checkpoint", checkpoint_path,
-            "--config", config_path,
-            "--num-ips", str(num_ips),
-            "--pings-per-ip", str(pings_per_ip),
-            "--model-samples", str(model_samples),
-            "--temperature", str(temperature),
-            "--seed", str(seed),
+            "--checkpoint",
+            checkpoint_path,
+            "--config",
+            config_path,
+            "--num-ips",
+            str(num_ips),
+            "--pings-per-ip",
+            str(pings_per_ip),
+            "--model-samples",
+            str(model_samples),
+            "--temperature",
+            str(temperature),
+            "--seed",
+            str(seed),
         ]
 
         # Set environment to indicate GPU usage

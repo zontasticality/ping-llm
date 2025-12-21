@@ -458,30 +458,35 @@ class ProbeRowSampler(grain.experimental.FlatMapTransform):
         """Pad to crop_size and format for MaxText."""
         tokens = np.array(tokens, dtype=np.int32)
 
+        # IMPORTANT: Pad to crop_size + 1 BEFORE shift to ensure final length is crop_size
+        # This is required for FlashAttention which needs seq_len % 128 == 0
+        # After shift: inputs/targets will be exactly crop_size (e.g., 1024)
+        target_length = self.crop_size + 1
+
         # Truncate if too long
-        if len(tokens) > self.crop_size:
-            tokens = tokens[:self.crop_size]
+        if len(tokens) > target_length:
+            tokens = tokens[:target_length]
 
         original_length = len(tokens)
 
         # Pad if too short
-        if len(tokens) < self.crop_size:
+        if len(tokens) < target_length:
             padding = np.zeros(
-                self.crop_size - len(tokens), dtype=np.int32
+                target_length - len(tokens), dtype=np.int32
             )
             tokens = np.concatenate([tokens, padding])
 
-        # Segmentation mask
-        segmentation = np.ones(self.crop_size, dtype=np.int32)
+        # Segmentation mask (for crop_size + 1)
+        segmentation = np.ones(target_length, dtype=np.int32)
         segmentation[original_length:] = 0
 
-        # Position IDs
-        positions = np.arange(self.crop_size, dtype=np.int32)
+        # Position IDs (for crop_size + 1)
+        positions = np.arange(target_length, dtype=np.int32)
 
         # CRITICAL: Shift targets by 1 for autoregressive training
         # The model should predict token[i+1] given tokens[0:i+1]
-        # inputs: [0, 1, 2, ..., n-2] - exclude last token
-        # targets: [1, 2, 3, ..., n-1] - exclude first token, shifted left
+        # inputs: [0, 1, 2, ..., n-2] - exclude last token (now crop_size elements)
+        # targets: [1, 2, 3, ..., n-1] - exclude first token, shifted left (now crop_size elements)
         inputs = tokens[:-1]
         targets = tokens[1:]
 

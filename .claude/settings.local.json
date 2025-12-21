@@ -64,7 +64,8 @@
       "Bash(mv:*)",
       "Bash(mkdir:*)",
       "Bash(tree:*)",
-      "Bash(modal run:*)"
+      "Bash(modal run:*)",
+      "Bash(modal volume get:*)"
     ]
   },
   "sandbox": {
