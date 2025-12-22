@@ -247,6 +247,6 @@ One-shot helper (Modal → local → plot):
 
 After running these evaluations, you can:
 1. Compare different checkpoint steps to see training progress
-2. Swap the ping targets with `--regular-ips` and `--anchor-ips`
+2. Swap the ping targets with `--regular-domains` and `--anchor-ips`
 3. Analyze which field orderings work best for your use case
 4. Export results for visualization (scripts print to stdout, pipe to file)

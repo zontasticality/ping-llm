@@ -146,6 +146,9 @@ def compute_rtt_range(real_vals, model_vals, max_rtt):
     if range_max <= range_min:
         range_min = max(0.0, range_max - 1.0)
         range_max = range_min + 1.0
+    range_min = max(0.1, range_min)
+    if range_max <= range_min:
+        range_max = range_min + 1.0
     return float(range_min), float(range_max)
 
 
@@ -157,20 +160,44 @@ def compute_rtt_median(values):
 
 
 def discretize_rtt_with_timeout(
-    rtt_values, timeout_count, bins=50, range_min=0.0, range_max=1000.0
+    rtt_values,
+    timeout_count,
+    bins=50,
+    range_min=0.0,
+    range_max=1000.0,
+    bin_edges=None,
 ):
+    if bin_edges is None:
+        bin_edges = np.linspace(range_min, range_max, bins + 1)
     valid_rtts = [r for r in rtt_values if r >= 0]
     if valid_rtts:
-        clipped = np.clip(valid_rtts, range_min, range_max)
+        clipped = np.clip(valid_rtts, bin_edges[0], bin_edges[-1])
     else:
         clipped = []
-    hist, edges = np.histogram(clipped, bins=bins, range=(range_min, range_max))
+    hist, edges = np.histogram(clipped, bins=bin_edges)
     total = len(valid_rtts) + timeout_count
-    prob = np.zeros(bins + 1)
+    prob = np.zeros(len(bin_edges))
     if total > 0:
-        prob[:bins] = hist / total
+        prob[: len(hist)] = hist / total
         prob[-1] = timeout_count / total
     return prob, edges
+
+
+def smooth_hist(prob, kernel=None):
+    if prob.size <= 1:
+        return prob
+    body = prob[:-1]
+    if body.sum() <= 0:
+        return prob
+    if kernel is None:
+        kernel = np.array([0.1, 0.2, 0.4, 0.2, 0.1], dtype=np.float32)
+    smoothed = np.convolve(body, kernel, mode="same")
+    if smoothed.sum() > 0:
+        smoothed = smoothed * (body.sum() / smoothed.sum())
+    out = np.zeros_like(prob)
+    out[:-1] = smoothed
+    out[-1] = prob[-1]
+    return out
 
 
 def kl_divergence(p, q, epsilon=1e-10):
@@ -210,11 +237,15 @@ def plot_ping_grid(
         model_rtts = result.get("model_rtts", [])
         range_min = result.get("range_min", 0.0)
         range_max = result.get("range_max", range_min + 1.0)
-        bin_edges = np.linspace(range_min, range_max, bins + 1)
-        bin_width = bin_edges[1] - bin_edges[0] if len(bin_edges) > 1 else 1.0
-        centers = (bin_edges[:-1] + bin_edges[1:]) / 2.0
-        timeout_center = range_max + bin_width / 2.0
+        range_min = max(0.1, range_min)
+        range_max = max(range_max, range_min * 1.1)
+        bin_edges = np.geomspace(range_min, range_max, bins + 1)
+        bin_widths = bin_edges[1:] - bin_edges[:-1]
+        centers = np.sqrt(bin_edges[:-1] * bin_edges[1:])
+        timeout_center = range_max * 2.5
+        timeout_width = range_max * 0.4
         centers = np.concatenate([centers, [timeout_center]])
+        widths = np.concatenate([bin_widths, [timeout_width]])
 
         real_timeout = sum(1 for v in real_rtts if v < 0)
         model_timeout = result.get("model_timeout_count", 0)
@@ -227,6 +258,7 @@ def plot_ping_grid(
             bins=bins,
             range_min=range_min,
             range_max=range_max,
+            bin_edges=bin_edges,
         )
         model_prob, _ = discretize_rtt_with_timeout(
             model_rtts,
@@ -234,45 +266,108 @@ def plot_ping_grid(
             bins=bins,
             range_min=range_min,
             range_max=range_max,
+            bin_edges=bin_edges,
         )
+        real_plot = smooth_hist(real_prob)
+        model_plot = smooth_hist(model_prob)
 
         show_legend = idx == 0
         ax.bar(
             centers,
-            real_prob,
-            width=bin_width * 0.9,
+            real_plot,
+            width=widths * 0.9,
             alpha=0.6,
             label="real" if show_legend else None,
             color="#4C78A8",
         )
         ax.bar(
             centers,
-            model_prob,
-            width=bin_width * 0.9,
+            model_plot,
+            width=widths * 0.9,
             alpha=0.6,
             label="model" if show_legend else None,
             color="#F58518",
         )
 
         real_median = compute_rtt_median(real_rtts)
-        if real_median is not None:
-            ax.axvline(real_median, color="black", linestyle="-", linewidth=1.2)
+        if real_median is not None and real_median > 0:
+            ax.axvline(
+                real_median,
+                color="black",
+                linestyle="-",
+                linewidth=1.2,
+                zorder=4,
+            )
         model_median = compute_rtt_median(model_rtts)
-        if model_median is not None:
-            ax.axvline(model_median, color="black", linestyle="--", linewidth=1.2)
+        if model_median is not None and model_median > 0:
+            ax.axvline(
+                model_median,
+                color="black",
+                linestyle="--",
+                linewidth=1.2,
+                zorder=4,
+            )
 
         ax.set_title(f"{result['label']} | KL={result['kl']:.3f}")
-        ax.set_xlim(range_min, range_max + bin_width)
+        ax.set_xlim(range_min, timeout_center + timeout_width)
+        ax.set_xscale("log")
+        tick_vals = list(np.geomspace(range_min, range_max, num=5))
+        tick_vals.append(timeout_center)
+
+        def format_tick(val, precision):
+            if val >= 100:
+                fmt = f"{{val:.{precision}f}}" if precision else "{val:.0f}"
+            elif val >= 10:
+                fmt = f"{{val:.{precision}f}}" if precision else "{val:.0f}"
+            elif val >= 1:
+                fmt = f"{{val:.{max(1, precision)}f}}"
+            else:
+                fmt = f"{{val:.{max(2, precision)}f}}"
+            return fmt.format(val=val)
+
+        def build_labels(precision):
+            return [format_tick(val, precision) for val in tick_vals[:-1]]
+
+        tick_labels = build_labels(0)
+        if len(set(tick_labels)) < len(tick_labels):
+            tick_labels = build_labels(1)
+        if len(set(tick_labels)) < len(tick_labels):
+            tick_labels = build_labels(2)
+        tick_labels.append("Timeout")
+        ax.set_xticks(tick_vals)
+        ax.set_xticklabels(tick_labels, rotation=25, ha="right")
+        ax.tick_params(axis="x", which="both", length=3, width=0.8, labelsize=7)
         if row_idx == last_row:
             ax.set_xlabel("RTT (ms)")
-        ax.set_xticks([range_min, range_max, timeout_center])
-        ax.set_xticklabels([f"{range_min:.0f}", f"{range_max:.0f}", "Timeout"])
-        ax.tick_params(axis="x", labelsize=7)
         if col_idx == 0:
             ax.set_ylabel("probability mass")
-        else:
+        ax.tick_params(axis="y", which="both", length=3, width=0.8, labelsize=7)
+        if col_idx != 0:
             ax.tick_params(axis="y", labelleft=False)
-        ax.tick_params(axis="y", labelsize=7)
+        if real_median is not None and real_median > 0:
+            ax.text(
+                real_median,
+                0.95,
+                f"R {real_median:.1f}",
+                transform=ax.get_xaxis_transform(),
+                fontsize=6,
+                rotation=90,
+                ha="center",
+                va="top",
+                bbox=dict(facecolor="white", alpha=0.6, edgecolor="none", pad=1.5),
+            )
+        if model_median is not None and model_median > 0:
+            ax.text(
+                model_median,
+                0.8,
+                f"M {model_median:.1f}",
+                transform=ax.get_xaxis_transform(),
+                fontsize=6,
+                rotation=90,
+                ha="center",
+                va="top",
+                bbox=dict(facecolor="white", alpha=0.6, edgecolor="none", pad=1.5),
+            )
 
     for idx in range(len(results), grid_rows * grid_cols):
         row_idx = idx // grid_cols
@@ -281,8 +376,12 @@ def plot_ping_grid(
 
     legend_handles, legend_labels = axes[0][0].get_legend_handles_labels()
     median_handles = [
-        Line2D([0], [0], color="black", linestyle="-", linewidth=1.2, label="real median"),
-        Line2D([0], [0], color="black", linestyle="--", linewidth=1.2, label="model median"),
+        Line2D(
+            [0], [0], color="black", linestyle="-", linewidth=1.2, label="real median"
+        ),
+        Line2D(
+            [0], [0], color="black", linestyle="--", linewidth=1.2, label="model median"
+        ),
     ]
     if legend_handles:
         fig.legend(
@@ -315,7 +414,7 @@ def plot_timestamps(metrics, output_dir, hist_bins_override=None):
 
     full_logps = np.array(data.get("full_logps", []), dtype=np.float32)
     none_logps = np.array(data.get("none_logps", []), dtype=np.float32)
-    hist_bins = hist_bins_override or metrics.get("params", {}).get("hist_bins", 60)
+    hist_bins = hist_bins_override or metrics.get("params", {}).get("hist_bins", 500)
 
     all_logps = (
         np.concatenate([full_logps, none_logps])
@@ -437,12 +536,14 @@ def plot_ping(
         model_total = len(model_rtts) + model_timeout_count + model_invalid_count
         model_timeout = model_timeout_count / model_total if model_total else 0.0
 
+        bin_edges = np.geomspace(range_min, range_max, ping_bins + 1)
         real_dist, _ = discretize_rtt_with_timeout(
             real_rtts,
             real_timeout_count,
             bins=ping_bins,
             range_min=range_min,
             range_max=range_max,
+            bin_edges=bin_edges,
         )
         model_dist, _ = discretize_rtt_with_timeout(
             model_rtts,
@@ -450,6 +551,7 @@ def plot_ping(
             bins=ping_bins,
             range_min=range_min,
             range_max=range_max,
+            bin_edges=bin_edges,
         )
         kl_value = kl_divergence(real_dist, model_dist)
 
@@ -473,9 +575,7 @@ def plot_ping(
 
     avg_kl = float(np.mean([r["kl"] for r in results])) if results else float("nan")
     per_page = grid_rows * grid_cols
-    pages = [
-        results[i : i + per_page] for i in range(0, len(results), per_page)
-    ]
+    pages = [results[i : i + per_page] for i in range(0, len(results), per_page)]
     output_paths = []
     for idx, chunk in enumerate(pages):
         suffix = f"_{idx + 1:02d}" if len(pages) > 1 else ""
@@ -597,7 +697,9 @@ def main():
     selected = parse_only_arg(args.only)
 
     if "timestamps" in selected:
-        timestamp_path = args.timestamp_metrics or metrics_dir / "timestamp_metrics.json"
+        timestamp_path = (
+            args.timestamp_metrics or metrics_dir / "timestamp_metrics.json"
+        )
         if Path(timestamp_path).exists():
             timestamp_metrics = load_json(timestamp_path)
             plot_timestamps(timestamp_metrics, output_dir, args.hist_bins)

@@ -212,34 +212,37 @@ Training uses the AdamW optimizer with a cosine learning rate schedule and a bri
 
 The primary metric during training is token-level cross-entropy on held-out measurements, with downstream evaluation focusing on latency prediction accuracy and generalization to unseen IP pairs and network conditions.
 
-==== Note: Training is still in progress.
-#image("training_wip.png")
-
-Current status and remaining work:
-- Tokenization and the probe-centric data pipeline are stabilized.
-- Throughput optimization focuses on padding efficiency and data loading.
-- Evaluation of downstream tasks and robustness is ongoing.
+#figure(
+ image("wandb_training.png"),
+ caption: [Multiple rounds of training, continuing from previous model checkpoints]
+)
 
 == Evaluation & Metrics
 
-Evaluation is ongoing; the goal is to measure both next-token fit and downstream utility. The model is ultimately evaluated on how well it captures the joint distribution of `(src_ip, dst_ip, rtt, timestamp)` and how useful its predictions are for practical tasks.
+Evaluation focuses on three concrete checks that tie token likelihood to downstream utility. Each one probes a different capability and is cheap to re-run as the model changes.
 
-Core metrics and protocols:
+*Timestamp vs no-timestamp RTT likelihood:* compare the log-probability of the correct RTT tokens with and without timestamp context. This is meaningful because it isolates whether temporal information actually sharpens the RTT distribution without changing the IP conditioning.
 
-- Token-level cross-entropy and perplexity on a held-out split drawn from the same time range as training.
-- Forward latency prediction (given `src_ip`, `dst_ip`, and optionally a timestamp): mean absolute error (MAE), mean squared error (MSE), and calibration curves (`P(rtt < X)` vs empirical frequency), reported by IPv4 vs IPv6, geographic/ASN distance, and time-of-day.
-- Failure prediction: accuracy and calibration for the `<Failed>` token compared to successful probes.
-- *Inverse search (RTT -> IP):* given a target RTT and context, sample candidate destination IPs and evaluate plausibility and diversity (hit rate in RTT bands, geographic/ASN spread, and stability across repeated queries).
-- *IP completion:* given a partial IP (e.g., prefix) and context, predict plausible completions and measure byte-level accuracy and top-K accuracy, stratified by prefix length and allocation type.
-- *Temporal inference:* given `src_ip`, `dst_ip`, and `rtt`, evaluate likelihood over time buckets and seasonal patterns.
+#figure(
+  image("outputs/paper_metrics/run_latest/figures/timestamp_logprob_hist.png"),
+  caption: [Timestamp impact on RTT token likelihood: delta logP histogram, summary stats, and share above probability thresholds.]
+)
 
-Generalization is probed by constructing held-out evaluation sets that remove specific structure from training, such as:
+*Prediction-mode accuracy summary:* rotate which field is predicted last and measure mean correct-token probability by group. This is meaningful because downstream tasks often require filling a missing field; the summary shows which parts of the measurement the model predicts reliably and which remain weak.
 
-- Particular geographic regions or ASNs (to test whether the model has learned reusable routing rules rather than memorizing specific pairs).
-- Later time windows beyond the training range (to test temporal robustness).
-- IP pairs never observed during training (to test extrapolation based on learned topology and address-structure priors).
+#figure(
+  image("outputs/paper_metrics/run_latest/figures/mode_accuracy_summary.png"),
+  caption: [Prediction-mode accuracy by token group (mean P(correct token)).]
+)
 
-Because latency has intrinsic jitter, downstream metrics emphasize distributional fit (calibration and likelihood) rather than only point estimates.
+*Live ping distribution match:* compare real RTT histograms against model samples for a fixed set of targets and report KL divergence. This is meaningful because it tests distributional fidelity on live measurements, not just point accuracy, and surfaces miscalibration where the model is overconfident or under-dispersed.
+
+#figure(
+  image("outputs/paper_metrics/run_latest/figures/live_ping_grid.png"),
+  caption: [Live ping RTT distributions for real vs model samples with per-target KL.]
+)
+
+These figures are paired with token-level cross-entropy and perplexity on a held-out split from the same time window. Generalization is probed by holding out regions/ASNs, later time windows, and unseen IP pairs. Because latency has intrinsic jitter, the evaluation emphasizes distributional fit and calibration over point estimates.
 
 == Implementation Appendix
 
@@ -294,37 +297,23 @@ How in such a dynamic system like the internet is a static protocol supposed to 
 
 However, we already have a system of decentralized independently-learning and cooperating nodes that can incentivize each other and form protocols in various fashions: Human Society! The question then is, is it possible to program AIs to manage a given node's connections based on the owner's preferences in such a way as to take into account potential adversarial scenarios?
 
-== A Probably Dangerous Theoretical Moon-Shot
+== Privacy-Preserving Decentralized Network Design Powered by a Universal Optimizer
 
-One idea I've been thinking about for some time is recursively improving AI models. Specifically a model where given a type declaration in some (ideally dependently-typed) programming language, the AI would infer a term that satisfies the type. What could this be used for? Some obvious examples come to mind: theorem proving, SAT solving, generating implementations that fit a specification. An example of such a specification might be the specification for such a self-improving AI itself:
+One idea I've been thinking about for some time is recursively improving AI models. This is probably dangerous, but if you assume you have one, specifically, an AI that can take a formal specification and produce something that satisfies it under resource constraints, it allows a designer to focus on the specification rather than the problem itself. In practice such an AI doesn't exist yet, so you eventually need to think about the implementation as well. However, thinking about the specification often helps one understand what implementations even need to do, and what you might be missing.
 
-```rust
-// The type of a program that takes a predicate on programs (a.k.a. a 'type') and returns a program that satisfies the type
-ProgramInferrer := { pred : Program -> bool } -> Program;
-```
+For this thought experiment, we will work from human experience. How do humans build protocols and societies and do collaboration? We have a continually growing knowledge base (science) that allows us to make predictions on what will happen given a certain mechanism / initial conditions for collaboration. It seems like the root problem to solve is _world simulation_. We somehow need to collect large amounts of data, and then be able to create a small program that can reproduce that data as accurately as possible, which then is likely to be a valid program that can simulate counterfactual cases. This paper about LLMs is a perfect example of this world-modeling in action, but if we had a universal optimizer, we could make it more optimal.
 
-This can even be generalized to arbitrary valuation functions on programs.
+The key to creating this simulator is to require it to have enough structure to be able to swap our the internal code running on each node, but not too much to where you are unnecessarily over-specifying the simulator. I imagine this would look something like a base data structure defining a way for programs associated on nodes in a graph to discrete-time talk to each other, i.e. describing the baseline of UDP/TCP graph where two programs on two different nodes can dial each other. You then use the optimizer to find a simulation program that infers this base structure (including the simple program on each node), and tries to match a dataset. Somehow this would have to be made in such a way where you can trade-off speed for simulation accuracy for downstream tasks.
 
-```rust
-// The type of a program that takes a predicate on programs (a.k.a. a 'type') and returns a program that satisfies the type
-ProgramInferrer := { pred : Program -> Real } -> Program;
-```
+Once you have a good simulator, you can start doing RL to find policies. We don't even need to run the simulator with special algorithms in it directly, we can just use the universal optimizer to say 'find me a program that optimizes some local reward function for a node' (lets say, it allows connections fast). Then you also have an adversarial mode where you use the optimizer to, given the good local rationality program, try to reduce some global utility metric (i.e. via surveillance, free loading, etc.). 
 
-Let's say we also generalized our type system into one that graded programs (assigning numbers), as opposed to just checking them.
+That adversarial loop suggests an arms race unless the simulator is constrained. In practice the "universal optimizer" would need hard limits: explicit privacy budgets, communication costs, and verifiable audit trails, otherwise the optimizer could find brittle solutions that look good only inside the simulation. A practical near-term path is to build a coarse but testable simulator that matches basic latency and routing statistics (the same signals shown in the evaluation figures) before trusting it for protocol design.
 
-```rust
-// The type of a program that takes a predicate on programs (a.k.a. a 'type') and returns a program that satisfies the type
-ProgramInferrer := { pred : Program -> Real } -> Program;
-```
+If the simulator cannot reproduce the timestamp effect or the live ping distribution match, it is not yet a safe foundation for policy search. The goal is not to find a perfect world model, but one that is honest about its assumptions and makes its blind spots visible.
 
-Then you might imagine being able to run something like:
-```
-program_inferrer : ProgramInferrer := {/* initial impl */}
-program_inferrer(ProgramInferrer)(ProgramInferrer)(ProgramInferrer)(...)
-```
+= Reflection
 
-What could someone possibly do with this kind of program that can find a close-to-optimal program satisfying a given specification and scoring function? I imagine it would be possible to do a wide variety of things with such a generalized search program. For one, you could create the fastest and most accurate simulations of any domain you would like, or more precisely navigate along the Pareto frontier of such a trade-off. Such a simulation could be used to create intensive training environments for RL agents that are themselves produced by the general optimization program to maximize reward and minimize risk over the course of the simulation, similar to how self-driving cars or robots are trained (in highly adversarial environments where you have god-like view to provide dense feedback, for example, if a routing agent is effectively hiding traffic or not). The sky is the limit!
+Building Ping-LLM makes it clear that the hardest part is not just modeling, but measurement discipline. The evaluation figures are small but grounding: they show where the model picks up temporal structure, where it struggles to predict failures, and whether it captures the spread of RTTs rather than a single average. The next iteration should keep tightening the loop between data collection, evaluation, and model changes, so each new capability can be defended with a concrete, repeatable signal.
 
-Here are some potential outlines of what this might look like (WIP).
 
 #bibliography("bibliography.bib")

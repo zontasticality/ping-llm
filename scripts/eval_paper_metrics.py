@@ -26,6 +26,7 @@ import json
 import math
 import re
 import socket
+import urllib.request
 import subprocess
 import sys
 import threading
@@ -147,17 +148,17 @@ from src.MaxText.input_pipeline.network_tokenization import (
     token_to_byte,
 )
 
-DEFAULT_REGULAR_IPS = [
-    "8.8.8.8",
-    "8.8.4.4",
-    "1.1.1.1",
-    "1.0.0.1",
-    "9.9.9.9",
-    "149.112.112.112",
-    "208.67.222.222",
-    "208.67.220.220",
-    "64.6.64.6",
-    "64.6.65.6",
+DEFAULT_REGULAR_DOMAINS = [
+    "umass.edu",
+    "berkeley.edu",
+    "cam.ac.uk",
+    "ethz.ch",
+    "iitb.ac.in",
+    "u-tokyo.ac.jp",
+    "unsw.edu.au",
+    "uct.ac.za",
+    "ufrj.br",
+    "unam.mx",
 ]
 
 DEFAULT_ANCHOR_IPS = [
@@ -647,23 +648,49 @@ def ping_series(label, ip, count, timeout, show_output, log_lock=None):
     return rtts
 
 
-def parse_ip_list(value):
+def parse_list(value):
     if not value:
         return []
     return [item.strip() for item in value.split(",") if item.strip()]
 
+def resolve_domains(domains):
+    resolved = []
+    seen_ips = set()
+    for domain in domains:
+        domain = domain.strip()
+        if not domain:
+            continue
+        try:
+            infos = socket.getaddrinfo(domain, None, family=socket.AF_INET)
+        except Exception:
+            continue
+        ip = None
+        for info in infos:
+            candidate = info[4][0]
+            if candidate:
+                ip = candidate
+                break
+        if ip is None or ip in seen_ips:
+            continue
+        resolved.append({"domain": domain, "ip": ip})
+        seen_ips.add(ip)
+    return resolved
 
-def build_ping_targets(regular_ips, anchor_ips):
+
+def build_ping_targets(regular_domains, anchor_ips):
     targets = []
     seen = set()
-    for idx, ip in enumerate(regular_ips, start=1):
+    resolved = resolve_domains(regular_domains)
+    for idx, entry in enumerate(resolved, start=1):
+        ip = entry["ip"]
         if ip in seen:
             continue
         seen.add(ip)
         targets.append(
             {
                 "ip": ip,
-                "label": f"regular {idx} ({ip})",
+                "domain": entry["domain"],
+                "label": f"{entry['domain']} ({ip})",
                 "group": "regular",
             }
         )
@@ -682,6 +709,22 @@ def build_ping_targets(regular_ips, anchor_ips):
 
 
 def get_src_ip():
+    public_ip = None
+    for url in (
+        "https://api.ipify.org",
+        "https://checkip.amazonaws.com",
+        "https://ifconfig.me/ip",
+    ):
+        try:
+            with urllib.request.urlopen(url, timeout=5) as resp:
+                candidate = resp.read().decode("utf-8").strip()
+            if re.match(r"^\\d+\\.\\d+\\.\\d+\\.\\d+$", candidate):
+                public_ip = candidate
+                break
+        except Exception:
+            continue
+    if public_ip:
+        return public_ip
     try:
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         sock.connect(("8.8.8.8", 80))
@@ -817,6 +860,9 @@ def compute_rtt_range(real_vals, model_vals, max_rtt):
         range_max = min(range_max, max_rtt)
     if range_max <= range_min:
         range_min = max(0.0, range_max - 1.0)
+        range_max = range_min + 1.0
+    range_min = max(0.1, range_min)
+    if range_max <= range_min:
         range_max = range_min + 1.0
     return float(range_min), float(range_max)
 
@@ -1091,9 +1137,15 @@ def build_parser():
     )
 
     parser.add_argument(
+        "--regular-domains",
+        default=",".join(DEFAULT_REGULAR_DOMAINS),
+        help="Comma-separated list of regular domains to resolve and ping",
+    )
+    parser.add_argument(
         "--regular-ips",
-        default=",".join(DEFAULT_REGULAR_IPS),
-        help="Comma-separated list of regular IPs to ping",
+        dest="regular_domains",
+        default=None,
+        help=argparse.SUPPRESS,
     )
     parser.add_argument(
         "--anchor-ips",
@@ -1223,9 +1275,9 @@ def run(args):
     ping_targets = []
     if "ping" in selected:
         ping_src_ip = get_src_ip()
-        regular_ips = parse_ip_list(args.regular_ips)
-        anchor_ips = parse_ip_list(args.anchor_ips)
-        ping_targets = build_ping_targets(regular_ips, anchor_ips)
+        regular_domains = parse_list(args.regular_domains)
+        anchor_ips = parse_list(args.anchor_ips)
+        ping_targets = build_ping_targets(regular_domains, anchor_ips)
         if ping_targets:
             sample_dst = ping_targets[0]["ip"]
             cond_tokens = create_conditioning_tokens(
@@ -1422,6 +1474,7 @@ def run(args):
                 dst_ip = target["ip"]
                 label = target["label"]
                 group = target.get("group")
+                domain = target.get("domain")
                 real_rtts = ping_real.get(dst_ip, [])
                 success_count = sum(1 for r in real_rtts if r >= 0)
                 if success_count == 0:
@@ -1476,6 +1529,7 @@ def run(args):
                 ping_results.append(
                     {
                         "dst_ip": dst_ip,
+                        "domain": domain,
                         "group": group,
                         "label": label,
                         "kl": kl_value,
@@ -1510,7 +1564,7 @@ def run(args):
                     "sampling_strategy": ping_sampling_strategy,
                     "ping_workers": args.ping_workers,
                     "ping_no_timestamp": args.ping_no_timestamp,
-                    "regular_ips": args.regular_ips,
+                    "regular_domains": args.regular_domains,
                     "anchor_ips": args.anchor_ips,
                 },
                 "ping": {
@@ -1519,6 +1573,7 @@ def run(args):
                     "targets": [
                         {
                             "dst_ip": r["dst_ip"],
+                            "domain": r.get("domain"),
                             "group": r.get("group"),
                             "label": r["label"],
                             "kl": r["kl"],
@@ -1581,7 +1636,7 @@ if MODAL_AVAILABLE:
         hist_bins: int | None = None,
         parquet: str | None = None,
         mode_samples: int | None = None,
-        regular_ips: str | None = None,
+        regular_domains: str | None = None,
         anchor_ips: str | None = None,
         pings_per_ip: int | None = None,
         model_samples: int | None = None,
@@ -1620,8 +1675,8 @@ if MODAL_AVAILABLE:
             args.parquet = parquet
         if mode_samples is not None:
             args.mode_samples = mode_samples
-        if regular_ips is not None:
-            args.regular_ips = regular_ips
+        if regular_domains is not None:
+            args.regular_domains = regular_domains
         if anchor_ips is not None:
             args.anchor_ips = anchor_ips
         if pings_per_ip is not None:
