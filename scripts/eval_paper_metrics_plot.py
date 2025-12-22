@@ -62,6 +62,22 @@ def summarize_logps(logps):
     }
 
 
+def build_hist_bins(logps_full, logps_none, hist_bins):
+    all_logps = (
+        np.concatenate([logps_full, logps_none])
+        if len(logps_full) and len(logps_none)
+        else np.array([])
+    )
+    if all_logps.size == 0:
+        return hist_bins
+    low, high = np.percentile(all_logps, [1, 99])
+    if low == high:
+        low, high = low - 1.0, high + 1.0
+    if isinstance(hist_bins, (list, tuple, np.ndarray)):
+        return np.array(hist_bins)
+    return np.linspace(low, high, int(hist_bins))
+
+
 def plot_logprob_hist(output_path, logps_full, logps_none, bins, title):
     fig, ax = plt.subplots(figsize=(8, 5))
     if len(logps_full) > 0:
@@ -86,8 +102,405 @@ def plot_logprob_hist(output_path, logps_full, logps_none, bins, title):
     if len(logps_full) > 0 or len(logps_none) > 0:
         ax.legend()
     fig.tight_layout()
-    fig.savefig(output_path, dpi=150)
+    fig.savefig(output_path, dpi=300)
     plt.close(fig)
+
+
+def plot_logprob_hist_with_cdf(
+    output_path,
+    logps_full,
+    logps_none,
+    bins,
+    title,
+    clip_percentiles=(2, 98),
+):
+    fig, ax = plt.subplots(figsize=(8, 5))
+    color_full = "#4C78A8"
+    color_none = "#72B7B2"
+    all_logps = (
+        np.concatenate([logps_full, logps_none])
+        if len(logps_full) and len(logps_none)
+        else np.array([])
+    )
+    x_min = None
+    x_max = None
+    if all_logps.size:
+        low_pct, high_pct = clip_percentiles
+        x_min, x_max = np.percentile(all_logps, [low_pct, high_pct])
+        if x_min == x_max:
+            x_min, x_max = x_min - 1.0, x_max + 1.0
+    elif isinstance(bins, (list, tuple, np.ndarray)) and len(bins) >= 2:
+        x_min = float(bins[0])
+        x_max = float(bins[-1])
+    if x_min is not None and x_max is not None:
+        bins = np.linspace(x_min, x_max, len(bins) if isinstance(bins, (list, tuple, np.ndarray)) else int(bins))
+
+    if len(logps_full) > 0:
+        clipped_full = (
+            logps_full[(logps_full >= x_min) & (logps_full <= x_max)]
+            if x_min is not None and x_max is not None
+            else logps_full
+        )
+        ax.hist(
+            clipped_full,
+            bins=bins,
+            alpha=0.45,
+            label="full timestamps",
+            density=True,
+            color=color_full,
+        )
+    if len(logps_none) > 0:
+        clipped_none = (
+            logps_none[(logps_none >= x_min) & (logps_none <= x_max)]
+            if x_min is not None and x_max is not None
+            else logps_none
+        )
+        ax.hist(
+            clipped_none,
+            bins=bins,
+            alpha=0.45,
+            label="no timestamps",
+            density=True,
+            color=color_none,
+        )
+    ax.set_xlabel("log P(correct token)")
+    ax.set_ylabel("density (normalized histogram)")
+    ax.set_title(title)
+    if x_min is not None and x_max is not None:
+        ax.set_xlim(x_min, x_max)
+
+    ax2 = ax.twinx()
+    if len(logps_full) > 0:
+        clipped_full = (
+            logps_full[(logps_full >= x_min) & (logps_full <= x_max)]
+            if x_min is not None and x_max is not None
+            else logps_full
+        )
+        sorted_full = np.sort(clipped_full)
+        cdf_full = np.linspace(0, 1, len(sorted_full))
+        ax2.plot(
+            sorted_full,
+            cdf_full,
+            color=color_full,
+            linewidth=1.5,
+            label="full CDF",
+        )
+    if len(logps_none) > 0:
+        clipped_none = (
+            logps_none[(logps_none >= x_min) & (logps_none <= x_max)]
+            if x_min is not None and x_max is not None
+            else logps_none
+        )
+        sorted_none = np.sort(clipped_none)
+        cdf_none = np.linspace(0, 1, len(sorted_none))
+        ax2.plot(
+            sorted_none,
+            cdf_none,
+            color=color_none,
+            linewidth=1.5,
+            label="no timestamp CDF",
+        )
+    ax2.set_ylabel("CDF (fraction of tokens with logP ≤ x)")
+    ax2.set_ylim(0, 1.0)
+    if x_min is not None and x_max is not None:
+        ax2.set_xlim(x_min, x_max)
+
+    handles, labels = ax.get_legend_handles_labels()
+    handles2, labels2 = ax2.get_legend_handles_labels()
+    if handles or handles2:
+        ax.legend(handles + handles2, labels + labels2, loc="upper left")
+    if x_min is not None and x_max is not None:
+        ax.text(
+            0.99,
+            0.02,
+            f"range clipped to {clip_percentiles[0]}–{clip_percentiles[1]}th pct",
+            transform=ax.transAxes,
+            ha="right",
+            va="bottom",
+            fontsize=8,
+        )
+    fig.tight_layout()
+    fig.savefig(output_path, dpi=300)
+    plt.close(fig)
+
+
+def plot_timestamp_effects(
+    output_path,
+    logps_full,
+    logps_none,
+    hist_bins,
+    thresholds=None,
+):
+    if thresholds is None:
+        thresholds = [0.5, 0.8, 0.95]
+
+    full_logps = np.array(logps_full, dtype=np.float32)
+    none_logps = np.array(logps_none, dtype=np.float32)
+    if full_logps.size == 0 or none_logps.size == 0:
+        print("Timestamp plot missing full/none logps; skipping.")
+        return None
+
+    paired_size = min(full_logps.size, none_logps.size)
+    if full_logps.size != none_logps.size:
+        print(
+            "Timestamp logps size mismatch; truncating to paired size "
+            f"{paired_size}."
+        )
+    delta_logps = full_logps[:paired_size] - none_logps[:paired_size]
+
+    if delta_logps.size:
+        low, high = np.percentile(delta_logps, [1, 99])
+        if low == high:
+            low, high = low - 1.0, high + 1.0
+        if isinstance(hist_bins, (list, tuple, np.ndarray)):
+            bins = np.array(hist_bins)
+        else:
+            bins = np.linspace(low, high, int(hist_bins))
+    else:
+        bins = hist_bins
+
+    full_summary = summarize_logps(full_logps)
+    none_summary = summarize_logps(none_logps)
+    mean_delta = float(np.mean(delta_logps)) if delta_logps.size else float("nan")
+    median_delta = float(np.median(delta_logps)) if delta_logps.size else float("nan")
+    ratio = math.exp(mean_delta) if not math.isnan(mean_delta) else float("nan")
+    pct_improved = (
+        float(np.mean(delta_logps > 0) * 100) if delta_logps.size else float("nan")
+    )
+
+    full_probs = np.exp(full_logps)
+    none_probs = np.exp(none_logps)
+    full_fracs = [
+        float(np.mean(full_probs >= threshold)) if full_probs.size else float("nan")
+        for threshold in thresholds
+    ]
+    none_fracs = [
+        float(np.mean(none_probs >= threshold)) if none_probs.size else float("nan")
+        for threshold in thresholds
+    ]
+
+    fig, axes = plt.subplots(
+        1,
+        3,
+        figsize=(13.5, 4.6),
+        gridspec_kw={"width_ratios": [1.4, 1.0, 1.2]},
+    )
+
+    ax = axes[0]
+    ax.hist(delta_logps, bins=bins, density=True, alpha=0.8, color="#4C78A8")
+    ax.axvline(0, color="black", linestyle="--", linewidth=1.1)
+    ax.set_xlabel("delta log P(correct token) (full - none)")
+    ax.set_ylabel("density")
+    ax.set_title("Delta logP distribution")
+
+    ax = axes[1]
+    ax.axis("off")
+    summary_lines = ["Summary (RTT tokens)"]
+    if full_logps.size != none_logps.size:
+        summary_lines.append(
+            f"N full / none: {full_logps.size:,} / {none_logps.size:,}"
+        )
+    summary_lines.extend(
+        [
+            f"N paired: {paired_size:,}",
+            f"mean logP full: {full_summary['mean_logp']:.3f}",
+            f"mean logP none: {none_summary['mean_logp']:.3f}",
+            f"mean dlogP: {mean_delta:+.3f} (x{ratio:.2f})",
+            f"median dlogP: {median_delta:+.3f}",
+            f"dlogP > 0: {pct_improved:.1f}%",
+        ]
+    )
+    ax.text(
+        0.0,
+        1.0,
+        "\n".join(summary_lines),
+        transform=ax.transAxes,
+        va="top",
+        ha="left",
+        fontsize=9,
+        family="monospace",
+    )
+
+    ax = axes[2]
+    x = np.arange(len(thresholds))
+    width = 0.38
+    ax.bar(x - width / 2, full_fracs, width, label="full timestamps", color="#4C78A8")
+    ax.bar(x + width / 2, none_fracs, width, label="no timestamps", color="#72B7B2")
+    ax.set_xticks(x)
+    ax.set_xticklabels([f"p>={t:.2f}" for t in thresholds])
+    ax.set_ylim(0, 1.0)
+    ax.set_ylabel("fraction of tokens")
+    ax.set_title("Share above thresholds")
+    ax.legend()
+
+    fig.suptitle("Timestamp impact on RTT token likelihood")
+    fig.tight_layout(rect=[0, 0, 1, 0.95])
+    fig.savefig(output_path, dpi=300)
+    plt.close(fig)
+    return output_path
+
+
+def plot_timestamp_threshold_cdf(output_path, logps_full, logps_none, num_points=200):
+    full_logps = np.array(logps_full, dtype=np.float32)
+    none_logps = np.array(logps_none, dtype=np.float32)
+    if full_logps.size == 0 or none_logps.size == 0:
+        print("Timestamp CDF missing full/none logps; skipping.")
+        return None
+
+    full_probs = np.exp(full_logps)
+    none_probs = np.exp(none_logps)
+    thresholds = np.linspace(0.0, 1.0, num_points)
+
+    full_curve = np.array([np.mean(full_probs >= t) for t in thresholds])
+    none_curve = np.array([np.mean(none_probs >= t) for t in thresholds])
+
+    fig, ax = plt.subplots(figsize=(8, 5))
+    ax.plot(thresholds, full_curve, label="full timestamps", color="#4C78A8")
+    ax.plot(thresholds, none_curve, label="no timestamps", color="#72B7B2")
+    ax.set_xlabel("probability threshold P(correct token)")
+    ax.set_ylabel("fraction of tokens with P >= threshold")
+    ax.set_title("Continuous threshold curve (1 - CDF)")
+    ax.set_ylim(0, 1.0)
+    ax.grid(True, alpha=0.3)
+    ax.legend()
+    fig.tight_layout()
+    fig.savefig(output_path, dpi=300)
+    plt.close(fig)
+    return output_path
+
+
+def plot_timestamp_buckets(
+    output_path,
+    logps_full,
+    logps_none,
+    full_rtt_ms,
+    none_rtt_ms,
+    full_event_hour,
+    none_event_hour,
+):
+    full_logps = np.array(logps_full, dtype=np.float32)
+    none_logps = np.array(logps_none, dtype=np.float32)
+    full_rtt = np.array(full_rtt_ms, dtype=np.float32)
+    none_rtt = np.array(none_rtt_ms, dtype=np.float32)
+    full_hour = np.array(full_event_hour, dtype=np.float32)
+    none_hour = np.array(none_event_hour, dtype=np.float32)
+
+    if (
+        full_logps.size == 0
+        or none_logps.size == 0
+        or full_rtt.size == 0
+        or none_rtt.size == 0
+        or full_hour.size == 0
+        or none_hour.size == 0
+    ):
+        print("Timestamp buckets missing logps or metadata; skipping.")
+        return None
+
+    full_len = min(full_logps.size, full_rtt.size, full_hour.size)
+    none_len = min(none_logps.size, none_rtt.size, none_hour.size)
+    if full_logps.size != full_len or none_logps.size != none_len:
+        print("Timestamp buckets length mismatch; truncating to aligned sizes.")
+    full_logps = full_logps[:full_len]
+    full_rtt = full_rtt[:full_len]
+    full_hour = full_hour[:full_len]
+    none_logps = none_logps[:none_len]
+    none_rtt = none_rtt[:none_len]
+    none_hour = none_hour[:none_len]
+
+    rtt_bins = np.array([0, 10, 20, 50, 100, 200, 500, 1000, np.inf], dtype=float)
+    hour_bins = np.array([0, 4, 8, 12, 16, 20, 24], dtype=float)
+
+    def bucket_means(logps, values, bins):
+        probs = np.exp(logps)
+        means = []
+        counts = []
+        for low, high in zip(bins[:-1], bins[1:]):
+            mask = (values >= low) & (values < high)
+            count = int(np.sum(mask))
+            counts.append(count)
+            means.append(float(np.mean(probs[mask])) if count else float("nan"))
+        return means, counts
+
+    full_rtt_mask = np.isfinite(full_rtt) & (full_rtt >= 0)
+    none_rtt_mask = np.isfinite(none_rtt) & (none_rtt >= 0)
+    full_hour_mask = full_rtt_mask & np.isfinite(full_hour)
+    none_hour_mask = none_rtt_mask & np.isfinite(none_hour)
+
+    full_rtt_means, _ = bucket_means(
+        full_logps[full_rtt_mask], full_rtt[full_rtt_mask], rtt_bins
+    )
+    none_rtt_means, _ = bucket_means(
+        none_logps[none_rtt_mask], none_rtt[none_rtt_mask], rtt_bins
+    )
+    full_hour_means, _ = bucket_means(
+        full_logps[full_hour_mask], full_hour[full_hour_mask], hour_bins
+    )
+    none_hour_means, _ = bucket_means(
+        none_logps[none_hour_mask], none_hour[none_hour_mask], hour_bins
+    )
+
+    rtt_labels = []
+    for low, high in zip(rtt_bins[:-1], rtt_bins[1:]):
+        if np.isinf(high):
+            label = f"{int(low)}+"
+        else:
+            label = f"{int(low)}-{int(high)}"
+        rtt_labels.append(label)
+    hour_labels = [
+        f"{int(low):02d}-{int(high):02d}"
+        for low, high in zip(hour_bins[:-1], hour_bins[1:])
+    ]
+
+    fig, axes = plt.subplots(2, 1, figsize=(12, 8))
+
+    x_rtt = np.arange(len(rtt_labels))
+    axes[0].plot(
+        x_rtt, full_rtt_means, marker="o", color="#4C78A8", label="full timestamps"
+    )
+    axes[0].plot(
+        x_rtt, none_rtt_means, marker="o", color="#72B7B2", label="no timestamps"
+    )
+    axes[0].set_xticks(x_rtt)
+    axes[0].set_xticklabels(rtt_labels, rotation=30, ha="right")
+    axes[0].set_ylabel("mean P(correct token)")
+    axes[0].set_title("By RTT magnitude (ms)")
+    axes[0].grid(True, axis="y", alpha=0.3)
+    axes[0].legend()
+    axes[0].text(
+        0.99,
+        0.05,
+        "failed RTTs excluded",
+        transform=axes[0].transAxes,
+        ha="right",
+        fontsize=8,
+    )
+
+    x_hour = np.arange(len(hour_labels))
+    axes[1].plot(
+        x_hour, full_hour_means, marker="o", color="#4C78A8", label="full timestamps"
+    )
+    axes[1].plot(
+        x_hour, none_hour_means, marker="o", color="#72B7B2", label="no timestamps"
+    )
+    axes[1].set_xticks(x_hour)
+    axes[1].set_xticklabels(hour_labels, rotation=30, ha="right")
+    axes[1].set_ylabel("mean P(correct token)")
+    axes[1].set_title("By time-of-day bucket (hour)")
+    axes[1].grid(True, axis="y", alpha=0.3)
+    axes[1].text(
+        0.99,
+        0.05,
+        "failed RTTs excluded",
+        transform=axes[1].transAxes,
+        ha="right",
+        fontsize=8,
+    )
+
+    fig.suptitle("Timestamp impact by RTT magnitude and time of day")
+    fig.tight_layout(rect=[0, 0, 1, 0.95])
+    fig.savefig(output_path, dpi=300)
+    plt.close(fig)
+    return output_path
 
 
 def plot_mode_summary(output_path, summary, order):
@@ -414,28 +827,43 @@ def plot_timestamps(metrics, output_dir, hist_bins_override=None):
 
     full_logps = np.array(data.get("full_logps", []), dtype=np.float32)
     none_logps = np.array(data.get("none_logps", []), dtype=np.float32)
-    hist_bins = hist_bins_override or metrics.get("params", {}).get("hist_bins", 500)
-
-    all_logps = (
-        np.concatenate([full_logps, none_logps])
-        if full_logps.size and none_logps.size
-        else np.array([])
-    )
-    if all_logps.size:
-        low, high = np.percentile(all_logps, [1, 99])
-        if low == high:
-            low, high = low - 1.0, high + 1.0
-        bins = np.linspace(low, high, hist_bins)
-    else:
-        bins = hist_bins
+    hist_bins = hist_bins_override or metrics.get("params", {}).get("hist_bins", 200)
+    hist_bins_arr = build_hist_bins(full_logps, none_logps, hist_bins)
 
     hist_path = output_dir / "timestamp_logprob_hist.png"
-    plot_logprob_hist(
+    plot_timestamp_effects(
         hist_path,
         full_logps,
         none_logps,
-        bins,
+        hist_bins,
+    )
+
+    hist_cdf_path = output_dir / "timestamp_logprob_hist_cdf.png"
+    plot_logprob_hist_with_cdf(
+        hist_cdf_path,
+        full_logps,
+        none_logps,
+        hist_bins_arr,
         "Log P(correct token): full vs no timestamps",
+        clip_percentiles=(2, 98),
+    )
+
+    cdf_path = output_dir / "timestamp_logprob_cdf.png"
+    plot_timestamp_threshold_cdf(
+        cdf_path,
+        full_logps,
+        none_logps,
+    )
+
+    buckets_path = output_dir / "timestamp_logprob_buckets.png"
+    plot_timestamp_buckets(
+        buckets_path,
+        full_logps,
+        none_logps,
+        data.get("full_rtt_ms", []),
+        data.get("none_rtt_ms", []),
+        data.get("full_event_hour", []),
+        data.get("none_event_hour", []),
     )
     return hist_path
 

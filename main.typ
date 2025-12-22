@@ -213,33 +213,33 @@ Training uses the AdamW optimizer with a cosine learning rate schedule and a bri
 The primary metric during training is token-level cross-entropy on held-out measurements, with downstream evaluation focusing on latency prediction accuracy and generalization to unseen IP pairs and network conditions.
 
 #figure(
- image("wandb_training.png"),
- caption: [Multiple rounds of training, continuing from previous model checkpoints]
+  image("wandb_training.png"),
+  caption: [Multiple rounds of training, continuing from previous model checkpoints],
 )
 
 == Evaluation & Metrics
 
-Evaluation focuses on three concrete checks that tie token likelihood to downstream utility. Each one probes a different capability and is cheap to re-run as the model changes.
+Evaluation focuses on three checks that should intuitively communicate the utility of the transformer approach. This includes a visualization of the hypothesis that including timestamps makes for better predictions, and a comparison of model predictions to real-world sampling from a given probe ID not in the dataset.
 
 *Timestamp vs no-timestamp RTT likelihood:* compare the log-probability of the correct RTT tokens with and without timestamp context. This is meaningful because it isolates whether temporal information actually sharpens the RTT distribution without changing the IP conditioning.
 
 #figure(
-  image("outputs/paper_metrics/run_latest/figures/timestamp_logprob_hist.png"),
-  caption: [Timestamp impact on RTT token likelihood: delta logP histogram, summary stats, and share above probability thresholds.]
-)
-
-*Prediction-mode accuracy summary:* rotate which field is predicted last and measure mean correct-token probability by group. This is meaningful because downstream tasks often require filling a missing field; the summary shows which parts of the measurement the model predicts reliably and which remain weak.
-
-#figure(
-  image("outputs/paper_metrics/run_latest/figures/mode_accuracy_summary.png"),
-  caption: [Prediction-mode accuracy by token group (mean P(correct token)).]
+  image("timestamp_logprob_hist.png"),
+  caption: [Log P(correct RTT tokens) for full timestamps vs no timestamps.],
 )
 
 *Live ping distribution match:* compare real RTT histograms against model samples for a fixed set of targets and report KL divergence. This is meaningful because it tests distributional fidelity on live measurements, not just point accuracy, and surfaces miscalibration where the model is overconfident or under-dispersed.
 
 #figure(
-  image("outputs/paper_metrics/run_latest/figures/live_ping_grid.png"),
-  caption: [Live ping RTT distributions for real vs model samples with per-target KL.]
+  image("live_ping_grid.png"),
+  caption: [Live ping RTT distributions for real vs model samples with per-target KL.],
+)
+
+*Prediction-mode accuracy summary:* rotate which field is predicted last and measure mean correct-token probability by group. This shows which fields are "easier" to learn than others / have less average entropy, at least at this model size, training time, and dataset size.
+
+#figure(
+  image("mode_accuracy_summary.png"),
+  caption: [Prediction-mode accuracy by token group (mean P(correct token)).],
 )
 
 These figures are paired with token-level cross-entropy and perplexity on a held-out split from the same time window. Generalization is probed by holding out regions/ASNs, later time windows, and unseen IP pairs. Because latency has intrinsic jitter, the evaluation emphasizes distributional fit and calibration over point estimates.
@@ -297,7 +297,7 @@ How in such a dynamic system like the internet is a static protocol supposed to 
 
 However, we already have a system of decentralized independently-learning and cooperating nodes that can incentivize each other and form protocols in various fashions: Human Society! The question then is, is it possible to program AIs to manage a given node's connections based on the owner's preferences in such a way as to take into account potential adversarial scenarios?
 
-== Privacy-Preserving Decentralized Network Design Powered by a Universal Optimizer
+== Thought Experiment: Privacy-Preserving Decentralized Network Design Powered by a Universal Optimizer
 
 One idea I've been thinking about for some time is recursively improving AI models. This is probably dangerous, but if you assume you have one, specifically, an AI that can take a formal specification and produce something that satisfies it under resource constraints, it allows a designer to focus on the specification rather than the problem itself. In practice such an AI doesn't exist yet, so you eventually need to think about the implementation as well. However, thinking about the specification often helps one understand what implementations even need to do, and what you might be missing.
 
@@ -305,15 +305,12 @@ For this thought experiment, we will work from human experience. How do humans b
 
 The key to creating this simulator is to require it to have enough structure to be able to swap our the internal code running on each node, but not too much to where you are unnecessarily over-specifying the simulator. I imagine this would look something like a base data structure defining a way for programs associated on nodes in a graph to discrete-time talk to each other, i.e. describing the baseline of UDP/TCP graph where two programs on two different nodes can dial each other. You then use the optimizer to find a simulation program that infers this base structure (including the simple program on each node), and tries to match a dataset. Somehow this would have to be made in such a way where you can trade-off speed for simulation accuracy for downstream tasks.
 
-Once you have a good simulator, you can start doing RL to find policies. We don't even need to run the simulator with special algorithms in it directly, we can just use the universal optimizer to say 'find me a program that optimizes some local reward function for a node' (lets say, it allows connections fast). Then you also have an adversarial mode where you use the optimizer to, given the good local rationality program, try to reduce some global utility metric (i.e. via surveillance, free loading, etc.). 
+Once you have a good simulator, you can start doing RL to find policies. We don't even need to run the simulator with special algorithms in it directly, we can just use the universal optimizer to say 'find me a program that optimizes some local reward function for a node' (lets say, it allows connections fast). Then you also have an adversarial mode where you use the optimizer to, given the good local rationality program, try to reduce some global utility metric (i.e. via surveillance, free loading, etc.).
 
-That adversarial loop suggests an arms race unless the simulator is constrained. In practice the "universal optimizer" would need hard limits: explicit privacy budgets, communication costs, and verifiable audit trails, otherwise the optimizer could find brittle solutions that look good only inside the simulation. A practical near-term path is to build a coarse but testable simulator that matches basic latency and routing statistics (the same signals shown in the evaluation figures) before trusting it for protocol design.
+The details are then what the utility metric is. There are some obvious things to optimize for: latency to connect to nodes, speed at which data can be retrieved, likelihood of correlating traffic to source/destination from various attacker vantage points, etc. Assuming you can define a _reasonable_ global utility metric however, (probably much easier than solving the alignment problem), in theory entire protocols should be able to pop out, anything from cryptocurrencies for proper incentivization to onion routing to cryptographic protocols could pop out of this simulation-based optimization process, maybe. I suppose the only way to figure out is to try. For me at least, I'm not sure how much I want to try to make the FOOM machine, but it most definitely is attractive from an applications perspective to be able to skip the decades of research needed to make distributed systems practical and jump strait to the 'best' solution we can find.
 
-If the simulator cannot reproduce the timestamp effect or the live ping distribution match, it is not yet a safe foundation for policy search. The goal is not to find a perfect world model, but one that is honest about its assumptions and makes its blind spots visible.
+= Conclusion
 
-= Reflection
-
-Building Ping-LLM makes it clear that the hardest part is not just modeling, but measurement discipline. The evaluation figures are small but grounding: they show where the model picks up temporal structure, where it struggles to predict failures, and whether it captures the spread of RTTs rather than a single average. The next iteration should keep tightening the loop between data collection, evaluation, and model changes, so each new capability can be defended with a concrete, repeatable signal.
-
+Ping-LLM was a fun project. The hardest part was getting the data and actually getting started trying to run and iterate on an LLM. It was helpful to switch to a cloud provider like modal as the Unity cluster is a little clunky to use. (I did wrack up at least 40\$ in compute costs though). From this pilot project I think overall the idea of using a transformer network to predict network properties seems solid. I may want to make a few more evaluations though. The next step is to scale up, train for longer and on more diverse data (the whole RIPE Atlas is on the table, as well as any bandwidth datasets I can get my hands on). I think it may also be possible to scale up to 1B parameters, who knows. Overall, this feels like a promising research direction and I will definitely continue down this path in the future. Future research will focus on scaling this approach to larger models and better datasets, as well as actually testing out training in an distributed, adversarial, and privacy-preserving environment.
 
 #bibliography("bibliography.bib")

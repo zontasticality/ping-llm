@@ -196,7 +196,10 @@ These scripts default to CPU inference (for laptop use). If you have a GPU:
 ## Paper Metrics Plots
 
 Use the two-step workflow below to generate PNG figures for:
-- Timestamp vs no-timestamp log-probability histograms
+- Timestamp vs no-timestamp delta logP summary (`timestamp_logprob_hist.png`)
+- Timestamp histogram with overlaid CDFs (`timestamp_logprob_hist_cdf.png`)
+- Timestamp continuous threshold curve (`timestamp_logprob_cdf.png`)
+- Timestamp bucket breakdown by RTT magnitude and time-of-day (`timestamp_logprob_buckets.png`)
 - Prediction-mode accuracy bars (per-token accuracy)
 - Live ping distribution matches with KL labels
 

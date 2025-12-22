@@ -416,13 +416,23 @@ def sample_rtt_pairs_from_parquet(
     pairs = []
     for row in samples.itertuples(index=False):
         row_dict = row._asdict()
+        event_time = row_dict["event_time"]
         context_full, expected_full = build_rtt_prediction_tokens(
             row_dict, include_timestamp=True
         )
         context_none, expected_none = build_rtt_prediction_tokens(
             row_dict, include_timestamp=False
         )
-        pairs.append((context_full, expected_full, context_none, expected_none))
+        pairs.append(
+            {
+                "context_full": context_full,
+                "expected_full": expected_full,
+                "context_none": context_none,
+                "expected_none": expected_none,
+                "rtt_ms": float(row_dict["rtt"]),
+                "event_hour": int(event_time.hour),
+            }
+        )
     return pairs
 
 
@@ -1102,7 +1112,7 @@ def build_parser():
     parser.add_argument(
         "--timestamp-contexts",
         type=int,
-        default=200,
+        default=5000,
         help="Number of contexts for timestamp histogram",
     )
     parser.add_argument(
@@ -1244,7 +1254,11 @@ def run(args):
                 rng,
                 sample_rows=args.timestamp_sample_rows,
             )
-            for context_full, expected_full, context_none, expected_none in rtt_pairs:
+            for pair in rtt_pairs:
+                context_full = pair["context_full"]
+                expected_full = pair["expected_full"]
+                context_none = pair["context_none"]
+                expected_none = pair["expected_none"]
                 max_prefill_len = max(
                     max_prefill_len,
                     len(context_full) + len(expected_full),
@@ -1314,16 +1328,29 @@ def run(args):
             print("Computing RTT logprobs (timestamp vs no timestamp)...")
             logps_full = []
             logps_none = []
-            for context_full, expected_full, context_none, expected_none in rtt_pairs:
+            full_rtt_ms = []
+            none_rtt_ms = []
+            full_event_hour = []
+            none_event_hour = []
+            for pair in rtt_pairs:
+                context_full = pair["context_full"]
+                expected_full = pair["expected_full"]
+                context_none = pair["context_none"]
+                expected_none = pair["expected_none"]
+                rtt_ms = pair["rtt_ms"]
+                event_hour = pair["event_hour"]
                 tokens_full = context_full + expected_full
                 logp_full, jax_rng = compute_prompt_logprobs(
                     engine, params, config, tokens_full, jax_rng
                 )
                 start_full = len(context_full)
                 end_full = start_full + len(expected_full)
-                logps_full.extend(
-                    [lp for lp in logp_full[start_full:end_full] if not np.isnan(lp)]
-                )
+                for lp in logp_full[start_full:end_full]:
+                    if np.isnan(lp):
+                        continue
+                    logps_full.append(lp)
+                    full_rtt_ms.append(rtt_ms)
+                    full_event_hour.append(event_hour)
 
                 tokens_none = context_none + expected_none
                 logp_none, jax_rng = compute_prompt_logprobs(
@@ -1331,9 +1358,12 @@ def run(args):
                 )
                 start_none = len(context_none)
                 end_none = start_none + len(expected_none)
-                logps_none.extend(
-                    [lp for lp in logp_none[start_none:end_none] if not np.isnan(lp)]
-                )
+                for lp in logp_none[start_none:end_none]:
+                    if np.isnan(lp):
+                        continue
+                    logps_none.append(lp)
+                    none_rtt_ms.append(rtt_ms)
+                    none_event_hour.append(event_hour)
 
             flat_full = np.array(logps_full, dtype=np.float32)
             flat_none = np.array(logps_none, dtype=np.float32)
@@ -1353,6 +1383,10 @@ def run(args):
                     "none": summarize_logps(flat_none),
                     "full_logps": flat_full.tolist(),
                     "none_logps": flat_none.tolist(),
+                    "full_rtt_ms": full_rtt_ms,
+                    "none_rtt_ms": none_rtt_ms,
+                    "full_event_hour": full_event_hour,
+                    "none_event_hour": none_event_hour,
                 },
             }
             timestamp_path = metrics_dir / "timestamp_metrics.json"
