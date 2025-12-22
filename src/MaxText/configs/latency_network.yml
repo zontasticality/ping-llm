@@ -32,8 +32,8 @@ max_prefill_predict_length: 1024
 
 # Training - PLAN_2 hyperparameters
 steps: 5000
-per_device_batch_size: 128 # Increased from 32 to utilize A100 (70% GPU memory was idle)
-learning_rate: 1.0e-4 # Scaled up 2x for 4x larger batch (sqrt scaling rule)
+per_device_batch_size: 256 # OPTIMIZED: Increased from 128 to saturate A100 memory (was 70% idle)
+learning_rate: 1.414e-4 # Scaled up with sqrt(256/128) = 1.414x for larger batch
 learning_rate_schedule: 'cosine'
 learning_rate_schedule_steps: 5000 # Decay over full training duration
 warmup_steps: 20
@@ -80,16 +80,16 @@ network_eval_files: 'data/probe_rows/test.arrayrecord'
 
 # Data loading parallelism
 # OPTIMIZED: Increased workers to reduce source bottleneck (was 4)
-grain_worker_count: 16 # Parallel ArrayRecord reads (increased for B200)
-grain_per_worker_buffer_size: 8 # Larger buffer for better throughput
+grain_worker_count: 16 # Parallel ArrayRecord reads (CPU-bound with 8 cores on Modal)
+grain_per_worker_buffer_size: 16 # OPTIMIZED: Increased from 8 for better prefetch
 grain_worker_count_eval: 8 # Same for eval
-grain_per_worker_buffer_size_eval: 8
-grain_ram_budget_mb: 16384 # 16GB RAM budget for mp_prefetch auto-tuning
+grain_per_worker_buffer_size_eval: 16 # OPTIMIZED: Increased from 8
+grain_ram_budget_mb: 32768 # OPTIMIZED: Increased from 16GB to 32GB (if available on Modal)
 
 # Grain debugging (optional - enable for performance analysis)
-# Uncomment to enable:
+# Uncomment to enable if you suspect data loading bottlenecks:
 # grain_debug_mode: true # Log execution metrics every 60s (identifies bottlenecks)
-# grain_visualization_dir: "/tmp/grain_viz"  # Generate pipeline visualization graph
+# grain_visualization_dir: "/mnt/grain_viz"  # Generate pipeline visualization graph
 
 # Attention & Positional Encoding
 attention: 'flash' # JAX Pallas FlashAttention (supports packing, ~10-20% slower than cudnn_flash_te)

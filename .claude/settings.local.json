@@ -65,7 +65,10 @@
       "Bash(mkdir:*)",
       "Bash(tree:*)",
       "Bash(modal run:*)",
-      "Bash(modal volume get:*)"
+      "Bash(modal volume get:*)",
+      "Bash(if [ -d /home/zyansheep/Projects/ping-llm/outputs/latency_network/plan2_* ])",
+      "Bash(then ls -la /home/zyansheep/Projects/ping-llm/outputs/latency_network/plan2_*)",
+      "Bash(fi)"
     ]
   },
   "sandbox": {

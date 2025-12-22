@@ -98,7 +98,7 @@ image = (
     .add_local_dir(".", WORKDIR, ignore=IGNORE_PATTERNS, copy=True)
     # CACHE BUST: Force rebuild by running a unique command
     .run_commands(
-        "echo 'Cache bust: 2025-12-20-09 - Reduce eval overhead (100 steps, 5 eval)'"
+        "echo 'Cache bust: 2025-12-20-11 - A100 optimizations: 2x batch + compatible XLA flags'"
     )
 )
 
@@ -118,8 +118,17 @@ shared_vol = modal.Volume.from_name(VOLUME_NAME, create_if_missing=True)
         # Note: scripts/train.py also configures Python logging for ABSL/Grain
         "TF_CPP_MIN_LOG_LEVEL": "3",  # Errors only (0=all, 1=info, 2=warning, 3=error)
         "JAX_LOG_COMPILES": "0",  # Disable JAX compilation logs
-        # Suppress XLA C++ warnings (computation_placer, etc)
-        "XLA_FLAGS": "--xla_gpu_force_compilation_parallelism=1 --xla_cpu_multi_thread_eigen=false",
+        # A100 GPU optimizations + warning suppression
+        "XLA_FLAGS": " ".join([
+            "--xla_gpu_force_compilation_parallelism=1",
+            "--xla_cpu_multi_thread_eigen=false",
+            # A100-specific performance optimizations (expected +3-8% MFU):
+            "--xla_gpu_enable_latency_hiding_scheduler=true",  # Overlap compute with data loading
+            "--xla_gpu_triton_gemm_any=true",                  # Use optimized Triton GEMM kernels
+            "--xla_gpu_enable_highest_priority_async_stream=true",  # Prioritize async operations
+            # Profile-guided optimization (learns from runtime, +3-5% MFU after warmup):
+            "--xla_gpu_pgle_profile_file_or_directory_path=/mnt/pgle_profiles",
+        ]),
         # Suppress Python warnings
         "PYTHONWARNINGS": "ignore",
         # Redirect stderr to suppress C++ warnings that bypass TF_CPP_MIN_LOG_LEVEL
@@ -133,7 +142,7 @@ shared_vol = modal.Volume.from_name(VOLUME_NAME, create_if_missing=True)
 def run(
     run_name: str = "full-run",
     steps: int = 5_000,
-    batch_size: int = 128,
+    batch_size: int = 256,  # OPTIMIZED: Increased from 128 to saturate A100 memory
     wandb_project: str = "ping-llm",
 ):
     import signal

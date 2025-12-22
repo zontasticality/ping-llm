@@ -193,6 +193,38 @@ These scripts default to CPU inference (for laptop use). If you have a GPU:
 - KL < 0.5 is generally good
 - Compare with/without timestamp to see if temporal info helps
 
+## Paper Metrics Plots
+
+Use the two-step workflow below to generate PNG figures for:
+- Timestamp vs no-timestamp log-probability histograms
+- Prediction-mode accuracy bars (per-token accuracy)
+- Live ping distribution matches with KL labels
+
+By default it uses the latest param-only checkpoint from `outputs/latency_network/param_only_checkpoint`.
+
+Step 1: collect metrics (no plots). Defaults to `outputs/paper_metrics/default` and overwrites existing JSONs.
+```bash
+python scripts/eval_paper_metrics.py \
+    --timestamp-contexts 200 \
+    --mode-samples 200 \
+    --pings-per-ip 20 \
+    --model-samples 100
+```
+Metrics JSONs are saved under `outputs/paper_metrics/default/metrics/`.
+
+Step 2: render plots from metrics
+```bash
+python scripts/eval_paper_metrics_plot.py \
+    --run-dir outputs/paper_metrics/default
+```
+
+One-shot helper (Modal → local → plot):
+```bash
+./modal_measure_and_local_plot.sh
+# or pass extra Modal args after --
+./modal_measure_and_local_plot.sh -- --only ping
+```
+
 ## Troubleshooting
 
 **"Permission denied" for pings:**
@@ -200,7 +232,7 @@ These scripts default to CPU inference (for laptop use). If you have a GPU:
 - If it fails, check network connectivity
 
 **"Checkpoint not found":**
-- Verify the checkpoint path exists
+- Verify the param-only checkpoint exists in `outputs/latency_network/param_only_checkpoint`
 - Check Modal volume contents: `modal volume ls ping-llm outputs/latency_network/`
 
 **Out of memory:**
@@ -215,6 +247,6 @@ These scripts default to CPU inference (for laptop use). If you have a GPU:
 
 After running these evaluations, you can:
 1. Compare different checkpoint steps to see training progress
-2. Test on specific IP ranges (edit `generate_random_ipv4()`)
+2. Swap the ping targets with `--regular-ips` and `--anchor-ips`
 3. Analyze which field orderings work best for your use case
 4. Export results for visualization (scripts print to stdout, pipe to file)
