@@ -2,20 +2,20 @@
 
 == Motivation & Introduction
 
-In order to create an internet more controlled by users than by corporations, we need to enable services to be able to run directly on end-user devices in a peer-to-peer network. Core to this problem is the issue of figuring out how to find nodes in _topologically ideal_ places, for example in anonymous routing where you want to route through an intermediary on the way to your destination, or for data storage, where you want your data to be stored close to the most likely users. These are fundamentally optimization problems that require being able to predict network properties between arbitrary nodes in a network in order to optimize node selection.
+In order to create an internet more controlled by users than by corporations, we need to enable services to run directly on end-user devices in a peer-to-peer network. Core to this problem is the issue of finding nodes in _topologically ideal_ places, meaning selections that optimize latency, reliability, bandwidth, anonymity, or storage locality. These are fundamentally optimization problems that require predicting network properties between arbitrary nodes in a network in order to optimize node selection.
 
-Much research has been done in this area over the years, but as of the author's knowledge, no one has trained a very large transformer model to learn a very general prediction algorithm that can not only predict latency between two nodes, but also predict a wide variety of other topological features for a variety of applications, including being able to condition on timestamp. This independent study investigates training a transformer directly on latency measurements in order to learn a variety of potentially useful prediction modes for node selection, in addition to reviewing the literature on how such a transformer could be trained in a decentralized fashion.
+Much research has been done in this area over the years, but as of the author's knowledge, no one has trained a medium-sized transformer model to learn a general prediction algorithm that can not only predict latency between two nodes, but also predict other topological features for a variety of applications, including conditioning on timestamp. This independent study investigates training a transformer directly on latency measurements in order to learn a variety of potentially useful prediction modes for node selection, in addition to reviewing the literature on how such a transformer could be trained in a decentralized fashion.
 
 == Proposed Objectives
 
 The objective of this independent study is to work towards creating a system with _all_ of the following properties:
 
-1. Ability to take into account time when predicting link properties.
-2. Ability to predict link properties even without a connection to the network.
-3. Ability to cheaply calibrate the predictive model with additional local measurements.
-4. Ability to detect and resist significant node failures or malicious behavior (e.g. data poisoning).
-5. Ability for nodes to limit training data discovery. (i.e. inspecting the model to figure out exactly who is communicating frequently with whom)
-6. Ability to scale prediction accuracy based on end-user hardware capabilities.
+1. Ability to take into account time when predicting link properties (e.g. diurnal patterns and outages).
+2. Ability to predict link properties even without a connection to the network (offline, cold-start inference).
+3. Ability to cheaply calibrate the predictive model with additional local measurements (few-shot adaptation).
+4. Ability to detect and resist significant node failures or malicious behavior (e.g. poisoning, Sybil, Byzantine).
+5. Ability for nodes to limit training data discovery (membership or relationship inference from weights or outputs).
+6. Ability to scale prediction accuracy based on end-user hardware capabilities (distilled tiers, adaptive context/compute).
 
 A transformer model trained on heterogeneous measurement sequences and in-context learning could potentially satisfy properties 1-3. It is unclear how properties 4-6 could be easily satisfied, however. Thus the goal of this independent study is to train a transformer to address goals 1-3 and then do a literature review to map out how properties 4-6 could be achieved.
 
@@ -29,15 +29,16 @@ Architecturally, the target model is a medium-sized network (on the order of 80-
 
 - An embedding dimension of approximately 640 and a vocabulary size of 267 (11 role tokens + 256 byte tokens) shared between input and output embeddings.
 - 20 transformer decoder layers with multi-head self-attention (around 10 heads of width 64) and MLP blocks of width roughly 2048 (a ~3.2x expansion over the embedding size).
+- Rotary positional embeddings (RoPE), using MaxText defaults.
 - A context window of 1024 tokens, which corresponds to roughly 25-60 measurements depending on IPv4/IPv6 mix and timestamp encoding under the tokenization scheme described below.
 
 This design intentionally favors depth over width and uses a smaller-than-usual MLP ratio so that the model learns general routing and topology rules instead of memorizing individual (src, dst, time) triples.
 
 === Data
 
-The data to be trained on is roughly 200M measurements directly downloaded and parsed from the RIPE Atlas project's 'daily dumps' page split 90/10 into train/test sets. This 200M measurement dataset is a random sample drawn from a much larger raw corpus (35 billion measurements comprising all data from ~1 month of RIPE Atlas operations). @ripe_atlas_daily_dumps
+The data to be trained on is roughly 200M measurements directly downloaded and parsed from the RIPE Atlas project's 'daily dumps' page split 90/10 into train/test sets. This 200M measurement dataset is a random sample drawn from a much larger raw corpus (35 billions measurements comprising roughly a month of RIPE Atlas operations). @ripe_atlas_daily_dumps
 
-The RIPE Atlas is a project that contains tens of thousands of 'anchor' nodes running on high-capacity networks that regularly ping each other as well as satisfy requests to ping other locations on the internet, acting as a public tool for internet testing and measurement.
+The RIPE Atlas is a project that contains tens of thousands of probes and a smaller set of anchors. Probes run measurements (including pings) to other probes, anchors, and user-specified targets, while anchors are a well-provisioned subset of probes intended as stable reference endpoints for measurement campaigns.
 
 For this project, the raw JSON data is preprocessed into a Parquet snapshot. Only the following fields are actually used:
 
@@ -46,13 +47,13 @@ event_time: timestamp      # Event timestamp (unix epoch seconds)
 src_addr: string           # Source IP address (IPv4 or IPv6)
 dst_addr: string           # Destination IP address
 ip_version: int64          # 4 or 6
-rtt: double                # Round-trip time in milliseconds (-1.0 = failed probe)
+rtt: double                # Round-trip time in milliseconds (-1.0 = failed/filtered probe in preprocessing)
 ```
 
 The resulting dataset has the following characteristics (for the current snapshot):
 
-- Approximately 200M measurements (~2.1 GB) sampled at random from about a month of measurement data (~1TB).
-- Date range on the order of late June to late July 2025, so the model sees both short-term and medium-term temporal variation.
+- Approximately 200M measurements (~2.1 GB on disk) sampled at random from about a month of measurement data (~1TB).
+- Date range on the order of late June to late July (snapshot-specific), so the model sees both short-term and medium-term temporal variation.
 - Mixed IPv4/IPv6 coverage with a roughly 60%/40% split between IPv4 and IPv6 rows.
 
 === Tokenization
@@ -141,13 +142,13 @@ The token language is defined as follows:
 In the implementation, this grammar is realized as a compact 267-token vocabulary:
 
 - 11 role tokens that mark measurement structure (`<MeasurementStart>`, IP family and direction, timestamp/RTT markers, and failure/throughput markers).
-- 256 byte tokens (`<Byte0>`–`<Byte255>`) used to encode all numeric values as big-endian byte sequences.
+- 256 byte tokens (`<Byte0>`-`<Byte255>`) used to encode all numeric values as big-endian byte sequences.
 
-Each measurement is serialized as `<MeasurementStart>` followed by three or four field blocks (source IP, destination IP, RTT or failure indicator, and optionally a timestamp). During training, these field blocks are shuffled per measurement so the model is forced to learn the full joint distribution over fields rather than relying on a fixed field order.
+Each measurement is serialized as `<MeasurementStart>` followed by three or four field blocks (source IP, destination IP, RTT or failure indicator, and optionally a timestamp). During training, these field blocks are shuffled per measurement so the model is forced to learn the full joint distribution over fields rather than relying on a fixed field order. The `<ThroughputStart>` marker is reserved for future measurement types; the current dataset uses RTT or `<Failed>` only.
 
 Under this scheme, a typical IPv4 measurement with a timestamp uses about 16-23 tokens depending on whether the timestamp can be encoded as a 1-byte delta from the previous timestamp; IPv6 measurements are longer but follow the same pattern. Compared to the earlier, more verbose tokenization, this reduces sequence length by roughly a factor of 2-3, allowing a 1024-token context window to cover many more measurements and enabling stronger in-context "network localization" from recent observations.
 
-The RTT value is encoded as a 2-byte exponent/mantissa in microseconds (5-bit exponent, 11-bit mantissa), giving a wide dynamic range with ~0.05% relative precision. Timestamps are delta-encoded in seconds: the first measurement uses an absolute 64-bit timestamp, then deltas use 1 byte for gaps under 256 seconds and 4 bytes otherwise. All numeric values are stored as big-endian bytes.
+The RTT value is encoded as an unsigned 2-byte exponent/mantissa in microseconds (5-bit exponent, 11-bit mantissa), giving a wide dynamic range with sub-percent relative precision for typical RTT values. RTTs are converted from milliseconds to microseconds during tokenization to preserve resolution. Timestamps are delta-encoded in seconds: the first measurement uses an absolute 64-bit timestamp, then deltas use 1 byte for gaps under 256 seconds and 4 bytes otherwise (unsigned). All numeric values are stored as big-endian bytes.
 
 === Rationale
 
@@ -167,13 +168,17 @@ All the above prediction modes can be achieved by varying which fields are prese
 
 ==== Privacy Concerns
 
-Because the model is trained on real-world network measurements, there is a risk of memorizing rare or sensitive traffic patterns. The architectural choices above (medium model size, smaller MLP ratio, and emphasis on learning aggregate routing structure) are partly motivated by a desire to generalize rather than memorize individual flows, but a more thorough privacy analysis is left to the second half of this paper discussing the space of decentralized training algorithms.
+Because the model is trained on real-world network measurements, there is a risk of memorizing rare or sensitive traffic patterns. The architectural choices above (medium model size, smaller MLP ratio, and emphasis on learning aggregate routing structure) are partly motivated by a desire to generalize rather than memorize individual flows, but a more thorough privacy analysis (including membership inference and extraction risks) is left to the second half of this paper discussing the space of decentralized training algorithms.
+
+=== Related Work (Brief)
+
+Latency prediction and topology learning have a long history in network coordinate systems (embedding nodes into low-dimensional spaces), matrix completion or low-rank approaches for RTT estimation, and more recent ML models that incorporate ASN/geo features or graph structure. This work differs by training an autoregressive transformer directly on measurement sequences, enabling multi-field conditional predictions (latency, timestamp, failure likelihood) from a single model.
 
 === Size & Training
 
 The model is in the 100M parameter range, which should ideally be large enough to capture rich IP and routing structure but small enough to be trainable on a single modern accelerator.
 
-Training is formulated as standard next-token prediction over tokenized measurement sequences with a context length of 1024. Tokenization is done at runtime using a loader built on Google's `grain` library. The dataset is pre-grouped by source IP into probe-centric rows, and each row is sampled into windows (window size drawn from a log-uniform distribution) so the model sees both short- and long-range temporal patterns.
+Training is formulated as standard next-token prediction over tokenized measurement sequences with a context length of 1024. Tokenization is done at runtime using a loader built on Google's `grain` library. The dataset is pre-grouped by source IP into probe-centric rows. Each row is sampled into windows (window size drawn from a log-uniform distribution) so the model sees both short- and long-range temporal patterns.
 
 == Model Architecture
 
@@ -182,6 +187,7 @@ The model is a decoder-only transformer whose primary goal is to learn the joint
 - A relatively deep stack of decoder layers (~20) to support multi-step reasoning tasks such as "RTT -> IP search" and hierarchical IP structure learning (from coarse prefixes down to specific subnets).
 - A moderate embedding size (~640) with standard 64-dimensional attention heads to keep the model expressive without oversizing the representation for a 267-token vocabulary.
 - A smaller MLP expansion ratio (~3.2x) than is typical in general-purpose language models, which reduces pure memorization capacity and encourages the network to represent reusable routing and geography patterns.
+- Rotary positional embeddings (RoPE), matching the MaxText configuration used for training.
 - A context window of 1024 tokens so the model can condition on tens of recent measurements from the same vantage point and thereby infer location, connection type (residential vs datacenter), and other latent properties via in-context learning.
 
 These are mostly arbitrary choices based on intuition since I don't have any data as to what degree parameters affect performance on this dataset.
@@ -205,7 +211,7 @@ Training alternates between three timestamp modes (roughly 40/30/30 weighting):
 
 Training uses the AdamW optimizer with a cosine learning rate schedule and a brief warmup period. A representative configuration is:
 
-- Learning rate on the order of `1e-4` with ~20 warmup steps followed by cosine decay.
+- Learning rate on the order of `1e-4` with a brief warmup (e.g., ~20 steps in pilot runs; longer runs will scale warmup with total steps) followed by cosine decay.
 - Per-device batch size 128 with sequence length 1024; sequence packing is enabled when supported to reduce padding waste.
 - Dropout of about 0.1 and weight decay of about 0.01 for regularization.
 - bfloat16 for parameters and activations to match modern accelerator hardware.
@@ -219,7 +225,7 @@ The primary metric during training is token-level cross-entropy on held-out meas
 
 == Evaluation & Metrics
 
-Evaluation focuses on three checks that should intuitively communicate the utility of the transformer approach. This includes a visualization of the hypothesis that including timestamps makes for better predictions, and a comparison of model predictions to real-world sampling from a given probe ID not in the dataset.
+Evaluation focuses on three core checks that should intuitively communicate the utility of the transformer approach. This includes a visualization of the hypothesis that including timestamps makes for better predictions, and a comparison of model predictions to real-world sampling from a held-out source IP not seen in training. Additional baselines, metrics, and robustness tests are part of the evaluation plan and ongoing work.
 
 *Timestamp vs no-timestamp RTT likelihood:* compare the log-probability of the correct RTT tokens with and without timestamp context. This is meaningful because it isolates whether temporal information actually sharpens the RTT distribution without changing the IP conditioning.
 
@@ -244,12 +250,19 @@ Evaluation focuses on three checks that should intuitively communicate the utili
 
 These figures are paired with token-level cross-entropy and perplexity on a held-out split from the same time window. Generalization is probed by holding out regions/ASNs, later time windows, and unseen IP pairs. Because latency has intrinsic jitter, the evaluation emphasizes distributional fit and calibration over point estimates.
 
+Potential additional evaluation ideas:
+- Compare against simple, established methods (nearest neighbor using IP prefix, autonomous system, or geography; basic regression; and classic network coordinate systems) to show whether the transformer adds value.
+- Report error size in everyday terms (average absolute error, root-mean-square error, and percentile errors), and also check whether predicted distributions are well calibrated rather than just sharp.
+- Treat failed probes as rare-event prediction and report how often the model misses failures vs raises false alarms (precision, recall, and summary scores for receiver operating characteristic and precision-recall curves).
+- Report results separately for IPv4 vs IPv6 and for cold-start (no recent context) vs in-context use, so it is clear where the model helps.
+- Run controlled ablations that change one design choice at a time (timestamp handling, field order randomization, context length, model size, numeric precision) to see what actually matters.
+
 == Implementation Appendix
 
 This appendix summarizes the concrete training pipeline so the reader can map the conceptual model to the actual data flow.
 
 #figure(
-  caption: [PLAN_3 pipeline overview (probe-centric rows and runtime tokenization).],
+  caption: [Pipeline overview (probe-centric rows and runtime tokenization).],
   raw(
     block: true,
     "Raw measurements\n  -> group by source, sort by time, cap rows (~8 MB)\n  -> ArrayRecord rows + metadata\n  -> K contexts per row (K = min(ceil(n/30), 16))\n  -> sample windows (log-uniform) + timestamp modes (full/partial/none)\n  -> tokenization (role + byte tokens; RTT exponent/mantissa; timestamp deltas)\n  -> pad/pack to 1024-token crops",
@@ -260,15 +273,16 @@ A few implementation details worth noting:
 - Measurements are always sorted by time before delta encoding, even when partial or no-timestamp modes are applied.
 - Randomized field order plus timestamp masking induces many conditional prediction tasks without changing the underlying data.
 - The same row yields multiple contexts per epoch, providing strong data augmentation without duplicating stored measurements.
+- Source IP is used as a proxy for probe identity; probe IDs are intentionally excluded because they are dataset-specific and not part of the model inputs.
 
 = Reflections on Decentralized Learning
 
 Truly decentralized learning, where a model is updated locally and gradients are shared, often with differential privacy applied to the gradients or various other techniques to avoid leaking too much about private training data to the rest of the network, is a very active area of research. The design space is vast, with variations on how nodes connect, how updates are exchanged, how data is made private (differential privacy, multi-party computation) among many other dimensions.
 
-Looking at existing research, no solution that I can see so far solves _all_ the following requirements that would be required for this to be practical in a ungoverned peer-to-peer network. Most of them don't fully solve just the categories they are in either.
+Looking at existing research, no solution that I can see so far solves _all_ the following requirements that would be required for this to be practical in a ungoverned peer-to-peer network. Most of them don't fully solve just the categories they are in either. The list below is illustrative rather than exhaustive.
 
-1. Resilience to sybil attacks
-  - None found
+1. Resilience to Sybil attacks
+  - No clear solutions identified in this review
 
 2. Capable of keeping information that needs to be private, or at least providing a reasonable tradeoff between privacy and performance.
   - P4: Towards private, personalized, and Peer-to-Peer learning @maheri2024p4
@@ -283,8 +297,8 @@ Looking at existing research, no solution that I can see so far solves _all_ the
   - Byzantine-Robust Decentralized Federated Learning (BALANCE) @fang2024balance
   - GRANITE: a Byzantine-Resilient Dynamic Gossip Learning Framework @belal2025granite
 
-4. Can deal with free-loaders / is well-incentivized.
-  - None found
+4. Can deal with free riders / is well-incentivized.
+  - No clear solutions identified in this review
 
 5. Capable of scaling model size to node capabilities.
   - P4: Towards private, personalized, and Peer-to-Peer learning @maheri2024p4
@@ -295,22 +309,22 @@ Looking at existing research, no solution that I can see so far solves _all_ the
 
 How in such a dynamic system like the internet is a static protocol supposed to deal with all the ways adversaries can possibly disrupt or measure a network? Not only for the purposes of figuring out if your connection is sufficiently obfuscated, but even for modeling the internet itself, or incentivizing nodes to cooperate with each other, the sheer amount of complexity and things that could go wrong / be exploited seems insurmountable.
 
-However, we already have a system of decentralized independently-learning and cooperating nodes that can incentivize each other and form protocols in various fashions: Human Society! The question then is, is it possible to program AIs to manage a given node's connections based on the owner's preferences in such a way as to take into account potential adversarial scenarios?
-
 == Thought Experiment: Privacy-Preserving Decentralized Network Design Powered by a Universal Optimizer
 
-One idea I've been thinking about for some time is recursively improving AI models. This is probably dangerous, but if you assume you have one, specifically, an AI that can take a formal specification and produce something that satisfies it under resource constraints, it allows a designer to focus on the specification rather than the problem itself. In practice such an AI doesn't exist yet, so you eventually need to think about the implementation as well. However, thinking about the specification often helps one understand what implementations even need to do, and what you might be missing.
+One idea I've been thinking about for some time is recursively improving AI models. This is probably somewhat dangerous, but if you assume you have an AI that can take a formal specification and produce something that satisfies it under resource constraints, it allows a designer to focus on the specification rather than the problem itself. In practice such an AI doesn't exist yet, but thinking about the specification often helps one understand what implementations even need to do, what the space of implementations looks like, and where an "ideal" implementation might be hiding.
 
-For this thought experiment, we will work from human experience. How do humans build protocols and societies and do collaboration? We have a continually growing knowledge base (science) that allows us to make predictions on what will happen given a certain mechanism / initial conditions for collaboration. It seems like the root problem to solve is _world simulation_. We somehow need to collect large amounts of data, and then be able to create a small program that can reproduce that data as accurately as possible, which then is likely to be a valid program that can simulate counterfactual cases. This paper about LLMs is a perfect example of this world-modeling in action, but if we had a universal optimizer, we could make it more optimal.
+For this thought experiment, we realize that there is already an existing decentralized peer-to-peer network that is self-regulating and incentivizing: human society. How do humans naturally collaborate, specialize, and build complex protocols over time? I suspect the secret is a continually growing knowledge base embedded into our culture (science) that allows us to make increasingly accurate predictions about what will happen given a certain mechanism or initial conditions for collaboration. Can this be replicated in decentralized networks?
 
-The key to creating this simulator is to require it to have enough structure to be able to swap our the internal code running on each node, but not too much to where you are unnecessarily over-specifying the simulator. I imagine this would look something like a base data structure defining a way for programs associated on nodes in a graph to discrete-time talk to each other, i.e. describing the baseline of UDP/TCP graph where two programs on two different nodes can dial each other. You then use the optimizer to find a simulation program that infers this base structure (including the simple program on each node), and tries to match a dataset. Somehow this would have to be made in such a way where you can trade-off speed for simulation accuracy for downstream tasks.
+It feels like the root of the problem here is _world simulation_. We somehow need to collect large amounts of data, and then be able to reproduce that data as accurately as possible with as small a program as we can. If the resulting program is simple and accurate enough, then it seems likely to be a program that can simulate counterfactual cases. This paper about network topology LLMs is an example of this world-modeling in action, but if we had a universal optimizer, we could make it more optimal.
 
-Once you have a good simulator, you can start doing RL to find policies. We don't even need to run the simulator with special algorithms in it directly, we can just use the universal optimizer to say 'find me a program that optimizes some local reward function for a node' (lets say, it allows connections fast). Then you also have an adversarial mode where you use the optimizer to, given the good local rationality program, try to reduce some global utility metric (i.e. via surveillance, free loading, etc.).
+The key to creating this simulator is not just to have it be small and accurate, but also to require it to have enough structure to enable swapping the internal code running on each simulated node. I imagine this would look something like a base data structure defining a way for programs associated with nodes in a graph to talk to each other, i.e. describing the baseline of a UDP/TCP graph where two programs on two different nodes can dial each other. You then use the optimizer to find a simulation program that infers this base structure (including the simple program on each node), while simultaneously being able to simulate various levels of fidelity of this base structure to both match a dataset and to be useful for search. The "multiple levels of fidelity" part is especially interesting and is related to emergence and whether (or to what degree) you can simulate the results of a program on average, and how good of an inference that gives you.
 
-The details are then what the utility metric is. There are some obvious things to optimize for: latency to connect to nodes, speed at which data can be retrieved, likelihood of correlating traffic to source/destination from various attacker vantage points, etc. Assuming you can define a _reasonable_ global utility metric however, (probably much easier than solving the alignment problem), in theory entire protocols should be able to pop out, anything from cryptocurrencies for proper incentivization to onion routing to cryptographic protocols could pop out of this simulation-based optimization process, maybe. I suppose the only way to figure out is to try. For me at least, I'm not sure how much I want to try to make the FOOM machine, but it most definitely is attractive from an applications perspective to be able to skip the decades of research needed to make distributed systems practical and jump strait to the 'best' solution we can find.
+Once you have a good simulator, you can start doing RL to find policies. We do not even need to run the simulator with special algorithms in it directly; we can just use the universal optimizer to say "find me a protocol that optimizes the collective utility among many nodes running that protocol." In theory, this should re-invent simple fully trusted protocols like unencrypted communication or Paxos. Then, to make it resilient, you use the universal optimizer again to optimize a different utility function related to exploitation, denial of service, and surveillance, among other things. Then use the optimizer to do a joint mutual-improvement loop, where the protocol designer is optimized with respect to the adversary, which is optimized with respect to the protocol design.
+
+This may work somewhat in theory, but the devil is in the details, specifically what exactly the local utility metric is defined as. There are some obvious things to optimize for: latency to connect to nodes, speed at which data can be retrieved, likelihood of correlating traffic to source/destination from various attacker vantage points, etc. Assuming you can define a _reasonable_ utility metric (like an easier version of the alignment problem), the entire protocol might be able to pop out anything from cryptocurrencies for proper incentivization to onion routing to cryptographic protocols. I suppose the only way to figure out is to try. For me at least, I'm not sure how much I want to try to make the FOOM machine, but it is definitely attractive from an applications perspective to be able to skip the decades of research needed to make distributed systems practical and jump straight to the "best" solution AI can find.
 
 = Conclusion
 
-Ping-LLM was a fun project. The hardest part was getting the data and actually getting started trying to run and iterate on an LLM. It was helpful to switch to a cloud provider like modal as the Unity cluster is a little clunky to use. (I did wrack up at least 40\$ in compute costs though). From this pilot project I think overall the idea of using a transformer network to predict network properties seems solid. I may want to make a few more evaluations though. The next step is to scale up, train for longer and on more diverse data (the whole RIPE Atlas is on the table, as well as any bandwidth datasets I can get my hands on). I think it may also be possible to scale up to 1B parameters, who knows. Overall, this feels like a promising research direction and I will definitely continue down this path in the future. Future research will focus on scaling this approach to larger models and better datasets, as well as actually testing out training in an distributed, adversarial, and privacy-preserving environment.
+Ping-LLM was a fun project. The hardest part was getting the data and actually getting started trying to run and iterate on an LLM. It was helpful to switch to a cloud provider like Modal as the Unity cluster is a little clunky to use. (I did rack up at least 40\$ in compute costs, though.) From this pilot project I think overall the idea of using a transformer network to predict network properties seems solid. I want to run a few more evaluations. The next step is to scale up, train for longer and on more diverse data (the whole RIPE Atlas is on the table, as well as any bandwidth datasets I can get my hands on). I think it may also be possible to scale up to 1B parameters. Overall, this feels like a promising research direction and I plan to continue down this path in the future. Future research will focus on scaling this approach to larger models and better datasets, as well as actually testing out training in a distributed, adversarial, and privacy-preserving environment.
 
 #bibliography("bibliography.bib")

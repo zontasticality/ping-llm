@@ -15,6 +15,7 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 from matplotlib.lines import Line2D
+from matplotlib.ticker import MaxNLocator
 
 plt.style.use("seaborn-v0_8")
 
@@ -24,7 +25,7 @@ DEFAULT_RUN_DIR = Path("outputs/paper_metrics/default")
 def parse_only_arg(value):
     items = {item.strip().lower() for item in value.split(",") if item.strip()}
     if "all" in items or not items:
-        return {"timestamps", "modes", "ping"}
+        return {"timestamps", "modes", "ping", "latency_sampling"}
     return items
 
 
@@ -1023,6 +1024,242 @@ def plot_ping(
     return output_paths
 
 
+def collect_latency_samples(target, timeout_ms):
+    samples = target.get("samples", [])
+    entries = []
+    timeout_count = 0
+    base_ms = target.get("target_ms")
+    if base_ms is None:
+        base_ms = timeout_ms
+    for sample in samples:
+        median_rtt = sample.get("median_rtt_ms")
+        if median_rtt is None:
+            median_rtt = timeout_ms
+        success_count = sample.get("success_count", 0)
+        is_timeout = success_count == 0
+        if is_timeout:
+            timeout_count += 1
+        plot_rtt = float(base_ms) if is_timeout else float(median_rtt)
+        entries.append(
+            {
+                "rtt_ms": plot_rtt,
+                "ip_version": sample.get("ip_version"),
+                "is_timeout": is_timeout,
+            }
+        )
+    return entries, timeout_count, float(base_ms)
+
+
+def plot_latency_sampling_delta_grid(
+    output_path,
+    targets,
+    timeout_ms,
+    grid_rows=2,
+    grid_cols=3,
+):
+    if not targets:
+        return
+    colors = {
+        4: "#4C78A8",
+        6: "#F58518",
+    }
+    timeout_color = "#666666"
+    fig, axes = plt.subplots(
+        grid_rows,
+        grid_cols,
+        figsize=(grid_cols * 4.0, grid_rows * 3.0),
+        squeeze=False,
+    )
+    for idx, target in enumerate(targets):
+        row_idx = idx // grid_cols
+        col_idx = idx % grid_cols
+        ax = axes[row_idx][col_idx]
+        entries, timeout_count, base_ms = collect_latency_samples(target, timeout_ms)
+        if entries:
+            points = [
+                {
+                    "x": i + 1,
+                    **entry,
+                }
+                for i, entry in enumerate(entries)
+            ]
+            ipv4_x = [
+                p["x"]
+                for p in points
+                if not p["is_timeout"] and p.get("ip_version") == 4
+            ]
+            ipv4_y = [
+                p["rtt_ms"]
+                for p in points
+                if not p["is_timeout"] and p.get("ip_version") == 4
+            ]
+            ipv6_x = [
+                p["x"]
+                for p in points
+                if not p["is_timeout"] and p.get("ip_version") == 6
+            ]
+            ipv6_y = [
+                p["rtt_ms"]
+                for p in points
+                if not p["is_timeout"] and p.get("ip_version") == 6
+            ]
+            timeout_x = [p["x"] for p in points if p["is_timeout"]]
+            timeout_y = [p["rtt_ms"] for p in points if p["is_timeout"]]
+            if ipv4_x:
+                ax.scatter(ipv4_x, ipv4_y, color=colors[4], alpha=0.8, s=28)
+            if ipv6_x:
+                ax.scatter(ipv6_x, ipv6_y, color=colors[6], alpha=0.8, s=28)
+            if timeout_x:
+                ax.scatter(
+                    timeout_x,
+                    timeout_y,
+                    color=timeout_color,
+                    marker="x",
+                    s=36,
+                )
+            ax.axhline(base_ms, color="black", linestyle="--", linewidth=1.0)
+            y_vals = [p["rtt_ms"] for p in points] + [base_ms]
+            min_y = min(y_vals)
+            max_y = max(y_vals)
+            spread = max(1.0, max_y - min_y)
+            padding = max(1.0, 0.1 * spread)
+            ax.set_ylim(min_y - padding, max_y + padding)
+            ax.set_xlim(0.5, len(points) + 0.5)
+            if len(points) <= 20:
+                ax.set_xticks(range(1, len(points) + 1))
+            else:
+                ax.xaxis.set_major_locator(MaxNLocator(integer=True))
+        else:
+            ax.text(0.5, 0.5, "no data", ha="center", va="center")
+        label = target.get("label", "")
+        if target.get("is_timeout"):
+            label = f"{label} (baseline {timeout_ms:g}ms)"
+        ax.set_title(f"{label} (n={len(entries)}, timeouts={timeout_count})")
+        ax.set_xlabel("sample index")
+        ax.set_ylabel("median RTT (ms)")
+        ax.grid(True, alpha=0.3)
+
+    for idx in range(len(targets), grid_rows * grid_cols):
+        row_idx = idx // grid_cols
+        col_idx = idx % grid_cols
+        axes[row_idx][col_idx].axis("off")
+
+    legend_handles = [
+        Line2D(
+            [0],
+            [0],
+            marker="o",
+            color="w",
+            label="IPv4",
+            markerfacecolor=colors[4],
+            markersize=6,
+        ),
+        Line2D(
+            [0],
+            [0],
+            marker="o",
+            color="w",
+            label="IPv6",
+            markerfacecolor=colors[6],
+            markersize=6,
+        ),
+        Line2D(
+            [0],
+            [0],
+            marker="x",
+            color=timeout_color,
+            label="timeout (at target)",
+            markersize=6,
+        ),
+    ]
+    fig.legend(handles=legend_handles, loc="upper right")
+    fig.tight_layout()
+    fig.savefig(output_path, dpi=150)
+    plt.close(fig)
+
+
+def normalize_latency_label(label):
+    if label is None:
+        return None
+    return str(label).strip().lower().replace(" ", "")
+
+
+def parse_latency_target_labels(value):
+    if value is None:
+        return []
+    labels = []
+    for raw in value.split(","):
+        item = raw.strip().lower()
+        if not item:
+            continue
+        if item in ("timeout", "time-out", "failed", "fail"):
+            labels.append("timeout")
+            continue
+        if item.endswith("ms"):
+            item = item[:-2].strip()
+        try:
+            ms = float(item)
+        except ValueError:
+            labels.append(normalize_latency_label(item))
+            continue
+        labels.append(f"{ms:g}ms")
+    return labels
+
+
+def order_latency_targets(targets, desired_labels):
+    if not desired_labels:
+        return targets
+    buckets = {}
+    for target in targets:
+        label = normalize_latency_label(target.get("label"))
+        if not label:
+            continue
+        buckets.setdefault(label, []).append(target)
+    ordered = []
+    for desired in desired_labels:
+        label = normalize_latency_label(desired)
+        if not label:
+            continue
+        candidates = buckets.get(label, [])
+        if candidates:
+            ordered.append(candidates.pop(0))
+    return ordered
+
+
+def plot_latency_sampling(
+    metrics,
+    output_dir,
+    grid_rows=2,
+    grid_cols=3,
+    target_labels=None,
+):
+    sampling = metrics.get("latency_sampling", {})
+    params = metrics.get("params", {})
+    timeout_s = params.get("ping_timeout_s", 2)
+    timeout_ms = float(timeout_s) * 1000.0
+    targets = sampling.get("targets", [])
+    desired_labels = parse_latency_target_labels(target_labels) if target_labels else []
+    if desired_labels:
+        targets = order_latency_targets(targets, desired_labels)
+    if not targets:
+        return []
+    per_page = grid_rows * grid_cols
+    pages = [targets[i : i + per_page] for i in range(0, len(targets), per_page)]
+    output_paths = []
+    for idx, chunk in enumerate(pages):
+        suffix = f"_{idx + 1:02d}" if len(pages) > 1 else ""
+        fig_path = output_dir / f"latency_sampling_delta{suffix}.png"
+        plot_latency_sampling_delta_grid(
+            fig_path,
+            chunk,
+            timeout_ms,
+            grid_rows=grid_rows,
+            grid_cols=grid_cols,
+        )
+        output_paths.append(fig_path)
+    return output_paths
+
+
 def build_parser():
     parser = argparse.ArgumentParser(description="Plot paper metrics from JSON files")
     parser.add_argument(
@@ -1043,7 +1280,7 @@ def build_parser():
     parser.add_argument(
         "--only",
         default="all",
-        help="Comma list: timestamps,modes,ping,all",
+        help="Comma list: timestamps,modes,ping,latency_sampling,all",
     )
     parser.add_argument(
         "--timestamp-metrics",
@@ -1059,6 +1296,11 @@ def build_parser():
         "--ping-metrics",
         default=None,
         help="Path to ping_metrics.json",
+    )
+    parser.add_argument(
+        "--latency-sampling-metrics",
+        default=None,
+        help="Path to latency_sampling_metrics.json",
     )
     parser.add_argument(
         "--hist-bins",
@@ -1089,6 +1331,23 @@ def build_parser():
         type=int,
         default=5,
         help="Columns per ping grid page",
+    )
+    parser.add_argument(
+        "--latency-sampling-grid-rows",
+        type=int,
+        default=2,
+        help="Rows per latency sampling delta grid",
+    )
+    parser.add_argument(
+        "--latency-sampling-grid-cols",
+        type=int,
+        default=3,
+        help="Columns per latency sampling delta grid",
+    )
+    parser.add_argument(
+        "--latency-sampling-targets",
+        default="1,10,100,500,1000,timeout",
+        help="Comma list of latency targets to plot (default omits 50ms)",
     )
     return parser
 
@@ -1156,6 +1415,23 @@ def main():
             )
         else:
             print(f"Ping metrics not found: {ping_path}")
+
+    if "latency_sampling" in selected:
+        latency_path = (
+            args.latency_sampling_metrics
+            or metrics_dir / "latency_sampling_metrics.json"
+        )
+        if Path(latency_path).exists():
+            latency_metrics = load_json(latency_path)
+            plot_latency_sampling(
+                latency_metrics,
+                output_dir,
+                grid_rows=args.latency_sampling_grid_rows,
+                grid_cols=args.latency_sampling_grid_cols,
+                target_labels=args.latency_sampling_targets,
+            )
+        else:
+            print(f"Latency sampling metrics not found: {latency_path}")
 
 
 if __name__ == "__main__":

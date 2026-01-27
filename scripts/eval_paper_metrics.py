@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Paper metrics collection:
-- Writes timestamp, mode, and ping metrics JSON files
+- Writes timestamp, mode, ping, and latency-sampling metrics JSON files
 - Use eval_paper_metrics_plot.py to render figures
 """
 
@@ -32,6 +32,7 @@ import sys
 import threading
 import time
 import shutil
+import ipaddress
 from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
@@ -129,6 +130,7 @@ try:
 except ImportError:
     ProbeRowDataSource = None
 from src.MaxText.input_pipeline.network_tokenization import (
+    BYTE_TOKEN_OFFSET,
     DST_IPV4,
     DST_IPV6,
     FAILED,
@@ -146,6 +148,7 @@ from src.MaxText.input_pipeline.network_tokenization import (
     encode_rtt_exponent_mantissa,
     encode_timestamp_delta,
     token_to_byte,
+    VOCAB_SIZE,
 )
 
 DEFAULT_REGULAR_DOMAINS = [
@@ -602,10 +605,14 @@ def ping_host(
     ping_count=None,
     show_output=False,
     log_lock=None,
+    ip_version=4,
 ):
     try:
+        ping_cmd = ["ping", "-c", "1", "-W", str(timeout), ip]
+        if ip_version == 6:
+            ping_cmd.insert(1, "-6")
         result = subprocess.run(
-            ["ping", "-c", "1", "-W", str(timeout), ip],
+            ping_cmd,
             capture_output=True,
             text=True,
             timeout=timeout + 1,
@@ -642,7 +649,7 @@ def ping_host(
         return -1.0
 
 
-def ping_series(label, ip, count, timeout, show_output, log_lock=None):
+def ping_series(label, ip, count, timeout, show_output, log_lock=None, ip_version=4):
     rtts = []
     for idx in range(count):
         rtt = ping_host(
@@ -653,6 +660,7 @@ def ping_series(label, ip, count, timeout, show_output, log_lock=None):
             ping_count=count,
             show_output=show_output,
             log_lock=log_lock,
+            ip_version=ip_version,
         )
         rtts.append(rtt)
     return rtts
@@ -662,6 +670,97 @@ def parse_list(value):
     if not value:
         return []
     return [item.strip() for item in value.split(",") if item.strip()]
+
+
+def parse_latency_targets(value):
+    if not value:
+        return []
+    targets = []
+    for raw in value.split(","):
+        item = raw.strip().lower()
+        if not item:
+            continue
+        if item in ("timeout", "time-out", "failed", "fail"):
+            targets.append({"label": "Timeout", "target_ms": None, "is_timeout": True})
+            continue
+        if item.endswith("ms"):
+            item = item[:-2].strip()
+        try:
+            ms = float(item)
+        except ValueError:
+            continue
+        if ms <= 0:
+            continue
+        targets.append({"label": f"{ms:g}ms", "target_ms": ms, "is_timeout": False})
+    return targets
+
+
+def is_byte_token(token_id):
+    return BYTE_TOKEN_OFFSET <= token_id < VOCAB_SIZE
+
+
+def extract_dst_ip_from_tokens(tokens, ip_version=None):
+    if ip_version == 4:
+        role_tokens = {DST_IPV4}
+    elif ip_version == 6:
+        role_tokens = {DST_IPV6}
+    else:
+        role_tokens = {DST_IPV4, DST_IPV6}
+
+    for idx, token in enumerate(tokens):
+        if token not in role_tokens:
+            continue
+        expected = 4 if token == DST_IPV4 else 16
+        end = idx + 1 + expected
+        if end > len(tokens):
+            continue
+        data = tokens[idx + 1 : end]
+        if not all(is_byte_token(t) for t in data):
+            continue
+        try:
+            byte_vals = [token_to_byte(t) for t in data]
+            ip_obj = ipaddress.ip_address(bytes(byte_vals))
+        except Exception:
+            continue
+        if (token == DST_IPV4 and ip_obj.version != 4) or (
+            token == DST_IPV6 and ip_obj.version != 6
+        ):
+            continue
+        if not ip_obj.is_global:
+            continue
+        return str(ip_obj)
+    return None
+
+
+def choose_ip_version(rng, ipv6_weight, has_ipv6):
+    if not has_ipv6:
+        return 4
+    if rng.random() < ipv6_weight:
+        return 6
+    return 4
+
+
+def create_latency_sampling_context(
+    src_ip,
+    ip_version,
+    target_ms,
+    include_timestamp=True,
+    current_time=None,
+    include_dst_role_token=True,
+):
+    tokens = [MEASUREMENT_START]
+    tokens.extend(encode_ip_merged(src_ip, ip_version, is_src=True))
+    if target_ms is None:
+        tokens.append(FAILED)
+    else:
+        tokens.extend(encode_rtt_exponent_mantissa(target_ms))
+    if include_timestamp:
+        current_time = current_time or datetime.now()
+        tokens.extend(encode_timestamp_delta(current_time, prev_time=None))
+    if include_dst_role_token:
+        tokens.append(DST_IPV6 if ip_version == 6 else DST_IPV4)
+    return tokens
+
 
 def resolve_domains(domains):
     resolved = []
@@ -743,6 +842,17 @@ def get_src_ip():
         return src_ip
     except Exception:
         return "127.0.0.1"
+
+
+def get_src_ipv6():
+    try:
+        sock = socket.socket(socket.AF_INET6, socket.SOCK_DGRAM)
+        sock.connect(("2001:4860:4860::8888", 80))
+        src_ip = sock.getsockname()[0]
+        sock.close()
+        return src_ip
+    except Exception:
+        return None
 
 
 def create_conditioning_tokens(src_ip, dst_ip, include_timestamp=False):
@@ -848,6 +958,156 @@ def sample_rtt_from_model(
                     engine.release_pages(slot=slot)
 
     return rtt_samples, timeout_count, invalid_count
+
+
+def sample_tokens_from_model(
+    engine,
+    params,
+    config,
+    sequences,
+    max_new_tokens,
+    temperature=1.0,
+    sampling_strategy="weighted",
+    rng=None,
+):
+    if rng is None:
+        rng = jax.random.PRNGKey(int(time.time() * 1000) % 2**31)
+    if max_new_tokens < 1:
+        return [[] for _ in sequences], rng
+
+    completions = [[] for _ in sequences]
+    max_slots = engine.max_concurrent_decodes
+
+    for start in range(0, len(sequences), max_slots):
+        batch = sequences[start : start + max_slots]
+        batch_size = len(batch)
+        rng, rng_state = jax.random.split(rng)
+        decode_state = engine.init_decode_state(rng=rng_state)
+
+        first_tokens = []
+        for slot, seq in enumerate(batch):
+            padded, true_length = pad_tokens(seq, config.max_prefill_predict_length)
+            rng, rng_prefill = jax.random.split(rng)
+            prefix, first = engine.prefill(
+                params=params,
+                padded_tokens=jnp.array(padded),
+                true_length=true_length,
+                rng=rng_prefill,
+                slot=slot,
+                temperature=temperature,
+                algorithm=sampling_strategy,
+            )
+            decode_state = engine.insert(
+                prefix=prefix, decode_state=decode_state, slot=slot
+            )
+            first_tokens.append(extract_token(first, slot=0))
+
+        for slot, token in enumerate(first_tokens):
+            completions[start + slot].append(int(token))
+
+        for _ in range(max_new_tokens - 1):
+            rng, rng_gen = jax.random.split(rng)
+            decode_state, result_tokens = engine.generate(
+                params=params,
+                decode_state=decode_state,
+                rng=rng_gen,
+                temperature=temperature,
+                algorithm=sampling_strategy,
+            )
+            tokens = np.asarray(result_tokens.data)[:, result_tokens.tokens_idx[0]]
+            for slot in range(batch_size):
+                completions[start + slot].append(int(tokens[slot]))
+
+        if (
+            getattr(engine, "page_manager", None) is not None
+            and getattr(engine.config, "attention", None) == "paged"
+        ):
+            for slot in range(batch_size):
+                engine.release_pages(slot=slot)
+
+    return completions, rng
+
+
+def sample_destination_ips_for_target(
+    engine,
+    params,
+    config,
+    rng,
+    jax_rng,
+    src_ipv4,
+    src_ipv6,
+    target_ms,
+    samples_per_target,
+    max_attempts,
+    max_new_tokens,
+    temperature,
+    sampling_strategy,
+    ipv6_weight,
+    include_timestamp=True,
+    current_time=None,
+):
+    samples = []
+    seen = set()
+    invalid = 0
+    duplicate = 0
+    attempts = 0
+    has_ipv6 = src_ipv6 is not None
+    current_time = current_time or datetime.now()
+
+    while len(samples) < samples_per_target and attempts < max_attempts:
+        remaining_attempts = max_attempts - attempts
+        batch_size = min(engine.max_concurrent_decodes, remaining_attempts)
+        sequences = []
+        desired_versions = []
+        for _ in range(batch_size):
+            ip_version = choose_ip_version(rng, ipv6_weight, has_ipv6)
+            src_ip = src_ipv6 if ip_version == 6 else src_ipv4
+            context = create_latency_sampling_context(
+                src_ip,
+                ip_version,
+                target_ms,
+                include_timestamp=include_timestamp,
+                current_time=current_time,
+            )
+            sequences.append(context)
+            desired_versions.append(ip_version)
+
+        completions, jax_rng = sample_tokens_from_model(
+            engine,
+            params,
+            config,
+            sequences,
+            max_new_tokens,
+            temperature=temperature,
+            sampling_strategy=sampling_strategy,
+            rng=jax_rng,
+        )
+
+        for completion, ip_version in zip(completions, desired_versions):
+            role_token = DST_IPV6 if ip_version == 6 else DST_IPV4
+            ip_str = extract_dst_ip_from_tokens(
+                [role_token] + completion, ip_version=ip_version
+            )
+            if ip_str is None:
+                invalid += 1
+                continue
+            key = (ip_version, ip_str)
+            if key in seen:
+                duplicate += 1
+                continue
+            seen.add(key)
+            samples.append({"dst_ip": ip_str, "ip_version": ip_version})
+            if len(samples) >= samples_per_target:
+                break
+
+        attempts += batch_size
+
+    meta = {
+        "attempted": attempts,
+        "invalid": invalid,
+        "duplicate": duplicate,
+    }
+    return samples, meta, jax_rng
 
 
 def compute_rtt_range(real_vals, model_vals, max_rtt):
@@ -1075,7 +1335,7 @@ def plot_ping_grid(
 def parse_only_arg(value):
     items = {item.strip().lower() for item in value.split(",") if item.strip()}
     if "all" in items or not items:
-        return {"timestamps", "modes", "ping"}
+        return {"timestamps", "modes", "ping", "latency_sampling"}
     return items
 
 
@@ -1101,7 +1361,7 @@ def build_parser():
     parser.add_argument(
         "--only",
         default="all",
-        help="Comma list: timestamps,modes,ping,all",
+        help="Comma list: timestamps,modes,ping,latency_sampling,all",
     )
 
     parser.add_argument(
@@ -1196,17 +1456,53 @@ def build_parser():
         "--temperature",
         type=float,
         default=1.0,
-        help="Sampling temperature for ping evaluation",
+        help="Sampling temperature for ping and latency sampling",
     )
     parser.add_argument(
         "--ping-sampling-strategy",
         default="weighted",
-        help="Sampling strategy for ping evaluation (e.g., weighted, greedy, nucleus)",
+        help="Sampling strategy for ping and latency sampling (e.g., weighted, greedy, nucleus)",
     )
     parser.add_argument(
         "--ping-no-timestamp",
         action="store_true",
         help="Disable timestamp conditioning for ping evaluation",
+    )
+
+    parser.add_argument(
+        "--latency-targets",
+        default="1,10,50,100,500,1000,timeout",
+        help="Comma-separated target RTTs in ms plus 'timeout'",
+    )
+    parser.add_argument(
+        "--latency-samples-per-target",
+        type=int,
+        default=15,
+        help="Destination IP samples per target bucket",
+    )
+    parser.add_argument(
+        "--latency-sample-max-attempts",
+        type=int,
+        default=200,
+        help="Max model sampling attempts per target bucket",
+    )
+    parser.add_argument(
+        "--latency-sample-max-new-tokens",
+        type=int,
+        default=24,
+        help="Max new tokens when sampling destination IP blocks",
+    )
+    parser.add_argument(
+        "--latency-ipv6-weight",
+        type=float,
+        default=0.5,
+        help="Probability of sampling IPv6 when available",
+    )
+    parser.add_argument(
+        "--latency-ping-timeout",
+        type=int,
+        default=2,
+        help="Ping timeout (seconds) for latency sampling",
     )
 
     return parser
@@ -1242,6 +1538,10 @@ def run(args):
     max_prefill_len = 1
 
     rtt_pairs = []
+    latency_targets = []
+    latency_src_ipv4 = None
+    latency_src_ipv6 = None
+    latency_context_time = None
     if "timestamps" in selected:
         parquet_path = Path(args.timestamp_parquet)
         if not parquet_path.exists():
@@ -1299,7 +1599,41 @@ def run(args):
             )
             max_prefill_len = max(max_prefill_len, len(cond_tokens))
 
-    max_target_len = max_prefill_len + 3
+    if "latency_sampling" in selected:
+        latency_targets = parse_latency_targets(args.latency_targets)
+        if not latency_targets:
+            print("No latency targets parsed; skipping latency_sampling.")
+            selected.discard("latency_sampling")
+        else:
+            latency_src_ipv4 = get_src_ip()
+            latency_src_ipv6 = get_src_ipv6()
+            latency_context_time = datetime.now()
+            sample_target = next(
+                (t for t in latency_targets if not t["is_timeout"]), latency_targets[0]
+            )
+            sample_ms = sample_target["target_ms"]
+            sample_ctx = create_latency_sampling_context(
+                latency_src_ipv4,
+                4,
+                sample_ms,
+                include_timestamp=True,
+                current_time=latency_context_time,
+            )
+            max_prefill_len = max(max_prefill_len, len(sample_ctx))
+            if latency_src_ipv6:
+                sample_ctx6 = create_latency_sampling_context(
+                    latency_src_ipv6,
+                    6,
+                    sample_ms,
+                    include_timestamp=True,
+                    current_time=latency_context_time,
+                )
+                max_prefill_len = max(max_prefill_len, len(sample_ctx6))
+
+    max_extra_tokens = 3
+    if "latency_sampling" in selected:
+        max_extra_tokens = max(max_extra_tokens, args.latency_sample_max_new_tokens)
+    max_target_len = max_prefill_len + max_extra_tokens
     use_gpu = IN_MODAL_RUNTIME or os.environ.get("JAX_PLATFORMS") == "gpu"
 
     if not selected:
@@ -1635,6 +1969,186 @@ def run(args):
             if not math.isnan(avg_kl):
                 print(f"Average KL divergence: {avg_kl:.4f}")
 
+        if "latency_sampling" in selected:
+            print("Running latency-conditioned destination sampling...")
+            latency_sampling_strategy = args.ping_sampling_strategy.lower()
+            latency_ping_timeout_s = args.latency_ping_timeout
+            latency_ping_timeout_ms = float(latency_ping_timeout_s) * 1000.0
+            latency_src_ipv4 = latency_src_ipv4 or get_src_ip()
+            latency_src_ipv6 = latency_src_ipv6 or get_src_ipv6()
+            latency_context_time = latency_context_time or datetime.now()
+            print(f"Source IPv4: {latency_src_ipv4}")
+            if latency_src_ipv6:
+                print(f"Source IPv6: {latency_src_ipv6}")
+            else:
+                print("Source IPv6: unavailable (sampling IPv4 only)")
+
+            latency_results = []
+            ping_lock = threading.Lock()
+
+            for target in latency_targets:
+                label = target["label"]
+                target_ms = target["target_ms"]
+                is_timeout = target["is_timeout"]
+                print(f"Sampling destinations for target {label}...")
+
+                samples, sample_meta, jax_rng = sample_destination_ips_for_target(
+                    engine,
+                    params,
+                    config,
+                    rng,
+                    jax_rng,
+                    latency_src_ipv4,
+                    latency_src_ipv6,
+                    target_ms,
+                    args.latency_samples_per_target,
+                    args.latency_sample_max_attempts,
+                    args.latency_sample_max_new_tokens,
+                    args.temperature,
+                    latency_sampling_strategy,
+                    args.latency_ipv6_weight,
+                    include_timestamp=True,
+                    current_time=latency_context_time,
+                )
+
+                if not samples:
+                    print(f"{label}: no valid destination samples")
+
+                sample_rtts = [None] * len(samples)
+                if samples and args.ping_workers > 1:
+                    print(f"{label}: pinging samples in parallel (workers={args.ping_workers})")
+                    with ThreadPoolExecutor(max_workers=args.ping_workers) as executor:
+                        future_map = {}
+                        for idx, sample in enumerate(samples):
+                            dst_ip = sample["dst_ip"]
+                            ip_version = sample["ip_version"]
+                            ping_label = f"{label} {idx + 1}/{len(samples)}"
+                            future = executor.submit(
+                                ping_series,
+                                ping_label,
+                                dst_ip,
+                                args.pings_per_ip,
+                                latency_ping_timeout_s,
+                                False,
+                                ping_lock,
+                                ip_version,
+                            )
+                            future_map[future] = idx
+                        for future in as_completed(future_map):
+                            idx = future_map[future]
+                            sample_rtts[idx] = future.result()
+                else:
+                    for idx, sample in enumerate(samples):
+                        dst_ip = sample["dst_ip"]
+                        ip_version = sample["ip_version"]
+                        ping_label = f"{label} {idx + 1}/{len(samples)}"
+                        sample_rtts[idx] = ping_series(
+                            ping_label,
+                            dst_ip,
+                            args.pings_per_ip,
+                            latency_ping_timeout_s,
+                            False,
+                            ping_lock,
+                            ip_version,
+                        )
+
+                errors = []
+                medians = []
+                timeout_rates = []
+                ipv4_count = 0
+                ipv6_count = 0
+                samples_payload = []
+                for sample, rtts in zip(samples, sample_rtts):
+                    ip_version = sample["ip_version"]
+                    if ip_version == 6:
+                        ipv6_count += 1
+                    else:
+                        ipv4_count += 1
+                    rtts = rtts or []
+                    success_count = sum(1 for r in rtts if r >= 0)
+                    timeout_count = len(rtts) - success_count
+                    timeout_rate = timeout_count / len(rtts) if rtts else 1.0
+                    median_rtt = compute_rtt_median(rtts)
+                    if median_rtt is None:
+                        median_rtt = latency_ping_timeout_ms
+
+                    if is_timeout:
+                        if success_count == 0:
+                            error_log2 = 0.0
+                        else:
+                            ratio = max(median_rtt, 1e-3) / latency_ping_timeout_ms
+                            error_log2 = abs(math.log2(ratio))
+                    else:
+                        ratio = max(median_rtt, 1e-3) / max(target_ms, 1e-3)
+                        error_log2 = abs(math.log2(ratio))
+
+                    errors.append(error_log2)
+                    medians.append(median_rtt)
+                    timeout_rates.append(timeout_rate)
+                    samples_payload.append(
+                        {
+                            "dst_ip": sample["dst_ip"],
+                            "ip_version": ip_version,
+                            "rtts": rtts,
+                            "median_rtt_ms": median_rtt,
+                            "success_count": success_count,
+                            "timeout_count": timeout_count,
+                            "timeout_rate": timeout_rate,
+                            "error_log2": error_log2,
+                        }
+                    )
+
+                summary = {
+                    "sampled_count": len(samples),
+                    "ipv4_count": ipv4_count,
+                    "ipv6_count": ipv6_count,
+                    "mean_error_log2": float(np.mean(errors)) if errors else None,
+                    "median_error_log2": float(np.median(errors)) if errors else None,
+                    "mean_median_rtt_ms": float(np.mean(medians)) if medians else None,
+                    "median_median_rtt_ms": float(np.median(medians)) if medians else None,
+                    "mean_timeout_rate": float(np.mean(timeout_rates)) if timeout_rates else None,
+                }
+
+                latency_results.append(
+                    {
+                        "label": label,
+                        "target_ms": target_ms,
+                        "is_timeout": is_timeout,
+                        "requested_samples": args.latency_samples_per_target,
+                        "sampled_count": len(samples),
+                        "sampling_attempts": sample_meta["attempted"],
+                        "sampling_invalid": sample_meta["invalid"],
+                        "sampling_duplicate": sample_meta["duplicate"],
+                        "samples": samples_payload,
+                        "summary": summary,
+                    }
+                )
+
+            latency_payload = {
+                "run": metrics["run"],
+                "params": {
+                    "targets": args.latency_targets,
+                    "samples_per_target": args.latency_samples_per_target,
+                    "sampling_max_attempts": args.latency_sample_max_attempts,
+                    "sampling_max_new_tokens": args.latency_sample_max_new_tokens,
+                    "temperature": args.temperature,
+                    "sampling_strategy": latency_sampling_strategy,
+                    "ipv6_weight": args.latency_ipv6_weight,
+                    "pings_per_ip": args.pings_per_ip,
+                    "ping_timeout_s": latency_ping_timeout_s,
+                    "include_timestamp": True,
+                },
+                "latency_sampling": {
+                    "src_ipv4": latency_src_ipv4,
+                    "src_ipv6": latency_src_ipv6,
+                    "targets": latency_results,
+                },
+            }
+            latency_path = metrics_dir / "latency_sampling_metrics.json"
+            with latency_path.open("w", encoding="utf-8") as f:
+                json.dump(latency_payload, f)
+            metrics["latency_sampling_metrics_file"] = str(latency_path)
+
     run_path = output_dir / "run.json"
     with run_path.open("w", encoding="utf-8") as f:
         json.dump(metrics, f, indent=2, sort_keys=True)
@@ -1680,6 +2194,12 @@ if MODAL_AVAILABLE:
         temperature: float | None = None,
         ping_sampling_strategy: str | None = None,
         ping_no_timestamp: bool = False,
+        latency_targets: str | None = None,
+        latency_samples_per_target: int | None = None,
+        latency_sample_max_attempts: int | None = None,
+        latency_sample_max_new_tokens: int | None = None,
+        latency_ipv6_weight: float | None = None,
+        latency_ping_timeout: int | None = None,
     ):
         parser = build_parser()
         args = parser.parse_args([])
@@ -1728,6 +2248,18 @@ if MODAL_AVAILABLE:
         if ping_sampling_strategy is not None:
             args.ping_sampling_strategy = ping_sampling_strategy
         args.ping_no_timestamp = ping_no_timestamp
+        if latency_targets is not None:
+            args.latency_targets = latency_targets
+        if latency_samples_per_target is not None:
+            args.latency_samples_per_target = latency_samples_per_target
+        if latency_sample_max_attempts is not None:
+            args.latency_sample_max_attempts = latency_sample_max_attempts
+        if latency_sample_max_new_tokens is not None:
+            args.latency_sample_max_new_tokens = latency_sample_max_new_tokens
+        if latency_ipv6_weight is not None:
+            args.latency_ipv6_weight = latency_ipv6_weight
+        if latency_ping_timeout is not None:
+            args.latency_ping_timeout = latency_ping_timeout
 
         run(args)
 

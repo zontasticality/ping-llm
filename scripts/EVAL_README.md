@@ -159,6 +159,43 @@ KL Divergence (lower is better):
 ✓ Model performs better WITH timestamp (lower KL)
 ```
 
+## Step 2D: Latency-Conditioned Destination Sampling (Delta Grid)
+
+This script samples destination IPs conditioned on a target RTT (with timestamp
+conditioning), then pings those IPs to see how close the observed median RTT is
+to the target.
+
+```bash
+python scripts/eval_paper_metrics.py \
+    --only latency_sampling \
+    --latency-targets 1,10,50,100,500,1000,timeout \
+    --latency-samples-per-target 15 \
+    --pings-per-ip 10
+```
+
+**What it does:**
+- For each target latency bucket, sample 15 destination IPs (mixed IPv4/IPv6)
+  using P(dst | src, rtt, timestamp)
+- Ping each sampled IP N times and compute median RTT
+- Compute error = abs(log2(median_rtt / target_rtt)) (Timeout uses ping timeout)
+- Saves metrics to `metrics/latency_sampling_metrics.json`
+
+**Plot the delta grids:**
+```bash
+python scripts/eval_paper_metrics_plot.py \
+    --run-dir outputs/paper_metrics/default \
+    --only latency_sampling
+```
+
+Default layout is a 3x2 grid per page (seven buckets means two pages).
+The plotter defaults to `1,10,100,500,1000,timeout` (omits 50ms) so it fits on one page,
+unless you set `--latency-sampling-targets`.
+
+Interpretation:
+- Each point is a sampled destination (median RTT) in sampling order
+- The dashed line is the target RTT; points show how close each sample lands
+- Timeout markers are plotted on the target line
+
 ## Tips
 
 ### Fast Testing
@@ -202,6 +239,7 @@ Use the two-step workflow below to generate PNG figures for:
 - Timestamp bucket breakdown by RTT magnitude and time-of-day (`timestamp_logprob_buckets.png`)
 - Prediction-mode accuracy bars (per-token accuracy)
 - Live ping distribution matches with KL labels
+- Latency-conditioned destination sampling delta grids
 
 By default it uses the latest param-only checkpoint from `outputs/latency_network/param_only_checkpoint`.
 
