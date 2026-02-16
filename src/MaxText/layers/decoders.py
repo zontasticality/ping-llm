@@ -40,6 +40,8 @@ from MaxText.layers import pipeline
 from MaxText import maxtext_utils
 from MaxText import multimodal_utils
 from MaxText import sharding
+from MaxText.layers.geometric_mixer import GeometricMixer
+from MaxText.layers.curvature_loss import DiagrammaticCurvatureLoss
 from MaxText.layers.attentions import attention_as_linen
 from MaxText.layers.normalizations import rms_norm
 from MaxText.layers.embeddings import attend_on_embedding, embed_as_linen, positional_embedding_as_linen
@@ -188,6 +190,11 @@ class DecoderLayer(nn.Module):
       mlp_lnx = _maybe_shard_with_logical(mlp_lnx, logical_axis_names)
 
     next_layer_addition = mlp_lnx + attention_lnx
+
+    if cfg.use_geometric_mixer:
+      geom_out = GeometricMixer(config=cfg, mesh=mesh, name="geometric_mixer")(
+          lnx, deterministic=deterministic)
+      next_layer_addition = next_layer_addition + geom_out
 
     next_layer_addition_dropped_out = nn.Dropout(rate=cfg.dropout_rate, broadcast_dims=(-2,))(
         next_layer_addition, deterministic=deterministic
@@ -894,6 +901,11 @@ class Decoder(nn.Module):
               kv_caches[lyr] = kv_cache
 
     assert isinstance(y, jax.Array)
+
+    # Compute and sow diagrammatic curvature loss for GT-Lite.
+    if cfg.use_geometric_mixer and cfg.geom_curvature_weight > 0:
+      curvature = DiagrammaticCurvatureLoss(config=cfg, mesh=mesh)(y)
+      self.sow("intermediates", "curvature_loss", curvature)
 
     # After the final transformer layer, `y` holds the raw, un-normalized hidden state.
     hidden_state = y

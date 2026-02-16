@@ -198,6 +198,14 @@ def loss_fn(model, config, data, dropout_rng, params, is_train=True):
     moe_lb_loss = jnp.mean(jnp.array(total_moe_lb_loss))
     loss += moe_lb_loss
 
+  # Geometric Transformer (GT-Lite) curvature loss with warmup schedule
+  curvature_loss = 0.0
+  if config.use_geometric_mixer and config.geom_curvature_weight > 0:
+    nested_key = ("intermediates", "decoder", "curvature_loss")
+    curvature_loss_values = maxtext_utils.get_nested_value(intermediate_outputs, nested_key, 0.0)
+    curvature_loss = jnp.mean(jnp.array(curvature_loss_values)) if isinstance(curvature_loss_values, (list, tuple)) else curvature_loss_values
+    loss += config.geom_curvature_weight * curvature_loss
+
   # Add the model's primary output to the intermediates dict so it can be used
   # by the acceptance rate calculation in eval_step.
   intermediate_outputs["logits"] = logits
@@ -208,6 +216,7 @@ def loss_fn(model, config, data, dropout_rng, params, is_train=True):
       "total_weights": total_weights,
       "moe_lb_loss": moe_lb_loss,
       "mtp_loss": mtp_loss,
+      "curvature_loss": curvature_loss,
   }
   return loss, aux
 
@@ -304,10 +313,12 @@ def train_step(model, config, state_mesh_shardings, params_shardings, state, dat
     )
   new_state = state.apply_gradients(grads=grads)
 
+  curvature_loss = aux.get("curvature_loss", 0.0)
   scalar_metrics = {
       "learning/loss": loss,
       "learning/moe_lb_loss": moe_lb_loss,
       "learning/mtp_loss": mtp_loss,
+      "learning/curvature_loss": curvature_loss,
       "learning/total_weights": total_weights,
   }
   if not config.optimizer_memory_host_offload:
@@ -350,6 +361,7 @@ def eval_step(model, config, state, data, dropout_rng):
   total_weights = aux["total_weights"]
   moe_lb_loss = aux["moe_lb_loss"]
   mtp_loss = aux["mtp_loss"]
+  curvature_loss = aux.get("curvature_loss", 0.0)
   metrics = {
       "scalar": {
           "evaluation/loss": loss,
@@ -357,6 +369,7 @@ def eval_step(model, config, state, data, dropout_rng):
           "evaluation/total_weights": total_weights,
           "evaluation/moe_lb_loss": moe_lb_loss,
           "evaluation/mtp_loss": mtp_loss,
+          "evaluation/curvature_loss": curvature_loss,
           "evaluation/mtp_acceptance_rate_percent": mtp_acceptance_rate,
       },
   }
