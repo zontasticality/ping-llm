@@ -16,7 +16,7 @@
 
 This backend provides specialized data loading for network latency measurement datasets:
 - probe_chunks: Probe-centric big-row data with runtime tokenization (DATA_LOADING_PLAN_3)
-- network_parquet: Legacy parquet shards with window-based sampling (DATA_LOADING_PLAN_2)
+- network_parquet: Legacy parquet shards with window-based sampling (not yet implemented)
 """
 
 import ml_collections
@@ -53,7 +53,7 @@ def make_network_train_iterator(
 
   Supports two data formats:
   1. probe_chunks: ArrayRecord files with probe-centric rows (PLAN_3)
-  2. network_parquet: Parquet shards with window sampling (PLAN_2)
+  2. network_parquet: Parquet shards with window sampling (not yet implemented)
 
   Args:
     config: Configuration dictionary with network-specific settings

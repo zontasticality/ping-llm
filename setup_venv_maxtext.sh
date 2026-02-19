@@ -5,7 +5,7 @@
 set -euo pipefail
 
 echo "=========================================="
-echo "MaxText Environment Setup (PLAN_2)"
+echo "MaxText Environment Setup"
 echo "=========================================="
 echo ""
 echo "System Info:"

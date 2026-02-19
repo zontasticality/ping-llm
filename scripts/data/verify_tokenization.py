@@ -2,7 +2,7 @@
 """
 Verify tokenization on real Parquet data.
 
-This script validates PLAN_2 tokenization requirements:
+This script validates network tokenization requirements:
 1. Token counts match spec (23 IPv4 first, 16 subsequent, etc.)
 2. RTT encoding accuracy (±0.049% relative error)
 3. Delta timestamp coverage (95%+ use 1-byte)
@@ -72,7 +72,7 @@ def load_parquet_sample(parquet_file: str, sample_size: int = 100):
 
 
 def verify_token_counts(rows):
-    """Verify token counts match PLAN_2 spec."""
+    """Verify token counts match network spec."""
     print("\n" + "=" * 80)
     print("TOKEN COUNT VERIFICATION")
     print("=" * 80)
@@ -259,7 +259,7 @@ def verify_ip_version_distribution(rows):
     print(f"\nSample distribution:")
     print(f"  IPv4: {ipv4_count} ({ipv4_count / len(rows) * 100:.1f}%)")
     print(f"  IPv6: {ipv6_count} ({ipv6_count / len(rows) * 100:.1f}%)")
-    print(f"\nDataset distribution (per PLAN_2):")
+    print(f"\nDataset distribution (per network):")
     print(f"  IPv4: 57.7%")
     print(f"  IPv6: 42.3%")
 
@@ -287,7 +287,7 @@ def verify_failed_probes(rows):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Verify PLAN_2 tokenization on real data")
+    parser = argparse.ArgumentParser(description="Verify network tokenization on real data")
     parser.add_argument(
         "--input",
         type=str,
@@ -303,7 +303,7 @@ def main():
     args = parser.parse_args()
 
     print("\n" + "=" * 80)
-    print("PLAN_2 TOKENIZATION VERIFICATION")
+    print("network TOKENIZATION VERIFICATION")
     print("=" * 80)
 
     try:
@@ -321,7 +321,7 @@ def main():
         print("\n" + "=" * 80)
         print("✅ ALL VERIFICATIONS PASSED")
         print("=" * 80)
-        print("\nPLAN_2 tokenization is working correctly on real data!")
+        print("\nnetwork tokenization is working correctly on real data!")
 
     except FileNotFoundError:
         print(f"\n❌ ERROR: File not found: {args.input}")

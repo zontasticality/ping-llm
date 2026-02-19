@@ -8,7 +8,7 @@
 #SBATCH --output=%x-%j.out
 #SBATCH --error=%x-%j.err
 
-# SLURM script for training PLAN_2/3 network measurement model on H100
+# SLURM script for training network measurement model on H100
 #
 # Usage:
 #   sbatch scripts/train/slurm_train_h100.sh
@@ -21,8 +21,8 @@
 #   - Wandb: Enabled by default
 #
 # Prerequisites:
-# 1. Dataset in data/probe_rows/{train,test}.arrayrecord (PLAN_3)
-#    OR data/sharded/{train,test}/ (PLAN_2 parquet shards)
+# 1. Dataset in data/probe_rows/{train,test}.arrayrecord
+#    OR data/sharded/{train,test}/ (legacy parquet shards)
 # 2. Virtual environment with MaxText + dependencies
 # 3. Wandb authentication: `wandb login` (if using wandb)
 #
@@ -112,7 +112,7 @@ if [ -f "$DATA_DIR/train.arrayrecord" ]; then
     EVAL_FILES="$DATA_DIR/test.arrayrecord"
     DATA_TYPE="probe_chunks"
 elif [ -d "${PROJECT_DIR}/data/sharded/train" ]; then
-    echo "  ✓ Found PLAN_2 parquet shards"
+    echo "  ✓ Found legacy parquet shards"
     TRAIN_SHARDS=$(ls -1 "${PROJECT_DIR}/data/sharded/train"/*.parquet 2>/dev/null | wc -l)
     TEST_SHARDS=$(ls -1 "${PROJECT_DIR}/data/sharded/test"/*.parquet 2>/dev/null | wc -l)
     echo "    Train shards: $TRAIN_SHARDS"
@@ -122,8 +122,8 @@ elif [ -d "${PROJECT_DIR}/data/sharded/train" ]; then
     DATA_TYPE="grain"
 else
     echo "ERROR: No training data found!"
-    echo "  Expected: $DATA_DIR/train.arrayrecord (PLAN_3)"
-    echo "       OR: ${PROJECT_DIR}/data/sharded/train/*.parquet (PLAN_2)"
+    echo "  Expected: $DATA_DIR/train.arrayrecord"
+    echo "       OR: ${PROJECT_DIR}/data/sharded/train/*.parquet (legacy)"
     exit 1
 fi
 
@@ -186,7 +186,7 @@ else
           network_eval_files="$EVAL_FILES" \
           grain_worker_count=16
     else
-        # PLAN_2 parquet format
+        # Legacy parquet format
         python -m MaxText.train \
           "$CONFIG_FILE" \
           run_name="$RUN_NAME" \

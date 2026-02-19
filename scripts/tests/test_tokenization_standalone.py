@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Standalone tokenization test with synthetic data (PLAN_2 schema).
+Standalone tokenization test with synthetic data (network schema).
 
 This test validates tokenization logic without requiring the actual Parquet file
 or external dependencies like pyarrow/duckdb.
@@ -38,7 +38,7 @@ from tokenization import (
 def test_token_mappings():
     """Test basic token ID mappings."""
     print("=" * 80)
-    print("TOKEN MAPPING TEST (PLAN_2 Schema)")
+    print("TOKEN MAPPING TEST (network Schema)")
     print("=" * 80)
 
     print(f"Vocabulary size: {VOCAB_SIZE}")
@@ -89,14 +89,14 @@ def test_rtt_encoding():
         print(f"  {description:30s}: {rtt_ms:10.3f}ms → {decoded_rtt:10.3f}ms "
               f"(error: {relative_error:6.3f}%)")
 
-        # Check precision (should be <0.1% for PLAN_2 spec)
+        # Check precision (should be <0.1% for network spec)
         assert relative_error < 0.1, f"Relative error too high: {relative_error}%"
 
     print("✓ RTT encoding validated (all <0.1% error)\n")
 
 
 def test_ipv4_encoding():
-    """Test IPv4 encoding with PLAN_2 schema."""
+    """Test IPv4 encoding with network schema."""
     print("-" * 80)
     print("IPv4 ENCODING TEST")
     print("-" * 80)
@@ -153,7 +153,7 @@ def test_ipv4_encoding():
 
 
 def test_ipv6_encoding():
-    """Test IPv6 encoding with PLAN_2 schema."""
+    """Test IPv6 encoding with network schema."""
     print("-" * 80)
     print("IPv6 ENCODING TEST")
     print("-" * 80)
@@ -322,7 +322,7 @@ def test_delta_timestamp_savings():
 def main():
     """Run all tests."""
     print("\n" + "=" * 80)
-    print("TOKENIZATION STANDALONE TEST SUITE (PLAN_2)")
+    print("TOKENIZATION STANDALONE TEST SUITE (network)")
     print("=" * 80)
     print()
 

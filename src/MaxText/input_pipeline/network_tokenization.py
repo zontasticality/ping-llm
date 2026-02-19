@@ -1,7 +1,7 @@
 """
-Tokenization for network measurement data (PLAN_2 schema).
+Tokenization for network measurement data.
 
-This module converts Parquet rows (network measurements) into token sequences
+This module converts measurement rows into token sequences
 for training a decoder-only Transformer with MaxText.
 
 Schema: event_time, src_addr, dst_addr, ip_version, rtt
@@ -21,7 +21,7 @@ import random
 
 
 # =============================================================================
-# Token ID Mappings (PLAN_2 Schema)
+# Token ID Mappings
 # =============================================================================
 
 # Role tokens (IDs 0-10)

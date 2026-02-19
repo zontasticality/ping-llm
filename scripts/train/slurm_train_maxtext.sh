@@ -8,7 +8,7 @@
 #SBATCH --output=%x-%j.out
 #SBATCH --error=%x-%j.err
 
-# SLURM script for training PLAN_2 network measurement model
+# SLURM script for training network measurement model
 #
 # Usage:
 #   sbatch scripts/train/slurm_train_maxtext.sh
@@ -16,7 +16,7 @@
 # Prerequisites:
 # 1. Dataset sharded into data/sharded/{train,test}/ (180 train + 20 test)
 # 2. Virtual environment with MaxText + dependencies
-# 3. PLAN_2 tokenization (267 vocab, merged IP tokens, delta timestamps)
+# 3. Network tokenization (267 vocab, merged IP tokens, delta timestamps)
 #
 # Model: 95M params, 20 layers, 640 emb, 2048 MLP
 # Expected runtime: ~37 hours for 200k steps on A100
@@ -28,7 +28,7 @@ PROJECT_DIR="${PROJECT_DIR:-$(cd "$SCRIPT_DIR/.." && pwd)}"
 VENV_DIR="${VENV_DIR:-${PROJECT_DIR}/.venv}"
 DATA_DIR="${DATA_DIR:-${PROJECT_DIR}/data/sharded}"
 OUT_DIR="${OUT_DIR:-${PROJECT_DIR}/outputs/latency_network}"
-RUN_NAME="${RUN_NAME:-plan2_${SLURM_JOB_ID:-manual}}"
+RUN_NAME="${RUN_NAME:-network_${SLURM_JOB_ID:-manual}}"
 CONFIG_FILE="${CONFIG_FILE:-${PROJECT_DIR}/src/MaxText/configs/latency_network.yml}"
 LOG_DIR="${LOG_DIR:-${PROJECT_DIR}/logs}"
 mkdir -p "$LOG_DIR"
@@ -38,7 +38,7 @@ LOG_BASENAME="${RUN_NAME}-${SLURM_JOB_ID:-manual}"
 exec > >(tee -a "${LOG_DIR}/${LOG_BASENAME}.out") 2> >(tee -a "${LOG_DIR}/${LOG_BASENAME}.err" >&2)
 
 echo "========================================"
-echo "PLAN_2 Network Measurement Training"
+echo "Network Measurement Training"
 echo "Job ID: ${SLURM_JOB_ID:-manual}"
 echo "Node: ${SLURM_NODELIST:-unknown}"
 if command -v nvidia-smi &> /dev/null; then
@@ -137,7 +137,7 @@ if [ "${ENABLE_WANDB:-false}" = "true" ]; then
     echo ""
 fi
 
-# Training command (PLAN_2 configuration)
+# Training command
 python -m MaxText.train \
   "$CONFIG_FILE" \
   run_name="$RUN_NAME" \

@@ -143,7 +143,7 @@ The network backend is implemented as a separate MaxText backend with minimal co
 
 ### Key Features
 
-- **PLAN_3 Design**: Probe-centric big-row data loading
+- **Probe-Centric Design**: Big-row data loading with runtime tokenization
 - **<5% Padding**: Minimal overhead vs 50-90% in alternative approaches
 - **Multi-scale Learning**: Log-uniform window sampling for temporal patterns
 - **Performance**: 320K-850K tokens/sec on B200 GPU

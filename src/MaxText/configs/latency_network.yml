@@ -1,7 +1,7 @@
 # Network Latency Measurement Training Config
 #
 # This config trains a decoder-only transformer on network ping measurements.
-# Dataset: 100M rows of RIPE Atlas measurements with IPv4/IPv6 addresses and RTT data
+# Dataset: ~200M+ RIPE Atlas measurements (hourly parquet snapshots) with IPv4/IPv6 addresses and RTT data
 #
 # Usage:
 #   DECOUPLE_GCLOUD=TRUE python -m MaxText.train src/MaxText/configs/latency_network.yml \
@@ -18,9 +18,9 @@ base_output_directory: outputs/latency_network
 # This is particularly important on Modal where containers restart frequently
 jax_cache_dir: '/mnt/jax_cache' # Use Modal volume for persistence
 
-# Model architecture - PLAN_2: ~95M param decoder-only transformer
+# Model architecture: ~95M param decoder-only transformer
 # Optimized for generalization (deep + narrow MLP ratio)
-vocab_size: 267 # 11 role tokens + 256 byte tokens (PLAN_2)
+vocab_size: 267 # 11 role tokens + 256 byte tokens
 base_num_decoder_layers: 20 # Deep for multi-step reasoning (inverse search)
 base_emb_dim: 640 # Optimized for small vocab
 base_num_query_heads: 10 # 640 / 64 = 10 heads
@@ -30,31 +30,30 @@ base_mlp_dim: 2048 # 3.2x ratio (vs standard 4x) for generalization
 max_target_length: 1024
 max_prefill_predict_length: 1024
 
-# Training - PLAN_2 hyperparameters
+# Training hyperparameters
 steps: 5000
 per_device_batch_size: 256 # OPTIMIZED: Increased from 128 to saturate A100 memory (was 70% idle)
 learning_rate: 1.414e-4 # Scaled up with sqrt(256/128) = 1.414x for larger batch
-learning_rate_schedule: 'cosine'
 learning_rate_schedule_steps: 5000 # Decay over full training duration
-warmup_steps: 20
-alpha: 0.1 # Minimum LR = 10% of peak (1e-5) to prevent decay to zero
+warmup_steps_fraction: 0.004 # 20 steps / 5000 total = 0.4% warmup
+cosine_learning_rate_final_fraction: 0.1 # Minimum LR = 10% of peak to prevent decay to zero
 adam_b1: 0.9
 adam_b2: 0.999
 adam_eps: 1.0e-8
 adam_eps_root: 0.0
-weight_decay: 0.01
+adam_weight_decay: 0.01
 dropout_rate: 0.1
 
 # Checkpointing
 enable_checkpointing: true
-checkpoint_period: 200 # Save checkpoint every 1000 steps
+checkpoint_period: 200 # Save checkpoint every 200 steps
 save_checkpoint_on_completion: true # Save final checkpoint when training completes/terminates
 # Note: train.py also saves checkpoint on KeyboardInterrupt/SystemExit to prevent data loss
 
 # Logging & Monitoring
 log_period: 100 # Log metrics every 100 steps
 eval_interval: 100 # Evaluate every 100 steps (for grokking visualization)
-eval_steps: 1 # Run 5 eval steps (5% overhead: 50 evals * 5 steps / 5000 steps)
+eval_steps: 1 # Run 1 eval batch per interval
 enable_tensorboard: true # Enable TensorBoard logging
 tensorboard_dir: '' # Auto-set to base_output_directory/tensorboard
 
@@ -67,11 +66,10 @@ tensorboard_dir: '' # Auto-set to base_output_directory/tensorboard
 #     * Minimal padding (<5% vs 50-90% in previous plans)
 #     * Data augmentation with 3 timestamp modes
 #     * Requires: modal run scripts/data/modal_create_probe_rows_parallel_streaming.py
-#   - network_parquet: Legacy parquet shards (PLAN_2) - Not yet implemented
+#   - network_parquet: Legacy parquet shards - Not yet implemented
 #
 dataset_type: 'network'
-packing: True # EXPERIMENT: Enable packing to reduce padding waste (75-82% → <5%)
-max_segments_per_seq: 8 # Max sequences packed per batch (for cudnn_flash_te SequenceDescriptor)
+packing: False # Network backend handles its own padding via probe-row windowing (<5% waste)
 
 # Network data configuration
 network_data_format: 'probe_chunks'
@@ -92,9 +90,8 @@ grain_ram_budget_mb: 32768 # OPTIMIZED: Increased from 16GB to 32GB (if availabl
 # grain_visualization_dir: "/mnt/grain_viz"  # Generate pipeline visualization graph
 
 # Attention & Positional Encoding
-attention: 'flash' # JAX Pallas FlashAttention (supports packing, ~10-20% slower than cudnn_flash_te)
+attention: 'flash' # JAX Pallas FlashAttention
 scan_layers: true
-position_embedding: 'rope' # RoPE for relative position encoding (PLAN_2)
 
 # Precision
 dtype: 'bfloat16'

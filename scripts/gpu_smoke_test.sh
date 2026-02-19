@@ -1,5 +1,5 @@
 #!/bin/bash
-# Quick GPU smoke test for MaxText with PLAN_2 config
+# Quick GPU smoke test for MaxText with network config
 # Run 10 steps to validate everything works before full training
 
 set -euo pipefail

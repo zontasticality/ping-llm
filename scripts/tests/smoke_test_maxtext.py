@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """
-Smoke test for MaxText integration with PLAN_2 tokenization.
+Smoke test for MaxText integration with network tokenization.
 
 This script validates:
 1. Tokenization produces valid sequences
 2. MaxText config loads correctly
-3. Model initializes with PLAN_2 architecture
+3. Model initializes with network architecture
 4. Forward pass works with tokenized data
 """
 
@@ -84,7 +84,7 @@ def test_tokenization_integration():
 
 
 def test_config_loading():
-    """Test that MaxText config loads with PLAN_2 parameters."""
+    """Test that MaxText config loads with network parameters."""
     print("\n" + "=" * 80)
     print("CONFIG LOADING TEST")
     print("=" * 80)
@@ -98,7 +98,7 @@ def test_config_loading():
             config = yaml.safe_load(f)
 
         print(f"\n✓ Config loaded from {config_path}")
-        print(f"\nPLAN_2 Parameters:")
+        print(f"\nnetwork Parameters:")
         print(f"  vocab_size: {config.get('vocab_size')} (expected: 267)")
         print(f"  num_decoder_layers: {config.get('num_decoder_layers')} (expected: 20)")
         print(f"  emb_dim: {config.get('emb_dim')} (expected: 640)")
@@ -106,14 +106,14 @@ def test_config_loading():
         print(f"  num_query_heads: {config.get('num_query_heads')} (expected: 10)")
         print(f"  max_target_length: {config.get('max_target_length')} (expected: 1024)")
 
-        # Validate PLAN_2 parameters
+        # Validate network parameters
         assert config.get('vocab_size') == 267, f"vocab_size should be 267, got {config.get('vocab_size')}"
         assert config.get('num_decoder_layers') == 20, f"num_decoder_layers should be 20"
         assert config.get('emb_dim') == 640, f"emb_dim should be 640"
         assert config.get('mlp_dim') == 2048, f"mlp_dim should be 2048"
         assert config.get('num_query_heads') == 10, f"num_query_heads should be 10"
 
-        print("\n✓ All PLAN_2 parameters correct")
+        print("\n✓ All network parameters correct")
 
     except ImportError:
         print("\n⚠ PyYAML not installed, skipping config validation")
@@ -123,7 +123,7 @@ def test_config_loading():
 
 
 def test_model_parameters():
-    """Estimate model parameters for PLAN_2 architecture."""
+    """Estimate model parameters for network architecture."""
     print("\n" + "=" * 80)
     print("MODEL PARAMETER COUNT")
     print("=" * 80)
@@ -207,7 +207,7 @@ def test_sequence_packing():
 def main():
     """Run all smoke tests."""
     print("\n" + "=" * 80)
-    print("MAXTEXT INTEGRATION SMOKE TESTS (PLAN_2)")
+    print("MAXTEXT INTEGRATION SMOKE TESTS (network)")
     print("=" * 80)
 
     try:
@@ -219,7 +219,7 @@ def main():
         print("\n" + "=" * 80)
         print("✅ ALL SMOKE TESTS PASSED")
         print("=" * 80)
-        print("\nPLAN_2 implementation is ready for MaxText integration!")
+        print("\nnetwork implementation is ready for MaxText integration!")
         print("Next steps:")
         print("  1. Run dataset preprocessing: python scripts/data/probe_chunk_preprocess.py")
         print("  2. Test Grain data pipeline with real data")

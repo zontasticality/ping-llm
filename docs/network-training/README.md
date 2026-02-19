@@ -68,7 +68,7 @@ Quick version:
 ```bash
 # Preprocess parquet files into ArrayRecord format
 python scripts/data/create_probe_rows_parallel_streaming.py \
-  --input "data/raw/*.parquet" \
+  --input "data/parquet_ping/*.parquet" \
   --output data/probe_rows \
   --max-row-size-mb 8
 ```
