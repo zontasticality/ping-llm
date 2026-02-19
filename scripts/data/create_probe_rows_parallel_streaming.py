@@ -1,15 +1,16 @@
 #!/usr/bin/env python3
 """
-Memory-efficient probe row preprocessing: per-file GROUP BY + direct streaming to ArrayRecord.
+Memory-efficient probe row preprocessing: per-file GROUP BY + hash partition + bucket merge.
 
-Two-pass architecture:
+Three-pass architecture:
   Pass 1: Per-file GROUP BY (parallel workers, each processes one parquet file)
-  Pass 2: DuckDB ORDER BY src_addr (external sort) -> stream Arrow batches ->
-           accumulate per src_addr -> sort by event_time -> write to ArrayRecord
+  Pass 2: Hash-partition intermediates into N bucket parquet files (~2GB RAM)
+  Pass 3: Per-bucket merge by src_addr + sort by event_time -> write to ArrayRecord (~5GB RAM)
 
-This eliminates the OOM-prone FLATTEN(LIST(measurements)) merge step and the
-intermediate merged parquet file. Only one probe's measurements (~57MB max)
-are held in memory at a time during Pass 2.
+Train/test split: hash_src_addr(src_addr) % 10 < 9 -> train (~90/10 deterministic split).
+
+This replaces the OOM-prone DuckDB ORDER BY approach with a hash-partition strategy
+that keeps peak memory under 10GB.
 """
 
 import argparse
@@ -25,23 +26,12 @@ from multiprocessing import Pool, cpu_count
 import time
 import tempfile
 import shutil
-import psutil
-
 try:
     import array_record.python.array_record_module as array_record_module
 except ImportError:
     raise ImportError(
         "array_record not installed. Install with: pip install array_record"
     )
-
-
-def get_available_memory_gb():
-    """Get available system memory in GB."""
-    try:
-        mem = psutil.virtual_memory()
-        return mem.available / (1024 ** 3)
-    except:
-        return 4.0  # Default fallback
 
 
 def hash_src_addr(src_addr: str) -> int:
@@ -212,10 +202,8 @@ def process_parquet_file_worker(args):
     con.execute("SET threads=2")
     con.execute("SET preserve_insertion_order=false")
     con.execute(f"SET temp_directory='{worker_temp}'")
-    try:
-        con.execute("SET force_external=true")
-    except:
-        pass
+    con.execute("SET debug_force_external=true")
+    con.execute("SET enable_external_file_cache=false")
 
     con.execute(f"""
         COPY (
@@ -237,204 +225,237 @@ def process_parquet_file_worker(args):
     return output_parquet, worker_id
 
 
-def _stream_to_arrayrecord(
-    intermediate_glob: str,
-    output_dir: Path,
-    train_ratio: float,
-    max_size_bytes: int,
-    memory_limit_gb: float,
-    temp_dir: str,
-) -> dict:
-    """Stream sorted intermediate parquets directly to train/test ArrayRecord files.
+def _hash_partition_intermediates(
+    intermediate_dir: Path,
+    bucket_dir: Path,
+    n_buckets: int,
+) -> None:
+    """Pass 2: Hash-partition intermediate files into N bucket parquet files.
 
-    Replaces the old merge-to-parquet + batch-processing + merge-arrayrecord pipeline.
+    Reads each of the ~720 intermediate grouped parquet files one at a time,
+    assigns each row to a bucket via hash_src_addr(src_addr) % n_buckets,
+    and appends to the corresponding bucket ParquetWriter.
 
-    1. Count distinct probes for train/test split boundary
-    2. DuckDB ORDER BY src_addr (external merge sort)
-    3. Stream Arrow batches, accumulate per src_addr
-    4. Sort each probe's measurements by event_time
-    5. Write directly to train or test ArrayRecord
-
-    Returns dict with statistics.
+    Peak memory: ~2GB (one intermediate file loaded at a time).
     """
-    print("\n  Step 2: Streaming directly to ArrayRecord...")
+    import pyarrow.parquet as pq
 
-    # --- Count probes for train/test split ---
-    con = duckdb.connect(':memory:')
-    con.execute(f"SET memory_limit='{memory_limit_gb}GB'")
-    con.execute(f"SET temp_directory='{temp_dir}'")
-    con.execute("SET preserve_insertion_order=false")
-    con.execute("SET threads=8")
-    try:
-        con.execute("SET force_external=true")
-    except:
-        pass
+    print("\n  Pass 2: Hash-partitioning intermediates into buckets...")
+    bucket_dir.mkdir(parents=True, exist_ok=True)
 
-    n_probes = con.execute(f"""
-        SELECT COUNT(DISTINCT src_addr) FROM read_parquet('{intermediate_glob}')
-    """).fetchone()[0]
+    # Resume support: skip if all bucket files exist and are non-empty
+    existing_buckets = [
+        bucket_dir / f"bucket_{b:04d}.parquet"
+        for b in range(n_buckets)
+        if (bucket_dir / f"bucket_{b:04d}.parquet").exists()
+        and (bucket_dir / f"bucket_{b:04d}.parquet").stat().st_size > 0
+    ]
+    if len(existing_buckets) == n_buckets:
+        print(f"    RESUMING: Found {n_buckets} existing bucket files, skipping Pass 2")
+        return
 
-    n_train = int(n_probes * train_ratio)
-    n_test = n_probes - n_train
-    print(f"    Probes: {n_probes:,} (train: {n_train:,}, test: {n_test:,})")
+    intermediate_files = sorted(glob.glob(str(intermediate_dir / "grouped_*.parquet")))
+    print(f"    Input: {len(intermediate_files)} intermediate files")
+    print(f"    Output: {n_buckets} bucket files in {bucket_dir}")
 
-    # --- DuckDB ORDER BY (external sort) ---
-    print(f"    Running DuckDB ORDER BY src_addr (external sort)...")
-    sort_start = time.time()
+    # Open N bucket writers
+    # We'll determine the schema from the first file
+    first_table = pq.read_table(intermediate_files[0])
+    schema = first_table.schema
+    del first_table
 
-    result = con.execute(f"""
-        SELECT src_addr, measurements
-        FROM read_parquet('{intermediate_glob}')
-        ORDER BY src_addr
-    """)
+    bucket_paths = [str(bucket_dir / f"bucket_{b:04d}.parquet") for b in range(n_buckets)]
+    writers = [pq.ParquetWriter(p, schema) for p in bucket_paths]
 
-    sort_time = time.time() - sort_start
-    print(f"    Sort query submitted in {sort_time:.1f}s")
+    partition_start = time.time()
 
-    # --- Stream Arrow batches ---
-    reader = result.fetch_arrow_reader(batch_size=4096)
+    for file_idx, intermediate_file in enumerate(intermediate_files):
+        table = pq.read_table(intermediate_file)
+        src_addrs = table.column('src_addr')
+
+        # Compute bucket assignment for each row
+        bucket_ids = pa.array(
+            [hash_src_addr(s.as_py()) % n_buckets for s in src_addrs],
+            type=pa.int32(),
+        )
+
+        # Group rows by bucket and write
+        for b in range(n_buckets):
+            mask = pc.equal(bucket_ids, b)
+            bucket_table = table.filter(mask)
+            if len(bucket_table) > 0:
+                writers[b].write_table(bucket_table)
+
+        if (file_idx + 1) % 50 == 0 or file_idx == len(intermediate_files) - 1:
+            elapsed = time.time() - partition_start
+            print(f"    Partitioned {file_idx + 1}/{len(intermediate_files)} files "
+                  f"({elapsed:.0f}s)")
+
+    for w in writers:
+        w.close()
+
+    partition_time = time.time() - partition_start
+    total_size_gb = sum(Path(p).stat().st_size for p in bucket_paths) / (1024 ** 3)
+    print(f"    Partitioning complete: {partition_time:.0f}s, {total_size_gb:.1f}GB total")
+
+
+def _process_bucket(
+    bucket_path: str,
+    train_writer,
+    test_writer,
+    max_size_bytes: int,
+) -> dict:
+    """Process a single bucket: group by src_addr, sort, write to ArrayRecord.
+
+    Returns dict with per-bucket statistics.
+    """
+    import pyarrow.parquet as pq
+
+    table = pq.read_table(bucket_path)
+    src_addrs = table.column('src_addr')
+    meas_col = table.column('measurements')
+
+    # Group rows by src_addr using a Python dict
+    # Each intermediate row has src_addr + measurements (list of structs)
+    probe_chunks = {}  # src_addr -> list of StructArray chunks
+    flat_values = meas_col.values
+    list_offsets = meas_col.offsets
+
+    for i in range(len(table)):
+        src = src_addrs[i].as_py()
+        start = list_offsets[i].as_py()
+        end = list_offsets[i + 1].as_py()
+        chunk = flat_values.slice(start, end - start)
+
+        if src in probe_chunks:
+            probe_chunks[src].append(chunk)
+        else:
+            probe_chunks[src] = [chunk]
+
+    del table, src_addrs, meas_col, flat_values, list_offsets
+
+    stats = {
+        'probes': 0,
+        'train_rows': 0, 'train_measurements': 0,
+        'test_rows': 0, 'test_measurements': 0,
+    }
+
+    for src_addr, chunks in probe_chunks.items():
+        # Concatenate all measurement chunks
+        if len(chunks) == 1:
+            merged = chunks[0]
+        else:
+            merged = pa.concat_arrays(chunks)
+
+        # Sort by event_time
+        sort_indices = pc.sort_indices(merged, sort_keys=[('event_time', 'ascending')])
+        sorted_measurements = merged.take(sort_indices)
+
+        # Train/test split: deterministic hash-based
+        is_train = hash_src_addr(src_addr) % 10 < 9
+        writer = train_writer if is_train else test_writer
+
+        rows, n_meas = write_probe_arrow(writer, src_addr, sorted_measurements, max_size_bytes)
+
+        if is_train:
+            stats['train_rows'] += rows
+            stats['train_measurements'] += n_meas
+        else:
+            stats['test_rows'] += rows
+            stats['test_measurements'] += n_meas
+
+        stats['probes'] += 1
+
+    return stats
+
+
+def _process_all_buckets(
+    bucket_dir: Path,
+    output_dir: Path,
+    n_buckets: int,
+    max_size_bytes: int,
+) -> dict:
+    """Pass 3: Process all buckets sequentially, writing to shared train/test ArrayRecord.
+
+    Returns dict with aggregate statistics.
+    """
+    print("\n  Pass 3: Processing buckets -> ArrayRecord...")
 
     train_output = str(output_dir / "train.arrayrecord")
     test_output = str(output_dir / "test.arrayrecord")
     train_writer = array_record_module.ArrayRecordWriter(train_output, 'group_size:1')
     test_writer = array_record_module.ArrayRecordWriter(test_output, 'group_size:1')
 
-    current_src = None
-    current_chunks = []  # List of Arrow StructArray slices
-    probes_processed = 0
-    total_rows_written = 0
-    total_measurements = 0
-    train_rows = 0
-    train_measurements = 0
-    test_rows = 0
-    test_measurements = 0
+    totals = {
+        'probes': 0,
+        'train_rows': 0, 'train_measurements': 0,
+        'test_rows': 0, 'test_measurements': 0,
+    }
 
-    stream_start = time.time()
+    process_start = time.time()
 
-    def emit_probe():
-        nonlocal probes_processed, total_rows_written, total_measurements
-        nonlocal train_rows, train_measurements, test_rows, test_measurements
-        if current_src is None:
-            return
+    for b in range(n_buckets):
+        bucket_path = str(bucket_dir / f"bucket_{b:04d}.parquet")
+        stats = _process_bucket(bucket_path, train_writer, test_writer, max_size_bytes)
 
-        # Concatenate all measurement chunks into one StructArray
-        if len(current_chunks) == 1:
-            merged = current_chunks[0]
-        else:
-            merged = pa.concat_arrays(current_chunks)
+        for k in totals:
+            totals[k] += stats[k]
 
-        # Sort by event_time using Arrow compute
-        sort_indices = pc.sort_indices(merged, sort_keys=[('event_time', 'ascending')])
-        sorted_measurements = merged.take(sort_indices)
-
-        # Choose writer based on probe index
-        if probes_processed < n_train:
-            active_writer = train_writer
-        else:
-            active_writer = test_writer
-
-        rows, n_meas = write_probe_arrow(active_writer, current_src, sorted_measurements, max_size_bytes)
-
-        if probes_processed < n_train:
-            train_rows += rows
-            train_measurements += n_meas
-        else:
-            test_rows += rows
-            test_measurements += n_meas
-
-        total_rows_written += rows
-        total_measurements += n_meas
-        probes_processed += 1
-
-        if probes_processed % 1000 == 0:
-            elapsed = time.time() - stream_start
-            rate = probes_processed / elapsed if elapsed > 0 else 0
-            print(f"    Processed {probes_processed:,}/{n_probes:,} probes "
-                  f"({total_measurements:,.0f} measurements, {rate:.0f} probes/s)    ", end='\r')
-
-    for batch in reader:
-        src_col = batch.column('src_addr')
-        meas_col = batch.column('measurements')
-        flat_values = meas_col.values
-        list_offsets = meas_col.offsets
-
-        for i in range(len(batch)):
-            src = src_col[i].as_py()
-            start = list_offsets[i].as_py()
-            end = list_offsets[i + 1].as_py()
-            meas_slice = flat_values.slice(start, end - start)
-
-            if src != current_src:
-                emit_probe()
-                current_src = src
-                current_chunks = [meas_slice]
-            else:
-                current_chunks.append(meas_slice)
-
-    emit_probe()  # Last probe
+        if (b + 1) % 10 == 0 or b == n_buckets - 1:
+            elapsed = time.time() - process_start
+            rate = totals['probes'] / elapsed if elapsed > 0 else 0
+            total_meas = totals['train_measurements'] + totals['test_measurements']
+            print(f"    Bucket {b + 1}/{n_buckets}: {totals['probes']:,} probes, "
+                  f"{total_meas:,} measurements ({rate:.0f} probes/s)")
 
     train_writer.close()
     test_writer.close()
-    con.close()
 
-    stream_time = time.time() - stream_start
-    print(f"\n    Streaming complete: {probes_processed:,} probes in {stream_time:.1f}s")
+    process_time = time.time() - process_start
+    print(f"    Bucket processing complete: {totals['probes']:,} probes in {process_time:.0f}s")
 
-    return {
-        'n_probes': probes_processed,
-        'n_train': n_train,
-        'n_test': n_test,
-        'train_rows': train_rows,
-        'train_measurements': train_measurements,
-        'test_rows': test_rows,
-        'test_measurements': test_measurements,
-        'total_rows': total_rows_written,
-        'total_measurements': total_measurements,
-        'stream_time': stream_time,
-        'train_output': train_output,
-        'test_output': test_output,
-    }
+    totals['process_time'] = process_time
+    totals['train_output'] = train_output
+    totals['test_output'] = test_output
+    return totals
 
 
 def process_parquet_to_probe_rows_streaming(
     input_pattern: str,
     output_dir: Path,
     max_row_size_mb: float = 8.0,
-    train_ratio: float = 0.9,
     num_workers: int = None,
-    memory_limit_gb: float = None,
+    n_buckets: int = 100,
     temp_dir_path: str = None,
 ):
     """
-    Two-pass probe row preprocessing: per-file GROUP BY + direct streaming to ArrayRecord.
+    Three-pass probe row preprocessing:
 
     Pass 1: Per-file GROUP BY (parallel workers, memory-safe)
-    Pass 2: DuckDB ORDER BY -> stream -> accumulate -> sort -> write ArrayRecord
+    Pass 2: Hash-partition intermediates into N bucket files (~2GB RAM)
+    Pass 3: Per-bucket merge + sort -> write to train/test ArrayRecord (~5GB RAM)
+
+    Train/test split: hash_src_addr(src_addr) % 10 < 9 -> train (~90/10).
 
     Args:
         input_pattern: Glob pattern for input parquet files
         output_dir: Output directory for ArrayRecord files
         max_row_size_mb: Maximum row size in MB
-        train_ratio: Ratio of probes for training set
-        num_workers: Number of worker processes (default: CPU count)
-        memory_limit_gb: DuckDB memory limit in GB (default: available - 1GB)
+        num_workers: Number of worker processes for Pass 1 (default: CPU count)
+        n_buckets: Number of hash buckets for partitioning (default: 100)
         temp_dir_path: Temp directory for intermediate files (enables resume on failure)
     """
     if num_workers is None:
         num_workers = cpu_count()
 
-    if memory_limit_gb is None:
-        available_gb = get_available_memory_gb()
-        memory_limit_gb = max(1.0, available_gb - 1.0)
-
     output_dir.mkdir(parents=True, exist_ok=True)
     max_size_bytes = int(max_row_size_mb * 1024 * 1024)
 
-    print(f"=" * 80)
-    print(f"PROBE ROW PREPROCESSING (direct streaming)")
-    print(f"=" * 80)
+    print("=" * 80)
+    print("PROBE ROW PREPROCESSING (hash-partition)")
+    print("=" * 80)
     print(f"Workers: {num_workers}")
-    print(f"Memory limit: {memory_limit_gb:.1f}GB")
+    print(f"Buckets: {n_buckets}")
     print(f"Input: {input_pattern}")
     print(f"Output: {output_dir}")
     print()
@@ -472,7 +493,6 @@ def process_parquet_to_probe_rows_streaming(
 
         if len(existing_nonzero) == len(parquet_files):
             print(f"  RESUMING: Found {len(existing_nonzero)} existing grouped files, skipping Pass 1")
-            per_file_time = 0.0
         else:
             if existing_nonzero:
                 print(f"  Found {len(existing_nonzero)}/{len(parquet_files)} existing files (incomplete), re-running Pass 1")
@@ -500,20 +520,18 @@ def process_parquet_to_probe_rows_streaming(
             print(f"  Per-file GROUP BY complete: {len(parquet_files)} files in {per_file_time:.1f}s")
 
         # ============================================================
-        # Pass 2: Stream sorted data directly to ArrayRecord
+        # Pass 2: Hash-partition into buckets
         # ============================================================
-        intermediate_glob = str(intermediate_dir / "grouped_*.parquet")
+        bucket_dir = temp_dir / "buckets"
+        _hash_partition_intermediates(intermediate_dir, bucket_dir, n_buckets)
 
-        stats = _stream_to_arrayrecord(
-            intermediate_glob=intermediate_glob,
-            output_dir=output_dir,
-            train_ratio=train_ratio,
-            max_size_bytes=max_size_bytes,
-            memory_limit_gb=memory_limit_gb,
-            temp_dir=str(temp_dir),
-        )
+        # ============================================================
+        # Pass 3: Process buckets -> ArrayRecord
+        # ============================================================
+        stats = _process_all_buckets(bucket_dir, output_dir, n_buckets, max_size_bytes)
 
         total_time = time.time() - start_time
+        total_measurements = stats['train_measurements'] + stats['test_measurements']
 
         # Print summary
         print("\n" + "=" * 80)
@@ -522,11 +540,11 @@ def process_parquet_to_probe_rows_streaming(
 
         print(f"\nPerformance:")
         print(f"  Total time: {total_time:.1f}s ({total_time/60:.1f}m)")
-        print(f"  Streaming: {stats['stream_time']:.1f}s")
-        print(f"  Throughput: {stats['total_measurements']/total_time:,.0f} measurements/sec")
+        print(f"  Bucket processing: {stats['process_time']:.1f}s")
+        if total_time > 0:
+            print(f"  Throughput: {total_measurements/total_time:,.0f} measurements/sec")
 
         print(f"\nTrain set:")
-        print(f"  Probes: {stats['n_train']:,}")
         print(f"  ArrayRecord rows: {stats['train_rows']:,}")
         print(f"  Measurements: {stats['train_measurements']:,}")
         if stats['train_rows'] > 0:
@@ -534,12 +552,13 @@ def process_parquet_to_probe_rows_streaming(
         print(f"  Output: {stats['train_output']}")
 
         print(f"\nTest set:")
-        print(f"  Probes: {stats['n_test']:,}")
         print(f"  ArrayRecord rows: {stats['test_rows']:,}")
         print(f"  Measurements: {stats['test_measurements']:,}")
         if stats['test_rows'] > 0:
             print(f"  Avg measurements/row: {stats['test_measurements']/stats['test_rows']:.1f}")
         print(f"  Output: {stats['test_output']}")
+
+        print(f"\nTotal probes: {stats['probes']:,}")
 
         success = True
 
@@ -554,7 +573,7 @@ def process_parquet_to_probe_rows_streaming(
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Probe row preprocessing: per-file GROUP BY + direct streaming to ArrayRecord"
+        description="Probe row preprocessing: per-file GROUP BY + hash partition + bucket merge to ArrayRecord"
     )
     parser.add_argument(
         "--input",
@@ -573,22 +592,16 @@ def main():
         help="Maximum row size in MB (default: 8.0)"
     )
     parser.add_argument(
-        "--train-ratio",
-        type=float,
-        default=0.9,
-        help="Train/test split ratio (default: 0.9)"
-    )
-    parser.add_argument(
         "--workers",
         type=int,
         default=None,
-        help="Number of worker processes (default: CPU count)"
+        help="Number of worker processes for Pass 1 (default: CPU count)"
     )
     parser.add_argument(
-        "--memory-limit-gb",
-        type=float,
-        default=None,
-        help="DuckDB memory limit in GB (default: available - 1GB)"
+        "--n-buckets",
+        type=int,
+        default=100,
+        help="Number of hash buckets for partitioning (default: 100)"
     )
     parser.add_argument(
         "--temp-dir",
@@ -603,9 +616,8 @@ def main():
         input_pattern=args.input,
         output_dir=Path(args.output),
         max_row_size_mb=args.max_row_size_mb,
-        train_ratio=args.train_ratio,
         num_workers=args.workers,
-        memory_limit_gb=args.memory_limit_gb,
+        n_buckets=args.n_buckets,
         temp_dir_path=args.temp_dir,
     )
 

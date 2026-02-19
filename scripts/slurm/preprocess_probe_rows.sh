@@ -5,7 +5,7 @@
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=64
-#SBATCH --mem=512G
+#SBATCH --mem=64G
 #SBATCH --time=2-00:00:00
 #SBATCH --output=/scratch4/workspace/zevwilson_umass_edu-pingdata/ping-llm/logs/preprocess_%j.out
 #SBATCH --error=/scratch4/workspace/zevwilson_umass_edu-pingdata/ping-llm/logs/preprocess_%j.err
@@ -13,26 +13,25 @@
 #SBATCH --mail-user=zevwilson@umass.edu
 
 ###############################################################################
-# Probe Row Preprocessing SLURM Job — Two-pass direct streaming
+# Probe Row Preprocessing SLURM Job — Three-pass hash-partition
 #
 # Architecture:
-#   Pass 1: Per-file GROUP BY (parallel, 48 workers * 8GB = 384GB peak)
-#   Pass 2: DuckDB ORDER BY src_addr (external sort) → stream Arrow batches →
-#           accumulate per src_addr → sort by event_time → write ArrayRecord
+#   Pass 1: Per-file GROUP BY (parallel, 30 workers * 8GB = 240GB peak)
+#           (already completed — will be skipped on resume)
+#   Pass 2: Hash-partition intermediates into 100 bucket files (~2GB RAM)
+#   Pass 3: Per-bucket merge by src_addr + sort -> write to ArrayRecord (~5GB RAM)
 #
 # Resource Estimates:
 #   - Input: 720 parquet files, 699 GB, ~25.3B rows
 #   - Unique probes (src_addr): ~20,000
-#   - Pass 1: ~4h (skipped on resume if intermediate files exist)
-#   - Pass 2: ~2-3h (DuckDB sort + Arrow streaming + ArrayRecord write)
-#   - Expected total time: 6-8 hours
-#   - Disk needed: ~700 GB intermediate + ~100 GB final output
+#   - Pass 1: ~6.5h (already done, skipped on resume)
+#   - Pass 2: ~30 min (hash partition, ~2GB RAM)
+#   - Pass 3: ~60 min (bucket merge -> ArrayRecord, ~5GB RAM)
+#   - Disk needed: ~700 GB intermediate + ~420 GB buckets + ~100 GB final output
 #
-# Memory: 512 GB requested
-#   - Pass 1: 48 workers * 8GB = 384GB
-#   - Pass 2: DuckDB sort buffers (300GB limit) + ~57MB per probe
+# Memory: 64 GB requested (Pass 1 already done; Pass 2+3 need <10GB)
 #
-# No intermediate merged parquet needed — streams directly to ArrayRecord.
+# Train/test split: hash_src_addr(src_addr) % 10 < 9 -> train (~90/10)
 ###############################################################################
 
 set -euo pipefail
@@ -81,22 +80,18 @@ import duckdb; print(f'  duckdb {duckdb.__version__}')
 import pyarrow; print(f'  pyarrow {pyarrow.__version__}')
 import pyarrow.compute; print(f'  pyarrow.compute OK')
 import array_record.python.array_record_module; print(f'  array_record OK')
-import psutil; print(f'  psutil {psutil.__version__}')
 "
 
-# Set DuckDB temp directory via environment variable as a fallback
+# Set temp directory via environment variable as a fallback
 export TMPDIR="${TEMP_DIR}"
 
-# Configure resource allocation:
-# - Pass 1: 48 workers * 8GB = 384GB (per-file GROUP BY)
-# - Pass 2: DuckDB external sort with 300GB limit (single-threaded streaming)
-DUCKDB_MEMORY_GB=300
-NUM_WORKERS=48
+NUM_WORKERS=30
+N_BUCKETS=100
 
 echo ""
 echo "Configuration:"
-echo "  DuckDB memory limit: ${DUCKDB_MEMORY_GB} GB"
 echo "  Worker processes: ${NUM_WORKERS}"
+echo "  Hash buckets: ${N_BUCKETS}"
 echo "  Input: ${INPUT_PATTERN}"
 echo "  Output: ${OUTPUT_DIR}"
 echo "  Temp: ${TEMP_DIR}"
@@ -110,9 +105,8 @@ python3 "${SCRIPT}" \
     --input "${INPUT_PATTERN}" \
     --output "${OUTPUT_DIR}" \
     --workers "${NUM_WORKERS}" \
-    --memory-limit-gb "${DUCKDB_MEMORY_GB}" \
+    --n-buckets "${N_BUCKETS}" \
     --max-row-size-mb 8.0 \
-    --train-ratio 0.9 \
     --temp-dir "${TEMP_DIR}"
 
 echo ""
