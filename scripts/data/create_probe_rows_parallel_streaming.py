@@ -319,30 +319,34 @@ def _process_bucket(
     import pyarrow.parquet as pq
 
     table = pq.read_table(bucket_path)
-    # Combine chunks into single arrays (read_table returns ChunkedArrays)
-    src_addrs = table.column('src_addr').combine_chunks()
-    meas_col = table.column('measurements').combine_chunks()
+    src_addrs_chunked = table.column('src_addr')
+    meas_chunked = table.column('measurements')
 
-    # Group rows by src_addr using a Python dict
-    # Each intermediate row has src_addr + measurements (list of structs)
+    # Group rows by src_addr using a Python dict.
+    # Iterate per-chunk to avoid combine_chunks() offset overflow on large
+    # nested list columns (>2GB).
     probe_chunks = {}  # src_addr -> list of StructArray chunks
-    flat_values = meas_col.values
-    list_offsets = meas_col.offsets
+    row_offset = 0
+    for chunk_idx in range(src_addrs_chunked.num_chunks):
+        src_chunk = src_addrs_chunked.chunk(chunk_idx)
+        meas_chunk = meas_chunked.chunk(chunk_idx)
+        flat_values = meas_chunk.values
+        list_offsets = meas_chunk.offsets
 
-    for i in range(len(table)):
-        src = src_addrs[i].as_py()
-        if src is None:
-            continue
-        start = list_offsets[i].as_py()
-        end = list_offsets[i + 1].as_py()
-        chunk = flat_values.slice(start, end - start)
+        for i in range(len(src_chunk)):
+            src = src_chunk[i].as_py()
+            if src is None:
+                continue
+            start = list_offsets[i].as_py()
+            end = list_offsets[i + 1].as_py()
+            chunk = flat_values.slice(start, end - start)
 
-        if src in probe_chunks:
-            probe_chunks[src].append(chunk)
-        else:
-            probe_chunks[src] = [chunk]
+            if src in probe_chunks:
+                probe_chunks[src].append(chunk)
+            else:
+                probe_chunks[src] = [chunk]
 
-    del table, src_addrs, meas_col, flat_values, list_offsets
+    del table, src_addrs_chunked, meas_chunked
 
     stats = {
         'probes': 0,
