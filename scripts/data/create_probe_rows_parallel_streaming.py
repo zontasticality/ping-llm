@@ -271,6 +271,13 @@ def _hash_partition_intermediates(
 
     for file_idx, intermediate_file in enumerate(intermediate_files):
         table = pq.read_table(intermediate_file)
+
+        # Drop rows with null src_addr
+        null_mask = pc.is_null(table.column('src_addr'))
+        n_nulls = pc.sum(null_mask).as_py()
+        if n_nulls:
+            table = table.filter(pc.invert(null_mask))
+
         src_addrs = table.column('src_addr')
 
         # Compute bucket assignment for each row
@@ -323,6 +330,8 @@ def _process_bucket(
 
     for i in range(len(table)):
         src = src_addrs[i].as_py()
+        if src is None:
+            continue
         start = list_offsets[i].as_py()
         end = list_offsets[i + 1].as_py()
         chunk = flat_values.slice(start, end - start)
