@@ -319,8 +319,9 @@ def _process_bucket(
     import pyarrow.parquet as pq
 
     table = pq.read_table(bucket_path)
-    src_addrs = table.column('src_addr')
-    meas_col = table.column('measurements')
+    # Combine chunks into single arrays (read_table returns ChunkedArrays)
+    src_addrs = table.column('src_addr').combine_chunks()
+    meas_col = table.column('measurements').combine_chunks()
 
     # Group rows by src_addr using a Python dict
     # Each intermediate row has src_addr + measurements (list of structs)
