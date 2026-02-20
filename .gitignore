@@ -154,3 +154,6 @@ gha-creds-*.json
 /outputs/
 /wandb/
 /node_modules/
+
+# SLURM venv
+.slurm_venv/
