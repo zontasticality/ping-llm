@@ -8,7 +8,7 @@ sys.path.insert(0, 'src')
 
 from datetime import datetime
 import numpy as np
-from MaxText.input_pipeline._probe_chunk_datasource import ProbeRowSampler
+from ping_llm.data.datasource import ProbeRowSampler
 
 # Create a test row with a single measurement
 test_row = {

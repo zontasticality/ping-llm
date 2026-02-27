@@ -20,12 +20,13 @@ from pathlib import Path
 import random
 import numpy as np
 
-# Ensure repo root is on sys.path for MaxText imports when running locally or in Modal
+# Ensure repo root/src is on sys.path for ping_llm imports
 REPO_ROOT = Path(__file__).resolve().parent.parent.parent
-if str(REPO_ROOT) not in sys.path:
-    sys.path.insert(0, str(REPO_ROOT))
+SRC_ROOT = REPO_ROOT / "src"
+if str(SRC_ROOT) not in sys.path:
+    sys.path.insert(0, str(SRC_ROOT))
 
-from MaxText.input_pipeline.probe_chunk_pipeline import build_probe_chunk_dataset
+from ping_llm.data.pipeline import build_probe_chunk_dataset
 
 
 def find_arrayrecord_files(base_dir: Path, split: str) -> list[Path]:
@@ -78,7 +79,7 @@ def analyze_split(
 
         # Count chunks in shard
         try:
-            from MaxText.input_pipeline._probe_chunk_datasource import (
+            from ping_llm.data.datasource import (
                 ProbeChunkDataSource,
             )
 
@@ -302,25 +303,13 @@ try:
         .add_local_file("README.md", f"{WORKDIR}/README.md", copy=True)
         .add_local_file("build_hooks.py", f"{WORKDIR}/build_hooks.py", copy=True)
         .add_local_dir("dependencies", f"{WORKDIR}/dependencies", copy=True)
-        .add_local_file(
-            "src/MaxText/__init__.py", f"{WORKDIR}/src/MaxText/__init__.py", copy=True
-        )  # Only __init__.py for version
-        .add_local_dir(
-            "src/install_maxtext_extra_deps",
-            f"{WORKDIR}/src/install_maxtext_extra_deps",
-            copy=True,
-        )
         # Stage 2: Install dependencies (this layer is cached unless above files change)
-        .run_commands(
-            f"cd {WORKDIR} && CC=gcc CXX=g++ uv pip install --system -e '.[cuda12]' --resolution=lowest",
-            f"cd {WORKDIR} && install_maxtext_github_deps",
-        )
         .uv_pip_install(
             "pyarrow",
             "numpy",
             "array_record",
             "grain",
-            "modal",  # ensure modal is available inside the container
+            "modal",
         )
         # Stage 3: Copy the rest of the code (fast layer that rebuilds on code changes)
         # CACHE BUST: 2025-12-16-12 - Changed to SIGINT in train_with_wandb_sync.py

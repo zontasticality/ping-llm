@@ -7,7 +7,7 @@ import sys
 sys.path.insert(0, 'src')
 
 from datetime import datetime
-from MaxText.input_pipeline.network_tokenization import encode_measurement
+from ping_llm.data.tokenization import encode_measurement
 
 # Create a test measurement
 test_measurement = {

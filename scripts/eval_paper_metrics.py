@@ -16,10 +16,6 @@ def _in_modal_runtime():
 
 
 IN_MODAL_RUNTIME = _in_modal_runtime()
-if not IN_MODAL_RUNTIME:
-    os.environ["JAX_PLATFORMS"] = "cpu"
-    os.environ["CUDA_VISIBLE_DEVICES"] = ""
-os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
 
 import argparse
 import json
@@ -30,14 +26,12 @@ import urllib.request
 import subprocess
 import sys
 import threading
-import time
 import shutil
 import ipaddress
 from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-import jax
-import jax.numpy as jnp
+import torch
 import numpy as np
 import pandas as pd
 from scipy.stats import entropy
@@ -56,7 +50,7 @@ if IN_MODAL_RUNTIME and (workspace_root / "src").exists():
 else:
     repo_root = Path(__file__).resolve().parent.parent
 
-sys.path.insert(0, str(repo_root))
+sys.path.insert(0, str(repo_root / "src"))
 
 plt.style.use("seaborn-v0_8")
 
@@ -102,21 +96,10 @@ if MODAL_AVAILABLE:
         .pip_install("uv")
         .add_local_file("pyproject.toml", f"{WORKDIR}/pyproject.toml", copy=True)
         .add_local_file("README.md", f"{WORKDIR}/README.md", copy=True)
-        .add_local_file("build_hooks.py", f"{WORKDIR}/build_hooks.py", copy=True)
-        .add_local_dir("dependencies", f"{WORKDIR}/dependencies", copy=True)
-        .add_local_file(
-            "src/MaxText/__init__.py", f"{WORKDIR}/src/MaxText/__init__.py", copy=True
-        )
-        .add_local_dir(
-            "src/install_maxtext_extra_deps",
-            f"{WORKDIR}/src/install_maxtext_extra_deps",
-            copy=True,
-        )
+        .add_local_dir("src", f"{WORKDIR}/src", copy=True)
         .run_commands(
-            f"cd {WORKDIR} && CC=gcc CXX=g++ uv pip install --system -e '.[cuda12]' --resolution=lowest",
-            f"cd {WORKDIR} && install_maxtext_github_deps",
+            f"cd {WORKDIR} && uv pip install --system -e '.[cuda12]'",
         )
-        .uv_pip_install("google-jetstream")
         .uv_pip_install("pandas", "pyarrow", "duckdb", "scipy", "matplotlib")
         .add_local_dir(".", WORKDIR, ignore=IGNORE_PATTERNS, copy=True)
     )
@@ -124,12 +107,11 @@ if MODAL_AVAILABLE:
     app = modal.App(APP_NAME)
     shared_vol = modal.Volume.from_name(VOLUME_NAME, create_if_missing=True)
 
-from src.MaxText import max_utils
 try:
-    from src.MaxText.input_pipeline._probe_chunk_datasource import ProbeRowDataSource
+    from ping_llm.data.datasource import ProbeRowDataSource
 except ImportError:
     ProbeRowDataSource = None
-from src.MaxText.input_pipeline.network_tokenization import (
+from ping_llm.data.tokenization import (
     BYTE_TOKEN_OFFSET,
     DST_IPV4,
     DST_IPV6,
@@ -150,6 +132,7 @@ from src.MaxText.input_pipeline.network_tokenization import (
     token_to_byte,
     VOCAB_SIZE,
 )
+from ping_llm.inference import load_model, generate, get_logits, get_log_probs
 
 DEFAULT_REGULAR_DOMAINS = [
     "umass.edu",
@@ -238,32 +221,6 @@ VARIANT_END_FIELDS = [
 ]
 
 
-def build_config(
-    checkpoint_path,
-    config_path,
-    max_prefill_length,
-    max_target_length,
-    use_gpu=False,
-):
-    from src.MaxText import pyconfig as maxtext_pyconfig
-    checkpoint_path = str(Path(checkpoint_path).resolve())
-    config_path = str(resolve_repo_path(config_path))
-
-    argv = [
-        "eval_script",
-        config_path,
-        f"load_parameters_path={checkpoint_path}",
-        f"hardware={'gpu' if use_gpu else 'cpu'}",
-        "skip_jax_distributed_system=true",
-        f"max_prefill_predict_length={max_prefill_length}",
-        f"max_target_length={max_target_length}",
-        "attention=dot_product",
-    ]
-
-    config = maxtext_pyconfig.initialize(argv)
-    return config, checkpoint_path
-
-
 def resolve_repo_path(path_str):
     path = Path(path_str)
     if path.is_absolute():
@@ -277,39 +234,19 @@ def resolve_repo_path(path_str):
     return path
 
 
-def setup_engine(config):
-    from src.MaxText import maxengine
+def compute_prompt_logprobs(model, device, tokens):
+    """Compute per-token log probs using PyTorch inference.
 
-    engine = maxengine.MaxEngine(config)
-    rng = jax.random.PRNGKey(0)
-    params = engine.load_params(rng=rng)
-    return engine, params
-
-
-def pad_tokens(tokens, target_len):
-    seq = tokens[:target_len]
-    padded = np.zeros(target_len, dtype=np.int32)
-    padded[: len(seq)] = seq
-    return padded, len(seq)
-
-
-def extract_token(result_tokens, slot):
-    token_idx = result_tokens.tokens_idx[0]
-    return int(np.asarray(result_tokens.data)[slot, token_idx])
-
-
-def compute_prompt_logprobs(engine, params, config, tokens, rng):
-    padded, true_length = pad_tokens(tokens, config.max_prefill_predict_length)
-    rng, rng_prefill = jax.random.split(rng)
-    prefix, _ = engine.prefill(
-        params=params,
-        padded_tokens=jnp.array(padded),
-        true_length=true_length,
-        rng=rng_prefill,
-        return_prompt_logp=True,
-    )
-    prompt_logp = np.array(prefix["prompt_logp"])[0]
-    return prompt_logp[:true_length], rng
+    Returns an array of length len(tokens) where index 0 is NaN
+    (no prediction for the first token) and index i (for i>=1) is
+    log P(token[i] | token[0..i-1]).
+    """
+    log_probs = get_log_probs(model, tokens, device=device)  # length len(tokens)-1
+    # Prepend NaN so indices align with the token list
+    result = np.empty(len(tokens), dtype=np.float32)
+    result[0] = float("nan")
+    result[1:] = log_probs.cpu().numpy()
+    return result
 
 
 def summarize_logps(logps):
@@ -866,174 +803,89 @@ def create_conditioning_tokens(src_ip, dst_ip, include_timestamp=False):
 
 
 def sample_rtt_from_model(
-    engine,
-    params,
-    config,
+    model,
+    device,
     conditioning_tokens,
     num_samples=100,
     temperature=1.0,
-    sampling_strategy="weighted",
-    rng=None,
+    **_kwargs,
 ):
+    """Sample RTT values by generating 3 tokens (RTT_START + byte1 + byte2)."""
     rtt_samples = []
     timeout_count = 0
     invalid_count = 0
-    if rng is None:
-        rng = jax.random.PRNGKey(int(time.time() * 1000) % 2**31)
 
-    max_slots = engine.max_concurrent_decodes
-    padded_tokens, true_length = pad_tokens(
-        conditioning_tokens, config.max_prefill_predict_length
-    )
-    padded_tokens = jnp.array(padded_tokens)
-
-    for start in range(0, num_samples, max_slots):
-        batch_size = min(max_slots, num_samples - start)
-        rng, rng_state = jax.random.split(rng)
-        decode_state = engine.init_decode_state(rng=rng_state)
-
-        first_tokens = []
-        for slot in range(batch_size):
-            rng, rng_prefill = jax.random.split(rng)
-            prefix, first = engine.prefill(
-                params=params,
-                padded_tokens=padded_tokens,
-                true_length=true_length,
-                rng=rng_prefill,
-                slot=slot,
-                temperature=temperature,
-                algorithm=sampling_strategy,
-            )
-            decode_state = engine.insert(
-                prefix=prefix, decode_state=decode_state, slot=slot
-            )
-            first_tokens.append(extract_token(first, slot=0))
-
-        rng, rng_gen1 = jax.random.split(rng)
-        decode_state, result_tokens = engine.generate(
-            params=params,
-            decode_state=decode_state,
-            rng=rng_gen1,
+    for _ in range(num_samples):
+        generated = generate(
+            model,
+            conditioning_tokens,
+            max_new_tokens=3,
             temperature=temperature,
-            algorithm=sampling_strategy,
+            device=device,
         )
-        second_tokens = np.asarray(result_tokens.data)[:, result_tokens.tokens_idx[0]]
+        new_tokens = generated[len(conditioning_tokens):]
+        if len(new_tokens) < 1:
+            invalid_count += 1
+            continue
 
-        rng, rng_gen2 = jax.random.split(rng)
-        decode_state, result_tokens = engine.generate(
-            params=params,
-            decode_state=decode_state,
-            rng=rng_gen2,
-            temperature=temperature,
-            algorithm=sampling_strategy,
-        )
-        third_tokens = np.asarray(result_tokens.data)[:, result_tokens.tokens_idx[0]]
-
-        for slot in range(batch_size):
-            first_token = int(first_tokens[slot])
-            second_token = int(second_tokens[slot])
-            third_token = int(third_tokens[slot])
-            try:
-                if first_token == FAILED:
-                    timeout_count += 1
-                    continue
-                if first_token != RTT_START:
-                    invalid_count += 1
-                    continue
-                if second_token == FAILED or third_token == FAILED:
-                    invalid_count += 1
-                    continue
-                byte1 = token_to_byte(second_token)
-                byte2 = token_to_byte(third_token)
-                rtt_ms = decode_rtt_exponent_mantissa(byte1, byte2)
-                rtt_samples.append(rtt_ms)
-            except Exception:
+        first_token = new_tokens[0]
+        try:
+            if first_token == FAILED:
+                timeout_count += 1
+                continue
+            if first_token != RTT_START:
                 invalid_count += 1
                 continue
-            finally:
-                if (
-                    getattr(engine, "page_manager", None) is not None
-                    and getattr(engine.config, "attention", None) == "paged"
-                ):
-                    engine.release_pages(slot=slot)
+            if len(new_tokens) < 3:
+                invalid_count += 1
+                continue
+            second_token = new_tokens[1]
+            third_token = new_tokens[2]
+            if second_token == FAILED or third_token == FAILED:
+                invalid_count += 1
+                continue
+            byte1 = token_to_byte(second_token)
+            byte2 = token_to_byte(third_token)
+            rtt_ms = decode_rtt_exponent_mantissa(byte1, byte2)
+            rtt_samples.append(rtt_ms)
+        except Exception:
+            invalid_count += 1
+            continue
 
     return rtt_samples, timeout_count, invalid_count
 
 
 def sample_tokens_from_model(
-    engine,
-    params,
-    config,
+    model,
+    device,
     sequences,
     max_new_tokens,
     temperature=1.0,
-    sampling_strategy="weighted",
-    rng=None,
+    **_kwargs,
 ):
-    if rng is None:
-        rng = jax.random.PRNGKey(int(time.time() * 1000) % 2**31)
+    """Generate tokens for each prompt sequence using PyTorch inference."""
     if max_new_tokens < 1:
-        return [[] for _ in sequences], rng
+        return [[] for _ in sequences]
 
-    completions = [[] for _ in sequences]
-    max_slots = engine.max_concurrent_decodes
+    completions = []
+    for seq in sequences:
+        generated = generate(
+            model,
+            seq,
+            max_new_tokens=max_new_tokens,
+            temperature=temperature,
+            device=device,
+        )
+        new_tokens = generated[len(seq):]
+        completions.append(new_tokens)
 
-    for start in range(0, len(sequences), max_slots):
-        batch = sequences[start : start + max_slots]
-        batch_size = len(batch)
-        rng, rng_state = jax.random.split(rng)
-        decode_state = engine.init_decode_state(rng=rng_state)
-
-        first_tokens = []
-        for slot, seq in enumerate(batch):
-            padded, true_length = pad_tokens(seq, config.max_prefill_predict_length)
-            rng, rng_prefill = jax.random.split(rng)
-            prefix, first = engine.prefill(
-                params=params,
-                padded_tokens=jnp.array(padded),
-                true_length=true_length,
-                rng=rng_prefill,
-                slot=slot,
-                temperature=temperature,
-                algorithm=sampling_strategy,
-            )
-            decode_state = engine.insert(
-                prefix=prefix, decode_state=decode_state, slot=slot
-            )
-            first_tokens.append(extract_token(first, slot=0))
-
-        for slot, token in enumerate(first_tokens):
-            completions[start + slot].append(int(token))
-
-        for _ in range(max_new_tokens - 1):
-            rng, rng_gen = jax.random.split(rng)
-            decode_state, result_tokens = engine.generate(
-                params=params,
-                decode_state=decode_state,
-                rng=rng_gen,
-                temperature=temperature,
-                algorithm=sampling_strategy,
-            )
-            tokens = np.asarray(result_tokens.data)[:, result_tokens.tokens_idx[0]]
-            for slot in range(batch_size):
-                completions[start + slot].append(int(tokens[slot]))
-
-        if (
-            getattr(engine, "page_manager", None) is not None
-            and getattr(engine.config, "attention", None) == "paged"
-        ):
-            for slot in range(batch_size):
-                engine.release_pages(slot=slot)
-
-    return completions, rng
+    return completions
 
 
 def sample_destination_ips_for_target(
-    engine,
-    params,
-    config,
+    model,
+    device,
     rng,
-    jax_rng,
     src_ipv4,
     src_ipv6,
     target_ms,
@@ -1041,10 +893,10 @@ def sample_destination_ips_for_target(
     max_attempts,
     max_new_tokens,
     temperature,
-    sampling_strategy,
     ipv6_weight,
     include_timestamp=True,
     current_time=None,
+    **_kwargs,
 ):
     samples = []
     seen = set()
@@ -1055,59 +907,47 @@ def sample_destination_ips_for_target(
     current_time = current_time or datetime.now()
 
     while len(samples) < samples_per_target and attempts < max_attempts:
-        remaining_attempts = max_attempts - attempts
-        batch_size = min(engine.max_concurrent_decodes, remaining_attempts)
-        sequences = []
-        desired_versions = []
-        for _ in range(batch_size):
-            ip_version = choose_ip_version(rng, ipv6_weight, has_ipv6)
-            src_ip = src_ipv6 if ip_version == 6 else src_ipv4
-            context = create_latency_sampling_context(
-                src_ip,
-                ip_version,
-                target_ms,
-                include_timestamp=include_timestamp,
-                current_time=current_time,
-            )
-            sequences.append(context)
-            desired_versions.append(ip_version)
-
-        completions, jax_rng = sample_tokens_from_model(
-            engine,
-            params,
-            config,
-            sequences,
-            max_new_tokens,
-            temperature=temperature,
-            sampling_strategy=sampling_strategy,
-            rng=jax_rng,
+        ip_version = choose_ip_version(rng, ipv6_weight, has_ipv6)
+        src_ip = src_ipv6 if ip_version == 6 else src_ipv4
+        context = create_latency_sampling_context(
+            src_ip,
+            ip_version,
+            target_ms,
+            include_timestamp=include_timestamp,
+            current_time=current_time,
         )
 
-        for completion, ip_version in zip(completions, desired_versions):
-            role_token = DST_IPV6 if ip_version == 6 else DST_IPV4
-            ip_str = extract_dst_ip_from_tokens(
-                [role_token] + completion, ip_version=ip_version
-            )
-            if ip_str is None:
-                invalid += 1
-                continue
+        completions = sample_tokens_from_model(
+            model,
+            device,
+            [context],
+            max_new_tokens,
+            temperature=temperature,
+        )
+
+        completion = completions[0]
+        role_token = DST_IPV6 if ip_version == 6 else DST_IPV4
+        ip_str = extract_dst_ip_from_tokens(
+            [role_token] + completion, ip_version=ip_version
+        )
+        if ip_str is None:
+            invalid += 1
+        else:
             key = (ip_version, ip_str)
             if key in seen:
                 duplicate += 1
-                continue
-            seen.add(key)
-            samples.append({"dst_ip": ip_str, "ip_version": ip_version})
-            if len(samples) >= samples_per_target:
-                break
+            else:
+                seen.add(key)
+                samples.append({"dst_ip": ip_str, "ip_version": ip_version})
 
-        attempts += batch_size
+        attempts += 1
 
     meta = {
         "attempted": attempts,
         "invalid": invalid,
         "duplicate": duplicate,
     }
-    return samples, meta, jax_rng
+    return samples, meta
 
 
 def compute_rtt_range(real_vals, model_vals, max_rtt):
@@ -1347,11 +1187,6 @@ def build_parser():
         help="Run name for param-only checkpoints",
     )
     parser.add_argument(
-        "--config",
-        default="src/MaxText/configs/latency_network.yml",
-        help="Config file path",
-    )
-    parser.add_argument(
         "--output-dir",
         default=None,
         help="Output directory (default: outputs/paper_metrics/default)",
@@ -1511,7 +1346,6 @@ def build_parser():
 def run(args):
     selected = parse_only_arg(args.only)
     rng = np.random.default_rng(args.seed)
-    jax_rng = jax.random.PRNGKey(args.seed)
 
     run_id = args.run_name or "default"
     output_dir = Path(args.output_dir) if args.output_dir else Path(DEFAULT_OUTPUT_DIR)
@@ -1530,12 +1364,10 @@ def run(args):
             "seed": args.seed,
             "checkpoint": str(resolved_checkpoint),
             "checkpoint_source": checkpoint_source,
-            "config": str(args.config),
         }
     }
 
     mode_variants = []
-    max_prefill_len = 1
 
     rtt_pairs = []
     latency_targets = []
@@ -1554,16 +1386,6 @@ def run(args):
                 rng,
                 sample_rows=args.timestamp_sample_rows,
             )
-            for pair in rtt_pairs:
-                context_full = pair["context_full"]
-                expected_full = pair["expected_full"]
-                context_none = pair["context_none"]
-                expected_none = pair["expected_none"]
-                max_prefill_len = max(
-                    max_prefill_len,
-                    len(context_full) + len(expected_full),
-                    len(context_none) + len(expected_none),
-                )
 
     if "modes" in selected:
         parquet_path = Path(args.parquet)
@@ -1578,11 +1400,6 @@ def run(args):
             for row in samples.itertuples(index=False):
                 row_dict = row._asdict()
                 mode_variants.extend(build_measurement_variants(row_dict))
-            max_mode_len = max(
-                (len(v["context_tokens"]) + len(v["expected_tokens"]) for v in mode_variants),
-                default=1,
-            )
-            max_prefill_len = max(max_prefill_len, max_mode_len)
 
     ping_include_timestamp = not args.ping_no_timestamp
     ping_src_ip = None
@@ -1592,12 +1409,6 @@ def run(args):
         regular_domains = parse_list(args.regular_domains)
         anchor_ips = parse_list(args.anchor_ips)
         ping_targets = build_ping_targets(regular_domains, anchor_ips)
-        if ping_targets:
-            sample_dst = ping_targets[0]["ip"]
-            cond_tokens = create_conditioning_tokens(
-                ping_src_ip, sample_dst, include_timestamp=ping_include_timestamp
-            )
-            max_prefill_len = max(max_prefill_len, len(cond_tokens))
 
     if "latency_sampling" in selected:
         latency_targets = parse_latency_targets(args.latency_targets)
@@ -1608,33 +1419,6 @@ def run(args):
             latency_src_ipv4 = get_src_ip()
             latency_src_ipv6 = get_src_ipv6()
             latency_context_time = datetime.now()
-            sample_target = next(
-                (t for t in latency_targets if not t["is_timeout"]), latency_targets[0]
-            )
-            sample_ms = sample_target["target_ms"]
-            sample_ctx = create_latency_sampling_context(
-                latency_src_ipv4,
-                4,
-                sample_ms,
-                include_timestamp=True,
-                current_time=latency_context_time,
-            )
-            max_prefill_len = max(max_prefill_len, len(sample_ctx))
-            if latency_src_ipv6:
-                sample_ctx6 = create_latency_sampling_context(
-                    latency_src_ipv6,
-                    6,
-                    sample_ms,
-                    include_timestamp=True,
-                    current_time=latency_context_time,
-                )
-                max_prefill_len = max(max_prefill_len, len(sample_ctx6))
-
-    max_extra_tokens = 3
-    if "latency_sampling" in selected:
-        max_extra_tokens = max(max_extra_tokens, args.latency_sample_max_new_tokens)
-    max_target_len = max_prefill_len + max_extra_tokens
-    use_gpu = IN_MODAL_RUNTIME or os.environ.get("JAX_PLATFORMS") == "gpu"
 
     if not selected:
         print("Nothing selected to run.")
@@ -1642,194 +1426,165 @@ def run(args):
 
     metrics["run"]["selected"] = sorted(selected)
 
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+
     print(f"Output directory: {output_dir}")
-    print(f"Max prefill length: {max_prefill_len}")
     print(f"Checkpoint: {resolved_checkpoint}")
+    print(f"Device: {device}")
 
-    config, checkpoint_path = build_config(
-        resolved_checkpoint,
-        args.config,
-        max_prefill_len,
-        max_target_len,
-        use_gpu=use_gpu,
-    )
+    model, model_cfg = load_model(resolved_checkpoint, device=device)
+    print(f"Loaded model from {resolved_checkpoint}")
 
-    with max_utils.maybe_get_transformer_engine_context(config):
-        engine, params = setup_engine(config)
-        print(f"Loaded params from {checkpoint_path}")
+    if "timestamps" in selected:
+        print("Computing RTT logprobs (timestamp vs no timestamp)...")
+        logps_full = []
+        logps_none = []
+        full_rtt_ms = []
+        none_rtt_ms = []
+        full_event_hour = []
+        none_event_hour = []
+        for pair in rtt_pairs:
+            context_full = pair["context_full"]
+            expected_full = pair["expected_full"]
+            context_none = pair["context_none"]
+            expected_none = pair["expected_none"]
+            rtt_ms = pair["rtt_ms"]
+            event_hour = pair["event_hour"]
+            tokens_full = context_full + expected_full
+            logp_full = compute_prompt_logprobs(model, device, tokens_full)
+            start_full = len(context_full)
+            end_full = start_full + len(expected_full)
+            for lp in logp_full[start_full:end_full]:
+                if np.isnan(lp):
+                    continue
+                logps_full.append(lp)
+                full_rtt_ms.append(rtt_ms)
+                full_event_hour.append(event_hour)
 
-        if "timestamps" in selected:
-            print("Computing RTT logprobs (timestamp vs no timestamp)...")
-            logps_full = []
-            logps_none = []
-            full_rtt_ms = []
-            none_rtt_ms = []
-            full_event_hour = []
-            none_event_hour = []
-            for pair in rtt_pairs:
-                context_full = pair["context_full"]
-                expected_full = pair["expected_full"]
-                context_none = pair["context_none"]
-                expected_none = pair["expected_none"]
-                rtt_ms = pair["rtt_ms"]
-                event_hour = pair["event_hour"]
-                tokens_full = context_full + expected_full
-                logp_full, jax_rng = compute_prompt_logprobs(
-                    engine, params, config, tokens_full, jax_rng
-                )
-                start_full = len(context_full)
-                end_full = start_full + len(expected_full)
-                for lp in logp_full[start_full:end_full]:
-                    if np.isnan(lp):
-                        continue
-                    logps_full.append(lp)
-                    full_rtt_ms.append(rtt_ms)
-                    full_event_hour.append(event_hour)
+            tokens_none = context_none + expected_none
+            logp_none = compute_prompt_logprobs(model, device, tokens_none)
+            start_none = len(context_none)
+            end_none = start_none + len(expected_none)
+            for lp in logp_none[start_none:end_none]:
+                if np.isnan(lp):
+                    continue
+                logps_none.append(lp)
+                none_rtt_ms.append(rtt_ms)
+                none_event_hour.append(event_hour)
 
-                tokens_none = context_none + expected_none
-                logp_none, jax_rng = compute_prompt_logprobs(
-                    engine, params, config, tokens_none, jax_rng
-                )
-                start_none = len(context_none)
-                end_none = start_none + len(expected_none)
-                for lp in logp_none[start_none:end_none]:
-                    if np.isnan(lp):
-                        continue
-                    logps_none.append(lp)
-                    none_rtt_ms.append(rtt_ms)
-                    none_event_hour.append(event_hour)
+        flat_full = np.array(logps_full, dtype=np.float32)
+        flat_none = np.array(logps_none, dtype=np.float32)
+        timestamp_payload = {
+            "run": metrics["run"],
+            "params": {
+                "timestamp_parquet": str(args.timestamp_parquet),
+                "timestamp_contexts": args.timestamp_contexts,
+                "timestamp_sample_rows": args.timestamp_sample_rows,
+                "hist_bins": args.hist_bins,
+            },
+            "timestamp_accuracy": {
+                "num_measurements": len(rtt_pairs),
+                "num_tokens_full": int(flat_full.size),
+                "num_tokens_none": int(flat_none.size),
+                "full": summarize_logps(flat_full),
+                "none": summarize_logps(flat_none),
+                "full_logps": flat_full.tolist(),
+                "none_logps": flat_none.tolist(),
+                "full_rtt_ms": full_rtt_ms,
+                "none_rtt_ms": none_rtt_ms,
+                "full_event_hour": full_event_hour,
+                "none_event_hour": none_event_hour,
+            },
+        }
+        timestamp_path = metrics_dir / "timestamp_metrics.json"
+        with timestamp_path.open("w", encoding="utf-8") as f:
+            json.dump(timestamp_payload, f)
+        metrics["timestamp_metrics_file"] = str(timestamp_path)
 
-            flat_full = np.array(logps_full, dtype=np.float32)
-            flat_none = np.array(logps_none, dtype=np.float32)
-            timestamp_payload = {
-                "run": metrics["run"],
-                "params": {
-                    "timestamp_parquet": str(args.timestamp_parquet),
-                    "timestamp_contexts": args.timestamp_contexts,
-                    "timestamp_sample_rows": args.timestamp_sample_rows,
-                    "hist_bins": args.hist_bins,
-                },
-                "timestamp_accuracy": {
-                    "num_measurements": len(rtt_pairs),
-                    "num_tokens_full": int(flat_full.size),
-                    "num_tokens_none": int(flat_none.size),
-                    "full": summarize_logps(flat_full),
-                    "none": summarize_logps(flat_none),
-                    "full_logps": flat_full.tolist(),
-                    "none_logps": flat_none.tolist(),
-                    "full_rtt_ms": full_rtt_ms,
-                    "none_rtt_ms": none_rtt_ms,
-                    "full_event_hour": full_event_hour,
-                    "none_event_hour": none_event_hour,
-                },
+    if "modes" in selected:
+        print("Computing prediction-mode accuracy...")
+        group_logps = {}
+        group_labels = {}
+        for variant in mode_variants:
+            context = variant["context_tokens"]
+            expected = variant["expected_tokens"]
+            if not expected:
+                continue
+            tokens = context + expected
+            logp = compute_prompt_logprobs(model, device, tokens)
+            start = len(context)
+            end = start + len(expected)
+            expected_logp = logp[start:end]
+            group = group_key_for_expected(expected)
+            if group == "unknown" or group == "empty":
+                continue
+            if group not in group_logps:
+                group_logps[group] = [
+                    [] for _ in range(len(expected))
+                ]
+                group_labels[group] = decode_token_stream_pretty(expected)
+            if len(expected) != len(group_logps[group]):
+                continue
+            for idx, lp in enumerate(expected_logp):
+                if not np.isnan(lp):
+                    group_logps[group][idx].append(float(lp))
+
+        group_summary = {}
+        for group, per_pos in group_logps.items():
+            flat = [lp for pos in per_pos for lp in pos]
+            group_summary[group] = summarize_logps(np.array(flat))
+
+        order = [
+            "src_ipv4",
+            "src_ipv6",
+            "dst_ipv4",
+            "dst_ipv6",
+            "rtt",
+            "rtt_failed",
+            "timestamp_abs",
+            "timestamp_delta1",
+            "timestamp_delta4",
+        ]
+        group_payload = {}
+        for group, per_pos in group_logps.items():
+            labels = group_labels.get(group, [str(i) for i in range(len(per_pos))])
+            group_payload[group] = {
+                "labels": labels,
+                "per_pos_logps": per_pos,
+                "summary": group_summary.get(group, {}),
             }
-            timestamp_path = metrics_dir / "timestamp_metrics.json"
-            with timestamp_path.open("w", encoding="utf-8") as f:
-                json.dump(timestamp_payload, f)
-            metrics["timestamp_metrics_file"] = str(timestamp_path)
 
-        if "modes" in selected:
-            print("Computing prediction-mode accuracy...")
-            group_logps = {}
-            group_labels = {}
-            for variant in mode_variants:
-                context = variant["context_tokens"]
-                expected = variant["expected_tokens"]
-                if not expected:
-                    continue
-                tokens = context + expected
-                logp, jax_rng = compute_prompt_logprobs(
-                    engine, params, config, tokens, jax_rng
-                )
-                start = len(context)
-                end = start + len(expected)
-                expected_logp = logp[start:end]
-                group = group_key_for_expected(expected)
-                if group == "unknown" or group == "empty":
-                    continue
-                if group not in group_logps:
-                    group_logps[group] = [
-                        [] for _ in range(len(expected))
-                    ]
-                    group_labels[group] = decode_token_stream_pretty(expected)
-                if len(expected) != len(group_logps[group]):
-                    continue
-                for idx, lp in enumerate(expected_logp):
-                    if not np.isnan(lp):
-                        group_logps[group][idx].append(float(lp))
+        mode_payload = {
+            "run": metrics["run"],
+            "params": {
+                "parquet": str(args.parquet),
+                "mode_samples": args.mode_samples,
+            },
+            "num_variants": len(mode_variants),
+            "group_order": order,
+            "groups": group_payload,
+        }
+        mode_path = metrics_dir / "mode_metrics.json"
+        with mode_path.open("w", encoding="utf-8") as f:
+            json.dump(mode_payload, f)
+        metrics["mode_metrics_file"] = str(mode_path)
 
-            group_summary = {}
-            for group, per_pos in group_logps.items():
-                flat = [lp for pos in per_pos for lp in pos]
-                group_summary[group] = summarize_logps(np.array(flat))
-
-            order = [
-                "src_ipv4",
-                "src_ipv6",
-                "dst_ipv4",
-                "dst_ipv6",
-                "rtt",
-                "rtt_failed",
-                "timestamp_abs",
-                "timestamp_delta1",
-                "timestamp_delta4",
-            ]
-            group_payload = {}
-            for group, per_pos in group_logps.items():
-                labels = group_labels.get(group, [str(i) for i in range(len(per_pos))])
-                group_payload[group] = {
-                    "labels": labels,
-                    "per_pos_logps": per_pos,
-                    "summary": group_summary.get(group, {}),
-                }
-
-            mode_payload = {
-                "run": metrics["run"],
-                "params": {
-                    "parquet": str(args.parquet),
-                    "mode_samples": args.mode_samples,
-                },
-                "num_variants": len(mode_variants),
-                "group_order": order,
-                "groups": group_payload,
-            }
-            mode_path = metrics_dir / "mode_metrics.json"
-            with mode_path.open("w", encoding="utf-8") as f:
-                json.dump(mode_payload, f)
-            metrics["mode_metrics_file"] = str(mode_path)
-
-        if "ping" in selected:
-            print("Running live ping evaluation...")
-            print(f"Source IP: {ping_src_ip}")
-            ping_sampling_strategy = args.ping_sampling_strategy.lower()
-            ping_results = []
-            ping_lock = threading.Lock()
-            ping_real = {}
-            if args.ping_workers > 1:
-                print(f"Pinging targets in parallel (workers={args.ping_workers})")
-                with ThreadPoolExecutor(max_workers=args.ping_workers) as executor:
-                    future_map = {}
-                    for target in ping_targets:
-                        dst_ip = target["ip"]
-                        label = target["label"]
-                        future = executor.submit(
-                            ping_series,
-                            label,
-                            dst_ip,
-                            args.pings_per_ip,
-                            2,
-                            True,
-                            ping_lock,
-                        )
-                        future_map[future] = dst_ip
-                    for future in as_completed(future_map):
-                        dst_ip = future_map[future]
-                        ping_real[dst_ip] = future.result()
-            else:
+    if "ping" in selected:
+        print("Running live ping evaluation...")
+        print(f"Source IP: {ping_src_ip}")
+        ping_sampling_strategy = args.ping_sampling_strategy.lower()
+        ping_results = []
+        ping_lock = threading.Lock()
+        ping_real = {}
+        if args.ping_workers > 1:
+            print(f"Pinging targets in parallel (workers={args.ping_workers})")
+            with ThreadPoolExecutor(max_workers=args.ping_workers) as executor:
+                future_map = {}
                 for target in ping_targets:
                     dst_ip = target["ip"]
                     label = target["label"]
-                    ping_real[dst_ip] = ping_series(
+                    future = executor.submit(
+                        ping_series,
                         label,
                         dst_ip,
                         args.pings_per_ip,
@@ -1837,212 +1592,205 @@ def run(args):
                         True,
                         ping_lock,
                     )
-
+                    future_map[future] = dst_ip
+                for future in as_completed(future_map):
+                    dst_ip = future_map[future]
+                    ping_real[dst_ip] = future.result()
+        else:
             for target in ping_targets:
                 dst_ip = target["ip"]
                 label = target["label"]
-                group = target.get("group")
-                domain = target.get("domain")
-                real_rtts = ping_real.get(dst_ip, [])
-                success_count = sum(1 for r in real_rtts if r >= 0)
-                if success_count == 0:
-                    print(f"{label}: all pings failed; keeping for timeout mass")
-
-                cond_tokens = create_conditioning_tokens(
-                    ping_src_ip, dst_ip, include_timestamp=ping_include_timestamp
-                )
-                model_rtts, model_timeout_count, model_invalid_count = sample_rtt_from_model(
-                    engine,
-                    params,
-                    config,
-                    cond_tokens,
-                    num_samples=args.model_samples,
-                    temperature=args.temperature,
-                    sampling_strategy=ping_sampling_strategy,
-                )
-                model_total = (
-                    len(model_rtts) + model_timeout_count + model_invalid_count
-                )
-                model_timeout_rate = (
-                    model_timeout_count / model_total if model_total else 0.0
-                )
-                real_timeout_rate = (
-                    (len(real_rtts) - success_count) / len(real_rtts)
-                    if real_rtts
-                    else 0.0
-                )
-                real_timeout_count = len(real_rtts) - success_count
-
-                range_min, range_max = compute_rtt_range(
-                    real_rtts,
-                    model_rtts,
-                    args.max_rtt,
-                )
-                real_dist, _ = discretize_rtt_with_timeout(
-                    real_rtts,
-                    real_timeout_count,
-                    bins=args.ping_bins,
-                    range_min=range_min,
-                    range_max=range_max,
-                )
-                model_dist, _ = discretize_rtt_with_timeout(
-                    model_rtts,
-                    model_timeout_count + model_invalid_count,
-                    bins=args.ping_bins,
-                    range_min=range_min,
-                    range_max=range_max,
-                )
-                kl_value = kl_divergence(real_dist, model_dist)
-
-                ping_results.append(
-                    {
-                        "dst_ip": dst_ip,
-                        "domain": domain,
-                        "group": group,
-                        "label": label,
-                        "kl": kl_value,
-                        "real_success_count": success_count,
-                        "model_sample_count": len(model_rtts),
-                        "model_timeout_count": model_timeout_count,
-                        "model_invalid_count": model_invalid_count,
-                        "real_timeout_count": real_timeout_count,
-                        "real_timeout_rate": real_timeout_rate,
-                        "model_timeout_rate": model_timeout_rate,
-                        "range_min": range_min,
-                        "range_max": range_max,
-                        "real_rtts": real_rtts,
-                        "model_rtts": model_rtts,
-                    }
+                ping_real[dst_ip] = ping_series(
+                    label,
+                    dst_ip,
+                    args.pings_per_ip,
+                    2,
+                    True,
+                    ping_lock,
                 )
 
-            avg_kl = (
-                float(np.mean([r["kl"] for r in ping_results]))
-                if ping_results
-                else float("nan")
+        for target in ping_targets:
+            dst_ip = target["ip"]
+            label = target["label"]
+            group = target.get("group")
+            domain = target.get("domain")
+            real_rtts = ping_real.get(dst_ip, [])
+            success_count = sum(1 for r in real_rtts if r >= 0)
+            if success_count == 0:
+                print(f"{label}: all pings failed; keeping for timeout mass")
+
+            cond_tokens = create_conditioning_tokens(
+                ping_src_ip, dst_ip, include_timestamp=ping_include_timestamp
+            )
+            model_rtts, model_timeout_count, model_invalid_count = sample_rtt_from_model(
+                model,
+                device,
+                cond_tokens,
+                num_samples=args.model_samples,
+                temperature=args.temperature,
+            )
+            model_total = (
+                len(model_rtts) + model_timeout_count + model_invalid_count
+            )
+            model_timeout_rate = (
+                model_timeout_count / model_total if model_total else 0.0
+            )
+            real_timeout_rate = (
+                (len(real_rtts) - success_count) / len(real_rtts)
+                if real_rtts
+                else 0.0
+            )
+            real_timeout_count = len(real_rtts) - success_count
+
+            range_min, range_max = compute_rtt_range(
+                real_rtts,
+                model_rtts,
+                args.max_rtt,
+            )
+            real_dist, _ = discretize_rtt_with_timeout(
+                real_rtts,
+                real_timeout_count,
+                bins=args.ping_bins,
+                range_min=range_min,
+                range_max=range_max,
+            )
+            model_dist, _ = discretize_rtt_with_timeout(
+                model_rtts,
+                model_timeout_count + model_invalid_count,
+                bins=args.ping_bins,
+                range_min=range_min,
+                range_max=range_max,
+            )
+            kl_value = kl_divergence(real_dist, model_dist)
+
+            ping_results.append(
+                {
+                    "dst_ip": dst_ip,
+                    "domain": domain,
+                    "group": group,
+                    "label": label,
+                    "kl": kl_value,
+                    "real_success_count": success_count,
+                    "model_sample_count": len(model_rtts),
+                    "model_timeout_count": model_timeout_count,
+                    "model_invalid_count": model_invalid_count,
+                    "real_timeout_count": real_timeout_count,
+                    "real_timeout_rate": real_timeout_rate,
+                    "model_timeout_rate": model_timeout_rate,
+                    "range_min": range_min,
+                    "range_max": range_max,
+                    "real_rtts": real_rtts,
+                    "model_rtts": model_rtts,
+                }
             )
 
-            ping_payload = {
-                "run": metrics["run"],
-                "params": {
-                    "pings_per_ip": args.pings_per_ip,
-                    "model_samples": args.model_samples,
-                    "ping_bins": args.ping_bins,
-                    "max_rtt": args.max_rtt,
-                    "temperature": args.temperature,
-                    "sampling_strategy": ping_sampling_strategy,
-                    "ping_workers": args.ping_workers,
-                    "ping_no_timestamp": args.ping_no_timestamp,
-                    "regular_domains": args.regular_domains,
-                    "anchor_ips": args.anchor_ips,
-                },
-                "ping": {
-                    "src_ip": ping_src_ip,
-                    "include_timestamp": ping_include_timestamp,
-                    "targets": [
-                        {
-                            "dst_ip": r["dst_ip"],
-                            "domain": r.get("domain"),
-                            "group": r.get("group"),
-                            "label": r["label"],
-                            "kl": r["kl"],
-                            "real_success_count": r["real_success_count"],
-                            "model_sample_count": r["model_sample_count"],
-                            "model_timeout_count": r["model_timeout_count"],
-                            "model_invalid_count": r["model_invalid_count"],
-                            "real_timeout_count": r["real_timeout_count"],
-                            "real_timeout_rate": r["real_timeout_rate"],
-                            "model_timeout_rate": r["model_timeout_rate"],
-                            "range_min": r["range_min"],
-                            "range_max": r["range_max"],
-                            "real_rtts": r["real_rtts"],
-                            "model_rtts": r["model_rtts"],
-                        }
-                        for r in ping_results
-                    ],
-                    "average_kl": avg_kl,
-                },
-            }
-            ping_path = metrics_dir / "ping_metrics.json"
-            with ping_path.open("w", encoding="utf-8") as f:
-                json.dump(ping_payload, f)
-            metrics["ping_metrics_file"] = str(ping_path)
-            if not math.isnan(avg_kl):
-                print(f"Average KL divergence: {avg_kl:.4f}")
+        avg_kl = (
+            float(np.mean([r["kl"] for r in ping_results]))
+            if ping_results
+            else float("nan")
+        )
 
-        if "latency_sampling" in selected:
-            print("Running latency-conditioned destination sampling...")
-            latency_sampling_strategy = args.ping_sampling_strategy.lower()
-            latency_ping_timeout_s = args.latency_ping_timeout
-            latency_ping_timeout_ms = float(latency_ping_timeout_s) * 1000.0
-            latency_src_ipv4 = latency_src_ipv4 or get_src_ip()
-            latency_src_ipv6 = latency_src_ipv6 or get_src_ipv6()
-            latency_context_time = latency_context_time or datetime.now()
-            print(f"Source IPv4: {latency_src_ipv4}")
-            if latency_src_ipv6:
-                print(f"Source IPv6: {latency_src_ipv6}")
-            else:
-                print("Source IPv6: unavailable (sampling IPv4 only)")
+        ping_payload = {
+            "run": metrics["run"],
+            "params": {
+                "pings_per_ip": args.pings_per_ip,
+                "model_samples": args.model_samples,
+                "ping_bins": args.ping_bins,
+                "max_rtt": args.max_rtt,
+                "temperature": args.temperature,
+                "sampling_strategy": ping_sampling_strategy,
+                "ping_workers": args.ping_workers,
+                "ping_no_timestamp": args.ping_no_timestamp,
+                "regular_domains": args.regular_domains,
+                "anchor_ips": args.anchor_ips,
+            },
+            "ping": {
+                "src_ip": ping_src_ip,
+                "include_timestamp": ping_include_timestamp,
+                "targets": [
+                    {
+                        "dst_ip": r["dst_ip"],
+                        "domain": r.get("domain"),
+                        "group": r.get("group"),
+                        "label": r["label"],
+                        "kl": r["kl"],
+                        "real_success_count": r["real_success_count"],
+                        "model_sample_count": r["model_sample_count"],
+                        "model_timeout_count": r["model_timeout_count"],
+                        "model_invalid_count": r["model_invalid_count"],
+                        "real_timeout_count": r["real_timeout_count"],
+                        "real_timeout_rate": r["real_timeout_rate"],
+                        "model_timeout_rate": r["model_timeout_rate"],
+                        "range_min": r["range_min"],
+                        "range_max": r["range_max"],
+                        "real_rtts": r["real_rtts"],
+                        "model_rtts": r["model_rtts"],
+                    }
+                    for r in ping_results
+                ],
+                "average_kl": avg_kl,
+            },
+        }
+        ping_path = metrics_dir / "ping_metrics.json"
+        with ping_path.open("w", encoding="utf-8") as f:
+            json.dump(ping_payload, f)
+        metrics["ping_metrics_file"] = str(ping_path)
+        if not math.isnan(avg_kl):
+            print(f"Average KL divergence: {avg_kl:.4f}")
 
-            latency_results = []
-            ping_lock = threading.Lock()
+    if "latency_sampling" in selected:
+        print("Running latency-conditioned destination sampling...")
+        latency_sampling_strategy = args.ping_sampling_strategy.lower()
+        latency_ping_timeout_s = args.latency_ping_timeout
+        latency_ping_timeout_ms = float(latency_ping_timeout_s) * 1000.0
+        latency_src_ipv4 = latency_src_ipv4 or get_src_ip()
+        latency_src_ipv6 = latency_src_ipv6 or get_src_ipv6()
+        latency_context_time = latency_context_time or datetime.now()
+        print(f"Source IPv4: {latency_src_ipv4}")
+        if latency_src_ipv6:
+            print(f"Source IPv6: {latency_src_ipv6}")
+        else:
+            print("Source IPv6: unavailable (sampling IPv4 only)")
 
-            for target in latency_targets:
-                label = target["label"]
-                target_ms = target["target_ms"]
-                is_timeout = target["is_timeout"]
-                print(f"Sampling destinations for target {label}...")
+        latency_results = []
+        ping_lock = threading.Lock()
 
-                samples, sample_meta, jax_rng = sample_destination_ips_for_target(
-                    engine,
-                    params,
-                    config,
-                    rng,
-                    jax_rng,
-                    latency_src_ipv4,
-                    latency_src_ipv6,
-                    target_ms,
-                    args.latency_samples_per_target,
-                    args.latency_sample_max_attempts,
-                    args.latency_sample_max_new_tokens,
-                    args.temperature,
-                    latency_sampling_strategy,
-                    args.latency_ipv6_weight,
-                    include_timestamp=True,
-                    current_time=latency_context_time,
-                )
+        for target in latency_targets:
+            label = target["label"]
+            target_ms = target["target_ms"]
+            is_timeout = target["is_timeout"]
+            print(f"Sampling destinations for target {label}...")
 
-                if not samples:
-                    print(f"{label}: no valid destination samples")
+            samples, sample_meta = sample_destination_ips_for_target(
+                model,
+                device,
+                rng,
+                latency_src_ipv4,
+                latency_src_ipv6,
+                target_ms,
+                args.latency_samples_per_target,
+                args.latency_sample_max_attempts,
+                args.latency_sample_max_new_tokens,
+                args.temperature,
+                args.latency_ipv6_weight,
+                include_timestamp=True,
+                current_time=latency_context_time,
+            )
 
-                sample_rtts = [None] * len(samples)
-                if samples and args.ping_workers > 1:
-                    print(f"{label}: pinging samples in parallel (workers={args.ping_workers})")
-                    with ThreadPoolExecutor(max_workers=args.ping_workers) as executor:
-                        future_map = {}
-                        for idx, sample in enumerate(samples):
-                            dst_ip = sample["dst_ip"]
-                            ip_version = sample["ip_version"]
-                            ping_label = f"{label} {idx + 1}/{len(samples)}"
-                            future = executor.submit(
-                                ping_series,
-                                ping_label,
-                                dst_ip,
-                                args.pings_per_ip,
-                                latency_ping_timeout_s,
-                                False,
-                                ping_lock,
-                                ip_version,
-                            )
-                            future_map[future] = idx
-                        for future in as_completed(future_map):
-                            idx = future_map[future]
-                            sample_rtts[idx] = future.result()
-                else:
+            if not samples:
+                print(f"{label}: no valid destination samples")
+
+            sample_rtts = [None] * len(samples)
+            if samples and args.ping_workers > 1:
+                print(f"{label}: pinging samples in parallel (workers={args.ping_workers})")
+                with ThreadPoolExecutor(max_workers=args.ping_workers) as executor:
+                    future_map = {}
                     for idx, sample in enumerate(samples):
                         dst_ip = sample["dst_ip"]
                         ip_version = sample["ip_version"]
                         ping_label = f"{label} {idx + 1}/{len(samples)}"
-                        sample_rtts[idx] = ping_series(
+                        future = executor.submit(
+                            ping_series,
                             ping_label,
                             dst_ip,
                             args.pings_per_ip,
@@ -2051,103 +1799,121 @@ def run(args):
                             ping_lock,
                             ip_version,
                         )
-
-                errors = []
-                medians = []
-                timeout_rates = []
-                ipv4_count = 0
-                ipv6_count = 0
-                samples_payload = []
-                for sample, rtts in zip(samples, sample_rtts):
+                        future_map[future] = idx
+                    for future in as_completed(future_map):
+                        idx = future_map[future]
+                        sample_rtts[idx] = future.result()
+            else:
+                for idx, sample in enumerate(samples):
+                    dst_ip = sample["dst_ip"]
                     ip_version = sample["ip_version"]
-                    if ip_version == 6:
-                        ipv6_count += 1
-                    else:
-                        ipv4_count += 1
-                    rtts = rtts or []
-                    success_count = sum(1 for r in rtts if r >= 0)
-                    timeout_count = len(rtts) - success_count
-                    timeout_rate = timeout_count / len(rtts) if rtts else 1.0
-                    median_rtt = compute_rtt_median(rtts)
-                    if median_rtt is None:
-                        median_rtt = latency_ping_timeout_ms
-
-                    if is_timeout:
-                        if success_count == 0:
-                            error_log2 = 0.0
-                        else:
-                            ratio = max(median_rtt, 1e-3) / latency_ping_timeout_ms
-                            error_log2 = abs(math.log2(ratio))
-                    else:
-                        ratio = max(median_rtt, 1e-3) / max(target_ms, 1e-3)
-                        error_log2 = abs(math.log2(ratio))
-
-                    errors.append(error_log2)
-                    medians.append(median_rtt)
-                    timeout_rates.append(timeout_rate)
-                    samples_payload.append(
-                        {
-                            "dst_ip": sample["dst_ip"],
-                            "ip_version": ip_version,
-                            "rtts": rtts,
-                            "median_rtt_ms": median_rtt,
-                            "success_count": success_count,
-                            "timeout_count": timeout_count,
-                            "timeout_rate": timeout_rate,
-                            "error_log2": error_log2,
-                        }
+                    ping_label = f"{label} {idx + 1}/{len(samples)}"
+                    sample_rtts[idx] = ping_series(
+                        ping_label,
+                        dst_ip,
+                        args.pings_per_ip,
+                        latency_ping_timeout_s,
+                        False,
+                        ping_lock,
+                        ip_version,
                     )
 
-                summary = {
-                    "sampled_count": len(samples),
-                    "ipv4_count": ipv4_count,
-                    "ipv6_count": ipv6_count,
-                    "mean_error_log2": float(np.mean(errors)) if errors else None,
-                    "median_error_log2": float(np.median(errors)) if errors else None,
-                    "mean_median_rtt_ms": float(np.mean(medians)) if medians else None,
-                    "median_median_rtt_ms": float(np.median(medians)) if medians else None,
-                    "mean_timeout_rate": float(np.mean(timeout_rates)) if timeout_rates else None,
-                }
+            errors = []
+            medians = []
+            timeout_rates = []
+            ipv4_count = 0
+            ipv6_count = 0
+            samples_payload = []
+            for sample, rtts in zip(samples, sample_rtts):
+                ip_version = sample["ip_version"]
+                if ip_version == 6:
+                    ipv6_count += 1
+                else:
+                    ipv4_count += 1
+                rtts = rtts or []
+                success_count = sum(1 for r in rtts if r >= 0)
+                timeout_count = len(rtts) - success_count
+                timeout_rate = timeout_count / len(rtts) if rtts else 1.0
+                median_rtt = compute_rtt_median(rtts)
+                if median_rtt is None:
+                    median_rtt = latency_ping_timeout_ms
 
-                latency_results.append(
+                if is_timeout:
+                    if success_count == 0:
+                        error_log2 = 0.0
+                    else:
+                        ratio = max(median_rtt, 1e-3) / latency_ping_timeout_ms
+                        error_log2 = abs(math.log2(ratio))
+                else:
+                    ratio = max(median_rtt, 1e-3) / max(target_ms, 1e-3)
+                    error_log2 = abs(math.log2(ratio))
+
+                errors.append(error_log2)
+                medians.append(median_rtt)
+                timeout_rates.append(timeout_rate)
+                samples_payload.append(
                     {
-                        "label": label,
-                        "target_ms": target_ms,
-                        "is_timeout": is_timeout,
-                        "requested_samples": args.latency_samples_per_target,
-                        "sampled_count": len(samples),
-                        "sampling_attempts": sample_meta["attempted"],
-                        "sampling_invalid": sample_meta["invalid"],
-                        "sampling_duplicate": sample_meta["duplicate"],
-                        "samples": samples_payload,
-                        "summary": summary,
+                        "dst_ip": sample["dst_ip"],
+                        "ip_version": ip_version,
+                        "rtts": rtts,
+                        "median_rtt_ms": median_rtt,
+                        "success_count": success_count,
+                        "timeout_count": timeout_count,
+                        "timeout_rate": timeout_rate,
+                        "error_log2": error_log2,
                     }
                 )
 
-            latency_payload = {
-                "run": metrics["run"],
-                "params": {
-                    "targets": args.latency_targets,
-                    "samples_per_target": args.latency_samples_per_target,
-                    "sampling_max_attempts": args.latency_sample_max_attempts,
-                    "sampling_max_new_tokens": args.latency_sample_max_new_tokens,
-                    "temperature": args.temperature,
-                    "sampling_strategy": latency_sampling_strategy,
-                    "ipv6_weight": args.latency_ipv6_weight,
-                    "pings_per_ip": args.pings_per_ip,
-                    "ping_timeout_s": latency_ping_timeout_s,
-                    "include_timestamp": True,
-                },
-                "latency_sampling": {
-                    "src_ipv4": latency_src_ipv4,
-                    "src_ipv6": latency_src_ipv6,
-                    "targets": latency_results,
-                },
+            summary = {
+                "sampled_count": len(samples),
+                "ipv4_count": ipv4_count,
+                "ipv6_count": ipv6_count,
+                "mean_error_log2": float(np.mean(errors)) if errors else None,
+                "median_error_log2": float(np.median(errors)) if errors else None,
+                "mean_median_rtt_ms": float(np.mean(medians)) if medians else None,
+                "median_median_rtt_ms": float(np.median(medians)) if medians else None,
+                "mean_timeout_rate": float(np.mean(timeout_rates)) if timeout_rates else None,
             }
-            latency_path = metrics_dir / "latency_sampling_metrics.json"
-            with latency_path.open("w", encoding="utf-8") as f:
-                json.dump(latency_payload, f)
-            metrics["latency_sampling_metrics_file"] = str(latency_path)
+
+            latency_results.append(
+                {
+                    "label": label,
+                    "target_ms": target_ms,
+                    "is_timeout": is_timeout,
+                    "requested_samples": args.latency_samples_per_target,
+                    "sampled_count": len(samples),
+                    "sampling_attempts": sample_meta["attempted"],
+                    "sampling_invalid": sample_meta["invalid"],
+                    "sampling_duplicate": sample_meta["duplicate"],
+                    "samples": samples_payload,
+                    "summary": summary,
+                }
+            )
+
+        latency_payload = {
+            "run": metrics["run"],
+            "params": {
+                "targets": args.latency_targets,
+                "samples_per_target": args.latency_samples_per_target,
+                "sampling_max_attempts": args.latency_sample_max_attempts,
+                "sampling_max_new_tokens": args.latency_sample_max_new_tokens,
+                "temperature": args.temperature,
+                "sampling_strategy": latency_sampling_strategy,
+                "ipv6_weight": args.latency_ipv6_weight,
+                "pings_per_ip": args.pings_per_ip,
+                "ping_timeout_s": latency_ping_timeout_s,
+                "include_timestamp": True,
+            },
+            "latency_sampling": {
+                "src_ipv4": latency_src_ipv4,
+                "src_ipv6": latency_src_ipv6,
+                "targets": latency_results,
+            },
+        }
+        latency_path = metrics_dir / "latency_sampling_metrics.json"
+        with latency_path.open("w", encoding="utf-8") as f:
+            json.dump(latency_payload, f)
+        metrics["latency_sampling_metrics_file"] = str(latency_path)
 
     run_path = output_dir / "run.json"
     with run_path.open("w", encoding="utf-8") as f:
@@ -2172,7 +1938,6 @@ if MODAL_AVAILABLE:
     )
     def eval_on_modal(
         param_only_run_name: str | None = None,
-        config: str | None = None,
         output_dir: str | None = None,
         run_name: str | None = None,
         seed: int | None = None,
@@ -2206,7 +1971,6 @@ if MODAL_AVAILABLE:
 
         if param_only_run_name is not None:
             args.param_only_run_name = param_only_run_name
-        args.config = config or "src/MaxText/configs/latency_network.yml"
         if output_dir is not None:
             args.output_dir = output_dir
         if run_name is not None:
