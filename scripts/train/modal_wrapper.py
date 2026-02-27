@@ -1,28 +1,24 @@
-"""Modal wrapper to run scripts/train.py on a single GPU with a shared volume.
+"""Modal wrapper to run ping-llm PyTorch training on a single GPU.
 
 Note: This file is named modal_wrapper.py (not modal.py) to avoid shadowing
       the modal Python module when Modal CLI runs the script.
 
 Prereqs:
   - Modal volume `ping-llm` (or set MODAL_VOLUME) with:
-      data/probe_rows/train.arrayrecord  (PLAN_3)
-      data/probe_rows/test.arrayrecord   (PLAN_3)
-  - WANDB_API_KEY provided via environment or Modal secret (set MODAL_WANDB_SECRET name).
+      data/probe_rows/train.arrayrecord
+      data/probe_rows/test.arrayrecord
+  - WANDB_API_KEY provided via Modal secret (wandb-secret).
 
 Usage:
-  # Basic usage (uses defaults: wandb-project=ping-llm, run-name=full-run):
+  # Basic usage:
   modal run scripts/train/modal_wrapper.py::run
 
   # Custom parameters:
   modal run scripts/train/modal_wrapper.py::run \
     --run-name my-test \
     --steps 5000 \
-    --batch-size 128
-
-Note:
-  - Uses latency_network.yml (64 workers for 64-core A100-80GB)
-  - Multiprocessing enabled for parallel tokenization (PLAN_3)
-  - Expected throughput: ~320K-850K tokens/sec
+    --batch-size 128 \
+    --gpu H100
 """
 
 import os
@@ -31,15 +27,15 @@ from typing import Optional
 
 import modal
 
-APP_NAME = "ping-llm-maxtext-wandb-sync"
+APP_NAME = "ping-llm-pytorch"
 WORKDIR = "/workspace"
-CONFIG_PATH = f"{WORKDIR}/src/MaxText/configs/latency_network.yml"
 VOLUME_NAME = os.environ.get("MODAL_VOLUME", "ping-llm")
 
-# Ignore heavy paths when copying code into the image
 IGNORE_PATTERNS = [
     ".git",
     ".venv",
+    ".train_venv",
+    ".slurm_venv",
     "__pycache__",
     ".mypy_cache",
     ".pytest_cache",
@@ -48,58 +44,28 @@ IGNORE_PATTERNS = [
     "data",
     "local_datasets",
     "archive",
-    "tests",
-    "docs",
-    "benchmarks",
-    "end_to_end",
     "*.parquet",
+    "*.arrayrecord",
     ".DS_Store",
 ]
 
-# Build image in stages to optimize caching:
-# 1. Copy only files needed for dependency installation
-# 2. Install dependencies (expensive, only rebuilds when dependencies change)
-# 3. Copy the rest of the code (cheap, rebuilds on code changes)
 image = (
     modal.Image.from_registry(
         "nvidia/cuda:12.4.1-cudnn-devel-ubuntu22.04",
         add_python="3.12",
     )
     .entrypoint([])
-    .apt_install(
-        "git",
-        "build-essential",
-        "cmake",
-        "ninja-build",
-    )
+    .apt_install("git", "build-essential")
     .pip_install("uv")
-    # Stage 1: Copy ONLY files needed for dependency resolution
-    .add_local_file("pyproject.toml", f"{WORKDIR}/pyproject.toml", copy=True)
-    .add_local_file("README.md", f"{WORKDIR}/README.md", copy=True)
-    .add_local_file("build_hooks.py", f"{WORKDIR}/build_hooks.py", copy=True)
-    .add_local_dir("dependencies", f"{WORKDIR}/dependencies", copy=True)
-    .add_local_file(
-        "src/MaxText/__init__.py", f"{WORKDIR}/src/MaxText/__init__.py", copy=True
-    )  # Only __init__.py for version
-    .add_local_dir(
-        "src/install_maxtext_extra_deps",
-        f"{WORKDIR}/src/install_maxtext_extra_deps",
-        copy=True,
-    )
-    # Stage 2: Install dependencies (this layer is cached unless above files change)
+    # Stage 1: Install Python dependencies (cached unless list changes)
     .run_commands(
-        f"cd {WORKDIR} && CC=gcc CXX=g++ uv pip install --system -e '.[cuda12]' --resolution=lowest",
-        f"cd {WORKDIR} && install_maxtext_github_deps",
+        "uv pip install --system "
+        "torch "
+        "pyarrow numpy grain array_record "
+        "wandb "
     )
-    .pip_install("wandb")
-    # Stage 3a: Copy training script separately to force rebuild on changes
-    .add_local_file("scripts/train.py", f"{WORKDIR}/scripts/train.py", copy=True)
-    # Stage 3b: Copy the rest of the code (fast layer that rebuilds on code changes)
+    # Stage 2: Copy code (rebuilds on code changes)
     .add_local_dir(".", WORKDIR, ignore=IGNORE_PATTERNS, copy=True)
-    # CACHE BUST: Force rebuild by running a unique command
-    .run_commands(
-        "echo 'Cache bust: 2025-12-20-11 - A100 optimizations: 2x batch + compatible XLA flags'"
-    )
 )
 
 app = modal.App(APP_NAME)
@@ -109,105 +75,65 @@ shared_vol = modal.Volume.from_name(VOLUME_NAME, create_if_missing=True)
 @app.function(
     image=image,
     gpu="A100",
-    cpu=8,  # A100-80GB with 64 CPUs for parallel data loading
+    cpu=8,
     volumes={"/mnt": shared_vol},
     secrets=[modal.Secret.from_name("wandb-secret")],
-    timeout=60 * 60 * 24,  # 24 hours (Modal max 86400s)
-    env={
-        # Suppress TensorFlow/CUDA/JAX warnings
-        # Note: scripts/train.py also configures Python logging for ABSL/Grain
-        "TF_CPP_MIN_LOG_LEVEL": "3",  # Errors only (0=all, 1=info, 2=warning, 3=error)
-        "JAX_LOG_COMPILES": "0",  # Disable JAX compilation logs
-        # A100 GPU optimizations + warning suppression
-        "XLA_FLAGS": " ".join([
-            "--xla_gpu_force_compilation_parallelism=1",
-            "--xla_cpu_multi_thread_eigen=false",
-            # A100-specific performance optimizations (expected +3-8% MFU):
-            "--xla_gpu_enable_latency_hiding_scheduler=true",  # Overlap compute with data loading
-            "--xla_gpu_triton_gemm_any=true",                  # Use optimized Triton GEMM kernels
-            "--xla_gpu_enable_highest_priority_async_stream=true",  # Prioritize async operations
-            # Profile-guided optimization (learns from runtime, +3-5% MFU after warmup):
-            "--xla_gpu_pgle_profile_file_or_directory_path=/mnt/pgle_profiles",
-        ]),
-        # Suppress Python warnings
-        "PYTHONWARNINGS": "ignore",
-        # Redirect stderr to suppress C++ warnings that bypass TF_CPP_MIN_LOG_LEVEL
-        "TF_CPP_VMODULE": "",  # Disable verbose C++ logging
-        # JAX persistent compilation cache for faster startup (2-3x improvement)
-        "JAX_COMPILATION_CACHE_DIR": "/mnt/jax_cache",
-        "JAX_PERSISTENT_CACHE_MIN_ENTRY_SIZE_BYTES": "0",  # Cache everything
-        "JAX_PERSISTENT_CACHE_MIN_COMPILE_TIME_SECS": "0",  # Cache all compilations
-    },
+    timeout=60 * 60 * 24,  # 24 hours
 )
 def run(
     run_name: str = "full-run",
-    steps: int = 5_000,
-    batch_size: int = 256,  # OPTIMIZED: Increased from 128 to saturate A100 memory
+    steps: int = 14000,
+    batch_size: int = 256,
     wandb_project: str = "ping-llm",
+    gpu: str = "A100",
 ):
     import signal
     import atexit
 
-    # Create symlinks so config's relative paths work
-    # Config expects: data/sharded/... and outputs/...
-    # Volume provides: /mnt/data/sharded/... and /mnt/outputs/...
+    # Symlinks for relative data paths
     os.symlink("/mnt/data", f"{WORKDIR}/data")
     os.makedirs("/mnt/outputs", exist_ok=True)
     os.symlink("/mnt/outputs", f"{WORKDIR}/outputs")
 
     cmd = [
-        "python",
-        "scripts/train.py",
-        "--config",
-        CONFIG_PATH,
-        "--project",
-        wandb_project,
-        "--name",
-        run_name,
-        "--steps",
-        str(steps),
-        "--batch-size",
-        str(batch_size),
-        "--hardware",
-        "gpu",
-        "--enable-checkpointing",  # Enable checkpointing to save progress
+        "python", "-m", "ping_llm.train",
+        "--run-name", run_name,
+        "--total-steps", str(steps),
+        "--batch-size", str(batch_size),
+        "--wandb-project", wandb_project,
+        "--checkpoint-dir", "outputs/checkpoints",
     ]
 
-    # Start the training subprocess with output streaming
+    env = os.environ.copy()
+    env["PYTHONPATH"] = f"{WORKDIR}/src"
+    env["PYTHONWARNINGS"] = "ignore"
+
     process = subprocess.Popen(
         cmd,
         cwd=WORKDIR,
+        env=env,
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
         universal_newlines=True,
-        bufsize=1,  # Line buffered
+        bufsize=1,
     )
 
-    # Register cleanup handler to send SIGINT on exit
     def cleanup_handler():
-        if process.poll() is None:  # Process still running
-            print("\n" + "=" * 80)
-            print(
-                "⚠️  Container shutting down - sending interrupt to training process..."
-            )
-            print("=" * 80)
+        if process.poll() is None:
+            print("\nContainer shutting down - sending interrupt to training...")
             process.send_signal(signal.SIGINT)
             try:
-                process.wait(timeout=25)  # Modal gives 30s grace period
-                print("✓ Training process exited gracefully")
+                process.wait(timeout=25)
+                print("Training process exited gracefully")
             except subprocess.TimeoutExpired:
-                print("⚠️  Training did not exit in time")
+                print("Training did not exit in time")
                 process.kill()
-            print("=" * 80)
 
     atexit.register(cleanup_handler)
 
-    # Stream output line by line to Modal logs
     for line in process.stdout:
         print(line, end="", flush=True)
 
-    # Wait for the process to complete
     exit_code = process.wait()
-
     if exit_code != 0:
         raise subprocess.CalledProcessError(exit_code, cmd)

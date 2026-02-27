@@ -1,11 +1,11 @@
 #!/bin/bash
-# Quick setup script for MaxText training environment
-# This .venv will be accessible from both login and GPU nodes
+# Setup script for ping-llm PyTorch training environment (CPU)
+# For GPU training, install torch with CUDA support separately.
 
-set -e  # Exit on error
+set -e
 
 echo "=========================================="
-echo "Setting up MaxText training environment"
+echo "Setting up ping-llm PyTorch environment"
 echo "=========================================="
 
 # Clean existing venv
@@ -23,43 +23,28 @@ source .venv/bin/activate
 echo "Upgrading pip..."
 pip install --upgrade pip setuptools wheel
 
-# Install core packages
-echo "Installing JAX (CPU version)..."
-pip install "jax[cpu]==0.4.34" "jaxlib==0.4.34"
-
-echo "Installing JAX ecosystem..."
-pip install \
-  flax==0.9.0 \
-  optax==0.2.4 \
-  orbax-checkpoint==0.11.0 \
-  chex==0.1.87
+echo "Installing PyTorch (CPU)..."
+pip install torch --index-url https://download.pytorch.org/whl/cpu
 
 echo "Installing data handling..."
 pip install \
   "pyarrow>=22.0.0" \
-  pandas \
-  "grain>=0.2.15"
-
-echo "Installing utilities..."
-pip install \
-  pyyaml \
-  absl-py \
-  ml-collections \
-  tqdm \
-  tensorboard \
-  tensorboardx
+  numpy \
+  "grain>=0.2.15" \
+  array_record
 
 echo "Installing wandb..."
 pip install wandb
 
 echo ""
 echo "=========================================="
-echo "✓ Installation complete!"
+echo "Installation complete!"
 echo "=========================================="
 echo ""
 echo "Verify with:"
 echo "  source .venv/bin/activate"
-echo "  python -c \"import jax, flax, grain, pyarrow; print('Success!')\""
+echo "  PYTHONPATH=src python -c \"from ping_llm.data.tokenization import VOCAB_SIZE; print(VOCAB_SIZE)\""
 echo ""
-echo "This .venv is on /scratch and will work on GPU nodes too!"
+echo "For GPU training, install torch with CUDA:"
+echo "  pip install torch --index-url https://download.pytorch.org/whl/cu124"
 echo ""
