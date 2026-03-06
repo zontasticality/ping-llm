@@ -8,10 +8,10 @@ import math
 @dataclass
 class ModelConfig:
     vocab_size: int = 267
-    n_layer: int = 24
-    n_embd: int = 1536
-    n_head: int = 12
-    head_dim: int = 128
+    n_layer: int = 20
+    n_embd: int = 640
+    n_head: int = 10
+    head_dim: int = 64
     seq_len: int = 1024
     rope_theta: float = 10000.0
     softcap: float = 15.0
