@@ -22,16 +22,18 @@ Outputs:
       targets, targets_segmentation, targets_position
 """
 
+import glob as globmod
 from pathlib import Path
 import grain.python as grain
 from ping_llm.data.datasource import (
+    DeserializeProbeRow,
     ProbeRowDataSource,
     ProbeRowSampler,
 )
 
 
 def build_probe_chunk_dataset(
-    arrayrecord_path: str,
+    arrayrecord_path: str | list[str],
     batch_size: int = 32,
     crop_size: int = 1024,
     shuffle: bool = True,
@@ -58,15 +60,30 @@ def build_probe_chunk_dataset(
     Returns:
         grain.IterDataset ready for consumption (training or analysis)
     """
-    from grain.experimental import pick_performance_config
+    # Resolve paths: support single path, glob pattern, or list of paths
+    paths: list[str] | None = None
+    if isinstance(arrayrecord_path, list):
+        paths = arrayrecord_path
+    elif '*' in arrayrecord_path:
+        paths = sorted(globmod.glob(arrayrecord_path))
+        if not paths:
+            raise FileNotFoundError(f"No files matched glob: {arrayrecord_path}")
 
-    path = Path(arrayrecord_path).expanduser().resolve()
-    if not path.exists():
-        raise FileNotFoundError(f"ArrayRecord file not found: {path}")
-
-    source = ProbeRowDataSource(arrayrecord_path=str(path))
-
-    dataset = grain.MapDataset.source(source)
+    if paths is not None:
+        # Sharded mode: use grain's built-in ArrayRecordDataSource + DeserializeProbeRow
+        for p in paths:
+            if not Path(p).exists():
+                raise FileNotFoundError(f"ArrayRecord shard not found: {p}")
+        source = grain.ArrayRecordDataSource(paths)
+        dataset = grain.MapDataset.source(source)
+        dataset = dataset.map(DeserializeProbeRow())
+    else:
+        # Single-file mode: use ProbeRowDataSource (handles deserialization internally)
+        path = Path(arrayrecord_path).expanduser().resolve()
+        if not path.exists():
+            raise FileNotFoundError(f"ArrayRecord file not found: {path}")
+        source = ProbeRowDataSource(arrayrecord_path=str(path))
+        dataset = grain.MapDataset.source(source)
     if shuffle:
         dataset = dataset.shuffle(seed=shuffle_seed)
 
@@ -98,14 +115,13 @@ def build_probe_chunk_dataset(
     dataset = dataset.batch(batch_size, drop_remainder=True)
 
     # Add multiprocessing for parallel tokenization (CRITICAL for performance)
+    # Note: ram_budget_mb is kept in signature for backward compat but unused;
+    # pick_performance_config auto-tuning deadlocks in spawn mode on Modal.
     if use_multiprocessing:
-        multiprocessing_options = pick_performance_config(
-            ds=dataset,
-            ram_budget_mb=ram_budget_mb,
-            max_workers=None,  # Auto-tune
-            max_buffer_size=None,  # Auto-tune
-        ).multiprocessing_options
-
+        multiprocessing_options = grain.MultiprocessingOptions(
+            num_workers=num_workers if num_workers > 0 else 4,
+            per_worker_buffer_size=prefetch_buffer_size,
+        )
         dataset = dataset.mp_prefetch(multiprocessing_options)
 
     return dataset

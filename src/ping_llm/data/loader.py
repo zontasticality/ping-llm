@@ -12,7 +12,7 @@ from ping_llm.data.pipeline import build_probe_chunk_dataset
 
 
 def create_loader(
-    arrayrecord_path: str,
+    arrayrecord_path: str | list[str],
     batch_size: int = 256,
     crop_size: int = 1024,
     shuffle: bool = True,

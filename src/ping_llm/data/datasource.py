@@ -142,6 +142,36 @@ class ProbeRowDataSource(grain.RandomAccessDataSource):
         }
 
 
+class DeserializeProbeRow(grain.MapTransform):
+    """
+    Grain MapTransform that deserializes raw ArrayRecord bytes into a probe row dict.
+
+    Used with grain.ArrayRecordDataSource (which returns raw bytes) to support
+    sharded ArrayRecord files. Extracts the same fields as ProbeRowDataSource.__getitem__.
+    """
+
+    def map(self, record_bytes: bytes) -> dict:
+        reader = ipc.open_stream(record_bytes)
+        batch = reader.read_next_batch()
+        reader.close()
+
+        measurements_bytes = batch.column('measurements')[0].as_py()
+        meas_reader = ipc.open_stream(measurements_bytes)
+        measurements = meas_reader.read_all().to_pylist()
+        meas_reader.close()
+
+        return {
+            'src_id': batch.column('src_id')[0].as_py(),
+            'measurements': measurements,
+            'n_measurements': batch.column('n_measurements')[0].as_py(),
+            'metadata': {
+                'time_span_seconds': batch.column('time_span_seconds')[0].as_py(),
+                'first_timestamp': batch.column('first_timestamp')[0].as_py(),
+                'last_timestamp': batch.column('last_timestamp')[0].as_py(),
+            }
+        }
+
+
 class ProbeRowSampler(grain.experimental.FlatMapTransform):
     """
     Generate K training contexts per row with PLAN_3 sampling.

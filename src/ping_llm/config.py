@@ -35,7 +35,7 @@ class ModelConfig:
 @dataclass
 class TrainConfig:
     # Data
-    train_data: str = "data/probe_rows/train.arrayrecord"
+    train_data: str | list[str] = "data/probe_rows/train.arrayrecord"
     eval_data: str = "data/probe_rows/test.arrayrecord"
     grain_workers: int = 16
     grain_prefetch: int = 16
@@ -50,6 +50,7 @@ class TrainConfig:
     dtype: str = "bfloat16"  # bfloat16, float16, float32
     compile: bool = True
     grad_clip: float = 1.0
+    gradient_accumulation_steps: int = 1
 
     # Optimizer: per-group LRs (scaled by (n_embd/768)**-0.5)
     embedding_lr: float = 0.3
@@ -120,6 +121,7 @@ def parse_args() -> tuple[ModelConfig, TrainConfig]:
     parser.add_argument("--dtype", type=str, default=None)
     parser.add_argument("--no-compile", action="store_true")
     parser.add_argument("--grad-clip", type=float, default=None)
+    parser.add_argument("--gradient-accumulation-steps", type=int, default=None)
     parser.add_argument("--embedding-lr", type=float, default=None)
     parser.add_argument("--unembedding-lr", type=float, default=None)
     parser.add_argument("--matrix-lr", type=float, default=None)
@@ -152,7 +154,8 @@ def parse_args() -> tuple[ModelConfig, TrainConfig]:
     train_fields = {
         "train_data", "eval_data", "grain_workers", "grain_prefetch",
         "grain_ram_budget_mb", "batch_size", "total_steps", "warmup_ratio",
-        "warmdown_ratio", "dtype", "grad_clip", "embedding_lr",
+        "warmdown_ratio", "dtype", "grad_clip", "gradient_accumulation_steps",
+        "embedding_lr",
         "unembedding_lr", "matrix_lr", "weight_decay", "muon_momentum",
         "checkpoint_dir", "checkpoint_interval", "run_name", "wandb_project",
         "wandb_mode", "log_interval", "eval_interval", "eval_steps",

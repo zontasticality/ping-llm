@@ -120,7 +120,14 @@ def create_optimizers(model: GPT, train_cfg: TrainConfig, model_cfg: ModelConfig
 # ---------------------------------------------------------------------------
 
 def train():
+    import multiprocessing
+    multiprocessing.set_start_method('spawn', force=True)
+
     model_cfg, train_cfg = parse_args()
+
+    # Support comma-separated train data paths from CLI
+    if isinstance(train_cfg.train_data, str) and ',' in train_cfg.train_data:
+        train_cfg.train_data = [p.strip() for p in train_cfg.train_data.split(',')]
 
     # Device
     device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -212,10 +219,13 @@ def train():
     signal.signal(signal.SIGINT, sigint_handler)
 
     # Training loop
+    accum_steps = train_cfg.gradient_accumulation_steps
     print(f"\nStarting training: {train_cfg.total_steps} steps, "
-          f"batch_size={train_cfg.batch_size}, seq_len={model_cfg.seq_len}")
-    tokens_per_step = train_cfg.batch_size * model_cfg.seq_len
-    print(f"Tokens/step: {tokens_per_step:,}")
+          f"batch_size={train_cfg.batch_size}, seq_len={model_cfg.seq_len}, "
+          f"grad_accum={accum_steps}")
+    tokens_per_step = train_cfg.batch_size * model_cfg.seq_len * accum_steps
+    print(f"Tokens/step: {tokens_per_step:,} "
+          f"(effective batch size: {train_cfg.batch_size * accum_steps})")
 
     scaler = torch.amp.GradScaler(enabled=(use_amp and amp_dtype == torch.float16))
     t0 = time.time()
@@ -252,24 +262,27 @@ def train():
                     pg["lr"] = base_lr * lr_mult
                     pg["weight_decay"] = wd
 
-        # --- Forward ---
-        batch = next(train_iter)
-        inputs = batch["inputs"]
-        targets = batch["targets"]
-        targets_mask = batch["targets_segmentation"]
-
-        with torch.amp.autocast(device_type=device, dtype=amp_dtype, enabled=use_amp):
-            _, loss = model(inputs, targets, targets_mask)
-
-        # --- Backward ---
+        # --- Gradient accumulation loop ---
         for opt, _, _ in optimizers:
             opt.zero_grad(set_to_none=True)
 
-        scaler.scale(loss).backward()
+        accumulated_loss = 0.0
+        for _micro in range(accum_steps):
+            batch = next(train_iter)
+            inputs = batch["inputs"]
+            targets = batch["targets"]
+            targets_mask = batch["targets_segmentation"]
+
+            with torch.amp.autocast(device_type=device, dtype=amp_dtype, enabled=use_amp):
+                _, loss = model(inputs, targets, targets_mask)
+                loss = loss / accum_steps
+
+            scaler.scale(loss).backward()
+            accumulated_loss += loss.item()
 
         # Gradient clipping
         if train_cfg.grad_clip > 0:
-            scaler.unscale_(optimizers[0][0])  # Unscale for all
+            scaler.unscale_(optimizers[0][0])
             scaler.unscale_(optimizers[1][0])
             scaler.unscale_(optimizers[2][0])
             raw_model = model._orig_mod if hasattr(model, "_orig_mod") else model
@@ -280,7 +293,7 @@ def train():
         scaler.update()
 
         # --- Logging ---
-        loss_val = loss.item()
+        loss_val = accumulated_loss
         running_loss += loss_val
         log_steps += 1
 

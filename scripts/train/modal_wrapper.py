@@ -4,32 +4,45 @@ Note: This file is named modal_wrapper.py (not modal.py) to avoid shadowing
       the modal Python module when Modal CLI runs the script.
 
 Prereqs:
-  - Modal volume `ping-llm` (or set MODAL_VOLUME) with:
-      data/probe_rows/train.arrayrecord
-      data/probe_rows/test.arrayrecord
+  - Modal volume `ping-llm-data` with train shards + test.arrayrecord
+  - Modal volume `ping-llm` for outputs (checkpoints, etc.)
   - WANDB_API_KEY provided via Modal secret (wandb-secret).
 
 Usage:
-  # Basic usage:
-  modal run scripts/train/modal_wrapper.py::run
-
-  # Custom parameters:
+  # Smoke test (10 steps):
   modal run scripts/train/modal_wrapper.py::run \
-    --run-name my-test \
-    --steps 5000 \
-    --batch-size 128 \
-    --gpu H100
+    --steps 10 --run-name smoke-test --batch-size 8 --no-compile
+
+  # Smoke test with gradient accumulation (effective BS=256):
+  modal run scripts/train/modal_wrapper.py::run \
+    --steps 10 --run-name smoke-accum --batch-size 32 \
+    --gradient-accumulation-steps 8 --no-compile
+
+  # Full run:
+  modal run scripts/train/modal_wrapper.py::run \
+    --run-name my-run
 """
 
 import os
 import subprocess
-from typing import Optional
 
 import modal
 
 APP_NAME = "ping-llm-pytorch"
 WORKDIR = "/workspace"
-VOLUME_NAME = os.environ.get("MODAL_VOLUME", "ping-llm")
+
+DATA_VOLUME = "ping-llm-data"
+OUTPUTS_VOLUME = "ping-llm"
+
+DATA_MOUNT = "/mnt/data"
+OUTPUTS_MOUNT = "/mnt/outputs"
+
+# Shard paths on the data volume
+TRAIN_SHARDS = [
+    f"{DATA_MOUNT}/train_shards/train.arrayrecord-0000{i}-of-00004"
+    for i in range(4)
+]
+EVAL_PATH = f"{DATA_MOUNT}/test.arrayrecord"
 
 IGNORE_PATTERNS = [
     ".git",
@@ -47,6 +60,8 @@ IGNORE_PATTERNS = [
     "*.parquet",
     "*.arrayrecord",
     ".DS_Store",
+    ".claude",
+    "docs",
 ]
 
 image = (
@@ -55,45 +70,58 @@ image = (
         add_python="3.12",
     )
     .entrypoint([])
-    .apt_install("git", "build-essential")
+    .env({"DEBIAN_FRONTEND": "noninteractive", "TZ": "UTC"})
+    .apt_install("git", "build-essential", "tzdata")
     .pip_install("uv")
-    # Stage 1: Install Python dependencies (cached unless list changes)
+    # Stage 1: Install Python deps (cached unless list changes)
     .run_commands(
         "uv pip install --system "
-        "torch "
-        "pyarrow numpy grain array_record "
-        "wandb "
+        "torch --index-url https://download.pytorch.org/whl/cu124 && "
+        "uv pip install --system "
+        "pyarrow numpy grain array_record wandb"
     )
     # Stage 2: Copy code (rebuilds on code changes)
     .add_local_dir(".", WORKDIR, ignore=IGNORE_PATTERNS, copy=True)
 )
 
 app = modal.App(APP_NAME)
-shared_vol = modal.Volume.from_name(VOLUME_NAME, create_if_missing=True)
+data_vol = modal.Volume.from_name(DATA_VOLUME)
+outputs_vol = modal.Volume.from_name(OUTPUTS_VOLUME, create_if_missing=True)
 
 
 @app.function(
     image=image,
     gpu="A100",
     cpu=8,
-    volumes={"/mnt": shared_vol},
+    volumes={DATA_MOUNT: data_vol, OUTPUTS_MOUNT: outputs_vol},
     secrets=[modal.Secret.from_name("wandb-secret")],
     timeout=60 * 60 * 24,  # 24 hours
 )
-def run(
-    run_name: str = "full-run",
-    steps: int = 14000,
-    batch_size: int = 256,
-    wandb_project: str = "ping-llm",
-    gpu: str = "A100",
+def _run(
+    run_name: str,
+    steps: int,
+    batch_size: int,
+    wandb_project: str,
+    no_compile: bool = False,
+    no_multiprocessing: bool = False,
+    gradient_accumulation_steps: int = 1,
 ):
     import signal
     import atexit
 
-    # Symlinks for relative data paths
-    os.symlink("/mnt/data", f"{WORKDIR}/data")
-    os.makedirs("/mnt/outputs", exist_ok=True)
-    os.symlink("/mnt/outputs", f"{WORKDIR}/outputs")
+    # Preflight: verify data files exist
+    print("=== Preflight checks ===")
+    for p in TRAIN_SHARDS + [EVAL_PATH]:
+        exists = os.path.exists(p)
+        print(f"  {'OK' if exists else 'MISSING'}: {p}")
+        if not exists:
+            raise FileNotFoundError(f"Data file not found: {p}")
+    print("All data files present.\n")
+
+    checkpoint_dir = f"{OUTPUTS_MOUNT}/checkpoints"
+    os.makedirs(checkpoint_dir, exist_ok=True)
+
+    train_data = ",".join(TRAIN_SHARDS)
 
     cmd = [
         "python", "-m", "ping_llm.train",
@@ -101,12 +129,24 @@ def run(
         "--total-steps", str(steps),
         "--batch-size", str(batch_size),
         "--wandb-project", wandb_project,
-        "--checkpoint-dir", "outputs/checkpoints",
+        "--train-data", train_data,
+        "--eval-data", EVAL_PATH,
+        "--checkpoint-dir", checkpoint_dir,
     ]
+
+    if no_compile:
+        cmd.append("--no-compile")
+    if no_multiprocessing:
+        cmd.append("--no-multiprocessing")
+    if gradient_accumulation_steps > 1:
+        cmd.extend(["--gradient-accumulation-steps", str(gradient_accumulation_steps)])
 
     env = os.environ.copy()
     env["PYTHONPATH"] = f"{WORKDIR}/src"
     env["PYTHONWARNINGS"] = "ignore"
+    env["PYTHONUNBUFFERED"] = "1"
+
+    print(f"CMD: {' '.join(cmd)}\n", flush=True)
 
     process = subprocess.Popen(
         cmd,
@@ -128,6 +168,7 @@ def run(
             except subprocess.TimeoutExpired:
                 print("Training did not exit in time")
                 process.kill()
+        outputs_vol.commit()
 
     atexit.register(cleanup_handler)
 
@@ -135,5 +176,27 @@ def run(
         print(line, end="", flush=True)
 
     exit_code = process.wait()
+    outputs_vol.commit()
     if exit_code != 0:
         raise subprocess.CalledProcessError(exit_code, cmd)
+
+
+@app.local_entrypoint()
+def run(
+    run_name: str = "full-run",
+    steps: int = 14000,
+    batch_size: int = 256,
+    wandb_project: str = "ping-llm",
+    no_compile: bool = False,
+    no_multiprocessing: bool = False,
+    gradient_accumulation_steps: int = 1,
+):
+    _run.remote(
+        run_name=run_name,
+        steps=steps,
+        batch_size=batch_size,
+        wandb_project=wandb_project,
+        no_compile=no_compile,
+        no_multiprocessing=no_multiprocessing,
+        gradient_accumulation_steps=gradient_accumulation_steps,
+    )
