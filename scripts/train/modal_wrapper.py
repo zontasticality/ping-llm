@@ -146,6 +146,12 @@ def _run(
     env["PYTHONWARNINGS"] = "ignore"
     env["PYTHONUNBUFFERED"] = "1"
 
+    # Cache torch.compile graphs to the outputs volume so recompilation is skipped
+    cache_dir = f"{OUTPUTS_MOUNT}/torch_cache"
+    os.makedirs(cache_dir, exist_ok=True)
+    env["TORCHINDUCTOR_FX_GRAPH_CACHE"] = "1"
+    env["TORCHINDUCTOR_CACHE_DIR"] = cache_dir
+
     print(f"CMD: {' '.join(cmd)}\n", flush=True)
 
     process = subprocess.Popen(
@@ -158,7 +164,10 @@ def _run(
         bufsize=1,
     )
 
+    committed = False
+
     def cleanup_handler():
+        nonlocal committed
         if process.poll() is None:
             print("\nContainer shutting down - sending interrupt to training...")
             process.send_signal(signal.SIGINT)
@@ -168,7 +177,9 @@ def _run(
             except subprocess.TimeoutExpired:
                 print("Training did not exit in time")
                 process.kill()
-        outputs_vol.commit()
+        if not committed:
+            outputs_vol.commit()
+            committed = True
 
     atexit.register(cleanup_handler)
 
@@ -177,6 +188,7 @@ def _run(
 
     exit_code = process.wait()
     outputs_vol.commit()
+    committed = True
     if exit_code != 0:
         raise subprocess.CalledProcessError(exit_code, cmd)
 

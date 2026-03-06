@@ -16,9 +16,13 @@ import sys
 import math
 import time
 import signal
+import logging
 import contextlib
 from pathlib import Path
 from dataclasses import asdict
+
+# Suppress noisy "Failed to load jax profiler" warnings from grain
+logging.getLogger("absl").setLevel(logging.ERROR)
 
 import torch
 import torch.nn.functional as F
@@ -150,13 +154,14 @@ def train():
     print(f"  Embedding: {model.wte.weight.numel():,}")
     print(f"  Non-embedding: {model.num_params_non_embedding:,}")
 
+    # Optimizers (must be created before compile wrapping)
+    optimizers = create_optimizers(model, train_cfg, model_cfg)
+
     # Compile
     if train_cfg.compile and device == "cuda":
-        print("Compiling model with torch.compile...")
+        print("Compiling model with torch.compile...", flush=True)
         model = torch.compile(model)
-
-    # Optimizers
-    optimizers = create_optimizers(model, train_cfg, model_cfg)
+        print("  (compilation happens on first forward pass)", flush=True)
 
     # Checkpoint directory
     ckpt_dir = Path(train_cfg.checkpoint_dir) / train_cfg.run_name
@@ -192,7 +197,7 @@ def train():
         )
 
     # Data loaders
-    print("Creating data loaders...")
+    print("Creating data loaders...", flush=True)
     train_loader = create_loader(
         arrayrecord_path=train_cfg.train_data,
         batch_size=train_cfg.batch_size,
@@ -296,6 +301,11 @@ def train():
         loss_val = accumulated_loss
         running_loss += loss_val
         log_steps += 1
+
+        # Brief per-step progress so output is never silent
+        elapsed = time.time() - t0
+        print(f"  step {step+1}/{train_cfg.total_steps} loss={loss_val:.4f} "
+              f"({elapsed:.1f}s)", flush=True)
 
         if (step + 1) % train_cfg.log_interval == 0:
             avg_loss = running_loss / log_steps
