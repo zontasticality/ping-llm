@@ -183,8 +183,15 @@ def _run(
 
     atexit.register(cleanup_handler)
 
-    for line in process.stdout:
-        print(line, end="", flush=True)
+    # Persist logs to output volume so they survive CLI disconnects
+    log_dir = f"{OUTPUTS_MOUNT}/logs"
+    os.makedirs(log_dir, exist_ok=True)
+    log_path = f"{log_dir}/{run_name}.log"
+    with open(log_path, "w") as log_file:
+        for line in process.stdout:
+            log_file.write(line)
+            log_file.flush()
+            print(line, end="", flush=True)
 
     exit_code = process.wait()
     outputs_vol.commit()

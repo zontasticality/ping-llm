@@ -286,12 +286,13 @@ def train():
             accumulated_loss += loss.item()
 
         # Gradient clipping
+        grad_norm = None
         if train_cfg.grad_clip > 0:
             scaler.unscale_(optimizers[0][0])
             scaler.unscale_(optimizers[1][0])
             scaler.unscale_(optimizers[2][0])
             raw_model = model._orig_mod if hasattr(model, "_orig_mod") else model
-            torch.nn.utils.clip_grad_norm_(raw_model.parameters(), train_cfg.grad_clip)
+            grad_norm = torch.nn.utils.clip_grad_norm_(raw_model.parameters(), train_cfg.grad_clip)
 
         for opt, _, _ in optimizers:
             scaler.step(opt)
@@ -322,14 +323,21 @@ def train():
 
             if wandb_run:
                 import wandb
-                wandb.log({
+                log_dict = {
                     "train/loss": avg_loss,
                     "train/lr_mult": lr_mult,
                     "train/tokens_per_sec": tokens_sec,
                     "train/weight_decay": wd,
                     "train/muon_momentum": muon_mom,
                     "train/step": step + 1,
-                }, step=step + 1)
+                }
+                if grad_norm is not None:
+                    log_dict["train/grad_norm"] = grad_norm.item()
+                if device == "cuda":
+                    log_dict["gpu/allocated_gb"] = torch.cuda.memory_allocated() / 1e9
+                    log_dict["gpu/peak_allocated_gb"] = torch.cuda.max_memory_allocated() / 1e9
+                    torch.cuda.reset_peak_memory_stats()
+                wandb.log(log_dict, step=step + 1)
 
             running_loss = 0.0
             log_steps = 0
