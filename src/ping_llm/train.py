@@ -302,10 +302,11 @@ def train():
         running_loss += loss_val
         log_steps += 1
 
-        # Brief per-step progress so output is never silent
-        elapsed = time.time() - t0
-        print(f"  step {step+1}/{train_cfg.total_steps} loss={loss_val:.4f} "
-              f"({elapsed:.1f}s)", flush=True)
+        # Print first step (confirms compile finished) then let log_interval handle it
+        if step == start_step:
+            elapsed = time.time() - t0
+            print(f"  step {step+1}/{train_cfg.total_steps} loss={loss_val:.4f} "
+                  f"({elapsed:.1f}s)", flush=True)
 
         if (step + 1) % train_cfg.log_interval == 0:
             avg_loss = running_loss / log_steps

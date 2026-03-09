@@ -197,7 +197,7 @@ def _run(
 def run(
     run_name: str = "full-run",
     steps: int = 14000,
-    batch_size: int = 256,
+    batch_size: int = 32,
     wandb_project: str = "ping-llm",
     no_compile: bool = False,
     no_multiprocessing: bool = False,
