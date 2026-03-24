@@ -99,9 +99,16 @@ def build_probe_chunk_dataset(
     # With repeat(), each row generates fresh random samples on each epoch
     dataset = dataset.apply(sampler)
 
-    # IMPORTANT FIX: Convert to IterDataset BEFORE batching
-    # This allows parallel processing of individual elements
-    if num_workers > 0:
+    # Convert to IterDataset BEFORE batching.
+    # When using mp_prefetch, each worker process runs the full pipeline
+    # independently. Threads inside each worker are redundant for CPU-bound
+    # tokenization (GIL-limited), so use minimal threads with mp_prefetch.
+    if use_multiprocessing:
+        # mp_prefetch provides process-level parallelism — keep threads minimal
+        dataset = dataset.to_iter_dataset(
+            read_options=grain.ReadOptions(num_threads=1, prefetch_buffer_size=2)
+        )
+    elif num_workers > 0:
         dataset = dataset.to_iter_dataset(
             read_options=grain.ReadOptions(
                 num_threads=num_workers,
@@ -114,13 +121,16 @@ def build_probe_chunk_dataset(
     # Batch AFTER converting to IterDataset (correct ordering)
     dataset = dataset.batch(batch_size, drop_remainder=True)
 
-    # Add multiprocessing for parallel tokenization (CRITICAL for performance)
-    # Note: ram_budget_mb is kept in signature for backward compat but unused;
-    # pick_performance_config auto-tuning deadlocks in spawn mode on Modal.
+    # Multiprocessing for parallel data loading + tokenization.
+    # Note: pick_performance_config auto-tuning deadlocks in spawn mode on Modal,
+    # so we use fixed MultiprocessingOptions.
     if use_multiprocessing:
+        # Cap workers: more workers than CPUs causes contention, not speedup.
+        # Leave 2 CPUs for main process + GPU work.
+        mp_workers = min(num_workers if num_workers > 0 else 4, 6)
         multiprocessing_options = grain.MultiprocessingOptions(
-            num_workers=num_workers if num_workers > 0 else 4,
-            per_worker_buffer_size=prefetch_buffer_size,
+            num_workers=mp_workers,
+            per_worker_buffer_size=min(prefetch_buffer_size, 4),
         )
         dataset = dataset.mp_prefetch(multiprocessing_options)
 

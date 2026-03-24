@@ -105,6 +105,8 @@ def _run(
     no_compile: bool = False,
     no_multiprocessing: bool = False,
     gradient_accumulation_steps: int = 1,
+    use_resid_scalars: bool = False,
+    use_value_embeds: bool = False,
 ):
     import signal
     import atexit
@@ -140,6 +142,10 @@ def _run(
         cmd.append("--no-multiprocessing")
     if gradient_accumulation_steps > 1:
         cmd.extend(["--gradient-accumulation-steps", str(gradient_accumulation_steps)])
+    if use_resid_scalars:
+        cmd.append("--use-resid-scalars")
+    if use_value_embeds:
+        cmd.append("--use-value-embeds")
 
     env = os.environ.copy()
     env["PYTHONPATH"] = f"{WORKDIR}/src"
@@ -209,6 +215,8 @@ def run(
     no_compile: bool = False,
     no_multiprocessing: bool = False,
     gradient_accumulation_steps: int = 1,
+    use_resid_scalars: bool = False,
+    use_value_embeds: bool = False,
 ):
     _run.remote(
         run_name=run_name,
@@ -218,4 +226,6 @@ def run(
         no_compile=no_compile,
         no_multiprocessing=no_multiprocessing,
         gradient_accumulation_steps=gradient_accumulation_steps,
+        use_resid_scalars=use_resid_scalars,
+        use_value_embeds=use_value_embeds,
     )

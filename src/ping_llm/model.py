@@ -4,10 +4,10 @@ GPT model for ping-llm, following nanochat architecture.
 Architecture:
 - RMSNorm (no learnable params)
 - RoPE (precomputed cos/sin buffers)
-- Separate Q/K/V projections with QK norm
+- Q/K/V projections with QK norm (fused QKV optional)
 - ReLU^2 activation (configurable)
 - Logit softcap at 15
-- Small init for output projections
+- Optional: zero init, residual scalars, value embeddings
 """
 
 import math
@@ -46,9 +46,7 @@ class RotaryEmbedding(nn.Module):
         T = x.shape[2]
         cos = self.cos[offset : offset + T]  # [T, half_dim]
         sin = self.sin[offset : offset + T]
-        # Split into pairs for rotation
         x1, x2 = x.chunk(2, dim=-1)
-        # Apply rotation
         out1 = x1 * cos - x2 * sin
         out2 = x1 * sin + x2 * cos
         return torch.cat([out1, out2], dim=-1)
@@ -59,26 +57,49 @@ class Attention(nn.Module):
         super().__init__()
         self.n_head = config.n_head
         self.head_dim = config.head_dim
+        self.layer_idx = layer_idx
+        self.use_fused_qkv = config.use_fused_qkv
         inner_dim = config.n_head * config.head_dim
 
-        self.q_proj = nn.Linear(config.n_embd, inner_dim, bias=False)
-        self.k_proj = nn.Linear(config.n_embd, inner_dim, bias=False)
-        self.v_proj = nn.Linear(config.n_embd, inner_dim, bias=False)
+        if self.use_fused_qkv:
+            self.qkv_proj = nn.Linear(config.n_embd, 3 * inner_dim, bias=False)
+        else:
+            self.q_proj = nn.Linear(config.n_embd, inner_dim, bias=False)
+            self.k_proj = nn.Linear(config.n_embd, inner_dim, bias=False)
+            self.v_proj = nn.Linear(config.n_embd, inner_dim, bias=False)
         self.o_proj = nn.Linear(inner_dim, config.n_embd, bias=False)
 
         # QK norm (per-head RMS norm on q and k)
         self.q_norm = RMSNorm(config.head_dim)
         self.k_norm = RMSNorm(config.head_dim)
 
-        # Small init for output projection
-        self.o_proj.weight.data.mul_(1.0 / math.sqrt(2 * config.n_layer))
+        # Output projection init
+        if config.use_zero_init:
+            self.o_proj.weight.data.zero_()
+        else:
+            self.o_proj.weight.data.mul_(1.0 / math.sqrt(2 * config.n_layer))
 
-    def forward(self, x: torch.Tensor, rope: RotaryEmbedding) -> torch.Tensor:
+        # Value embeddings on alternating layers
+        self.use_value_embeds = config.use_value_embeds and (layer_idx % 2 == 1)
+        if self.use_value_embeds:
+            self.ve_gate = nn.Parameter(torch.zeros(1))
+
+    def forward(self, x: torch.Tensor, rope: RotaryEmbedding,
+                value_embed: torch.Tensor | None = None) -> torch.Tensor:
         B, T, C = x.shape
 
-        q = self.q_proj(x).view(B, T, self.n_head, self.head_dim).transpose(1, 2)
-        k = self.k_proj(x).view(B, T, self.n_head, self.head_dim).transpose(1, 2)
-        v = self.v_proj(x).view(B, T, self.n_head, self.head_dim).transpose(1, 2)
+        if self.use_fused_qkv:
+            qkv = self.qkv_proj(x)
+            inner_dim = self.n_head * self.head_dim
+            q, k, v = qkv.split(inner_dim, dim=-1)
+        else:
+            q = self.q_proj(x)
+            k = self.k_proj(x)
+            v = self.v_proj(x)
+
+        q = q.view(B, T, self.n_head, self.head_dim).transpose(1, 2)
+        k = k.view(B, T, self.n_head, self.head_dim).transpose(1, 2)
+        v = v.view(B, T, self.n_head, self.head_dim).transpose(1, 2)
 
         # QK norm
         q = self.q_norm(q)
@@ -87,6 +108,10 @@ class Attention(nn.Module):
         # RoPE
         q = rope(q)
         k = rope(k)
+
+        # Value embeddings
+        if self.use_value_embeds and value_embed is not None:
+            v = v + self.ve_gate * value_embed[:, :T, :]
 
         # Flash attention (causal)
         y = F.scaled_dot_product_attention(q, k, v, is_causal=True)
@@ -102,8 +127,11 @@ class MLP(nn.Module):
         self.down_proj = nn.Linear(config.mlp_dim, config.n_embd, bias=False)
         self.activation = config.activation
 
-        # Small init for down projection
-        self.down_proj.weight.data.mul_(1.0 / math.sqrt(2 * config.n_layer))
+        # Down projection init
+        if config.use_zero_init:
+            self.down_proj.weight.data.zero_()
+        else:
+            self.down_proj.weight.data.mul_(1.0 / math.sqrt(2 * config.n_layer))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         h = self.up_proj(x)
@@ -126,9 +154,21 @@ class TransformerBlock(nn.Module):
         self.attn = Attention(config, layer_idx)
         self.mlp = MLP(config, layer_idx)
 
-    def forward(self, x: torch.Tensor, rope: RotaryEmbedding) -> torch.Tensor:
-        x = x + self.attn(self.attn_norm(x), rope)
-        x = x + self.mlp(self.mlp_norm(x))
+        # Per-layer residual scalars + x0 injection
+        self.use_resid_scalars = config.use_resid_scalars
+        if self.use_resid_scalars:
+            self.resid_lambda = nn.Parameter(torch.tensor(1.05))
+            self.x0_lambda = nn.Parameter(torch.tensor(0.01))
+
+    def forward(self, x: torch.Tensor, rope: RotaryEmbedding,
+                x0: torch.Tensor | None = None,
+                value_embed: torch.Tensor | None = None) -> torch.Tensor:
+        if self.use_resid_scalars and x0 is not None:
+            x = self.resid_lambda * x + self.attn(self.attn_norm(x), rope, value_embed)
+            x = self.resid_lambda * x + self.mlp(self.mlp_norm(x)) + self.x0_lambda * x0
+        else:
+            x = x + self.attn(self.attn_norm(x), rope, value_embed)
+            x = x + self.mlp(self.mlp_norm(x))
         return x
 
 
@@ -147,8 +187,19 @@ class GPT(nn.Module):
         # Shared rope for all layers
         self.rope = RotaryEmbedding(config.head_dim, config.seq_len, config.rope_theta)
 
+        # Value embeddings (alternating layers)
+        if config.use_value_embeds:
+            n_ve_layers = config.n_layer // 2
+            self.value_embeds = nn.Parameter(
+                0.01 * torch.randn(n_ve_layers, config.n_head, config.seq_len, config.head_dim)
+            )
+        else:
+            self.value_embeds = None
+
         # Initialize
         self.apply(self._init_weights)
+        if config.use_zero_init:
+            self.lm_head.weight.data.zero_()
 
     def _init_weights(self, module: nn.Module):
         if isinstance(module, nn.Linear):
@@ -156,26 +207,27 @@ class GPT(nn.Module):
             if module.bias is not None:
                 nn.init.zeros_(module.bias)
         elif isinstance(module, nn.Embedding):
-            nn.init.normal_(module.weight, mean=0.0, std=0.02)
+            std = self.config.embed_init_scale
+            if std == 0:  # auto: sqrt(3/n_embd)
+                std = math.sqrt(3.0 / self.config.n_embd)
+            nn.init.normal_(module.weight, mean=0.0, std=std)
 
     def forward(
         self, idx: torch.Tensor, targets: torch.Tensor | None = None,
         targets_mask: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
-        """
-        Args:
-            idx: input token ids [B, T]
-            targets: target token ids [B, T] (optional, for loss computation)
-            targets_mask: segmentation mask [B, T] for ignoring padding in loss
-
-        Returns:
-            (logits [B, T, V], loss or None)
-        """
         B, T = idx.shape
         x = self.wte(idx)  # [B, T, C]
 
+        x0 = x if self.config.use_resid_scalars else None
+
+        ve_idx = 0
         for block in self.blocks:
-            x = block(x, self.rope)
+            ve = None
+            if self.value_embeds is not None and block.attn.use_value_embeds:
+                ve = self.value_embeds[ve_idx]
+                ve_idx += 1
+            x = block(x, self.rope, x0=x0, value_embed=ve)
 
         x = self.final_norm(x)
         logits = self.lm_head(x)  # [B, T, V]
@@ -185,12 +237,10 @@ class GPT(nn.Module):
 
         loss = None
         if targets is not None:
-            # Flatten for cross entropy
             logits_flat = logits.view(-1, logits.size(-1))
             targets_flat = targets.view(-1)
 
             if targets_mask is not None:
-                # Masked loss: ignore padding tokens
                 mask_flat = targets_mask.view(-1).float()
                 per_token_loss = F.cross_entropy(
                     logits_flat, targets_flat, reduction="none"

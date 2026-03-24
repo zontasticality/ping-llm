@@ -17,6 +17,13 @@ class ModelConfig:
     softcap: float = 15.0
     activation: str = "relu_sq"  # relu_sq, gelu, silu
 
+    # Nanochat architecture flags (all default OFF = original baseline)
+    use_fused_qkv: bool = False     # fused Q/K/V projection (1 matmul vs 3)
+    use_zero_init: bool = False     # zero init for output projections + lm_head
+    use_resid_scalars: bool = False # per-layer residual scalars + x0 injection
+    use_value_embeds: bool = False  # ResFormer-style value embeddings
+    embed_init_scale: float = 0.02  # embedding init std (0.02=baseline, 0=auto sqrt(3/n_embd))
+
     @property
     def mlp_dim(self) -> int:
         return 4 * self.n_embd
@@ -37,8 +44,8 @@ class TrainConfig:
     # Data
     train_data: str | list[str] = "data/probe_rows/train.arrayrecord"
     eval_data: str = "data/probe_rows/test.arrayrecord"
-    grain_workers: int = 16
-    grain_prefetch: int = 16
+    grain_workers: int = 6
+    grain_prefetch: int = 4
     grain_ram_budget_mb: int = 32768
     use_multiprocessing: bool = True
 
@@ -51,6 +58,7 @@ class TrainConfig:
     compile: bool = True
     grad_clip: float = 1.0
     gradient_accumulation_steps: int = 1
+    max_time_seconds: int = 0  # 0 = disabled, >0 = stop after this many seconds
 
     # Optimizer: per-group LRs (scaled by (n_embd/768)**-0.5)
     embedding_lr: float = 0.3
@@ -106,6 +114,11 @@ def parse_args() -> tuple[ModelConfig, TrainConfig]:
     parser.add_argument("--rope-theta", type=float, default=None)
     parser.add_argument("--softcap", type=float, default=None)
     parser.add_argument("--activation", type=str, default=None)
+    parser.add_argument("--use-fused-qkv", action="store_true")
+    parser.add_argument("--use-zero-init", action="store_true")
+    parser.add_argument("--use-resid-scalars", action="store_true")
+    parser.add_argument("--use-value-embeds", action="store_true")
+    parser.add_argument("--embed-init-scale", type=float, default=None)
 
     # Train args
     parser.add_argument("--train-data", type=str, default=None)
@@ -116,6 +129,7 @@ def parse_args() -> tuple[ModelConfig, TrainConfig]:
     parser.add_argument("--no-multiprocessing", action="store_true")
     parser.add_argument("--batch-size", type=int, default=None)
     parser.add_argument("--total-steps", type=int, default=None)
+    parser.add_argument("--max-time-seconds", type=int, default=None)
     parser.add_argument("--warmup-ratio", type=float, default=None)
     parser.add_argument("--warmdown-ratio", type=float, default=None)
     parser.add_argument("--dtype", type=str, default=None)
@@ -144,6 +158,7 @@ def parse_args() -> tuple[ModelConfig, TrainConfig]:
     model_fields = {
         "vocab_size", "n_layer", "n_embd", "n_head", "head_dim",
         "seq_len", "rope_theta", "softcap", "activation",
+        "embed_init_scale",
     }
     for f in model_fields:
         cli_name = f.replace("_", "-")
@@ -153,7 +168,8 @@ def parse_args() -> tuple[ModelConfig, TrainConfig]:
 
     train_fields = {
         "train_data", "eval_data", "grain_workers", "grain_prefetch",
-        "grain_ram_budget_mb", "batch_size", "total_steps", "warmup_ratio",
+        "grain_ram_budget_mb", "batch_size", "total_steps", "max_time_seconds",
+        "warmup_ratio",
         "warmdown_ratio", "dtype", "grad_clip", "gradient_accumulation_steps",
         "embedding_lr",
         "unembedding_lr", "matrix_lr", "weight_decay", "muon_momentum",
@@ -169,5 +185,13 @@ def parse_args() -> tuple[ModelConfig, TrainConfig]:
         train_cfg.use_multiprocessing = False
     if args.no_compile:
         train_cfg.compile = False
+    if args.use_fused_qkv:
+        model_cfg.use_fused_qkv = True
+    if args.use_zero_init:
+        model_cfg.use_zero_init = True
+    if args.use_resid_scalars:
+        model_cfg.use_resid_scalars = True
+    if args.use_value_embeds:
+        model_cfg.use_value_embeds = True
 
     return model_cfg, train_cfg

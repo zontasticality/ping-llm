@@ -79,13 +79,17 @@ def create_optimizers(model: GPT, train_cfg: TrainConfig, model_cfg: ModelConfig
     embed_params = [model.wte.weight]
     unembed_params = [model.lm_head.weight]
     matrix_params = []
+    scalar_params = []  # 0D/1D/3D+ params (resid scalars, value embed gates, etc.)
 
     for name, p in model.named_parameters():
         if name == "wte.weight" or name == "lm_head.weight":
             continue
         if p.ndim == 2:
             matrix_params.append(p)
-        # 1D params (e.g. from norms) — no optimizer needed for parameterless RMSNorm
+        else:
+            # Catch all non-embedding, non-2D params (resid_lambda, x0_lambda,
+            # ve_gate, value_embeds). These would be silently dropped without this.
+            scalar_params.append(p)
 
     scale = train_cfg.lr_scale(model_cfg.n_embd)
 
@@ -112,11 +116,23 @@ def create_optimizers(model: GPT, train_cfg: TrainConfig, model_cfg: ModelConfig
         momentum=train_cfg.muon_nesterov_start,  # Will be warmed up
     )
 
-    return [
+    optimizers = [
         (embed_opt, "embedding", False),
         (unembed_opt, "unembedding", False),
         (muon_opt, "matrix", True),
     ]
+
+    # AdamW for scalar/other params (residual scalars, value embeddings, gates)
+    if scalar_params:
+        scalar_opt = torch.optim.AdamW(
+            scalar_params,
+            lr=train_cfg.matrix_lr * scale,
+            betas=(train_cfg.adam_beta1, train_cfg.adam_beta2),
+            weight_decay=0.0,  # No weight decay on scalars
+        )
+        optimizers.append((scalar_opt, "scalar", False))
+
+    return optimizers
 
 
 # ---------------------------------------------------------------------------
@@ -234,12 +250,19 @@ def train():
 
     scaler = torch.amp.GradScaler(enabled=(use_amp and amp_dtype == torch.float16))
     t0 = time.time()
+    train_start = time.time()
     running_loss = 0.0
     log_steps = 0
 
-    for step in range(start_step, train_cfg.total_steps):
+    max_steps = train_cfg.total_steps if train_cfg.total_steps > 0 else 10**9
+    for step in range(start_step, max_steps):
         if interrupted:
             break
+        # Time-budget stopping
+        if train_cfg.max_time_seconds > 0 and step > start_step:
+            if time.time() - train_start > train_cfg.max_time_seconds:
+                print(f"  Time budget ({train_cfg.max_time_seconds}s) reached at step {step+1}")
+                break
 
         # --- LR + schedule updates ---
         lr_mult = wsd_schedule(
@@ -262,10 +285,13 @@ def train():
                     base_lr = train_cfg.embedding_lr * train_cfg.lr_scale(model_cfg.n_embd)
                     pg["lr"] = base_lr * lr_mult
                     pg["weight_decay"] = wd
-                else:  # unembedding
+                elif name == "unembedding":
                     base_lr = train_cfg.unembedding_lr * train_cfg.lr_scale(model_cfg.n_embd)
                     pg["lr"] = base_lr * lr_mult
                     pg["weight_decay"] = wd
+                elif name == "scalar":
+                    base_lr = train_cfg.matrix_lr * train_cfg.lr_scale(model_cfg.n_embd)
+                    pg["lr"] = base_lr * lr_mult
 
         # --- Gradient accumulation loop ---
         for opt, _, _ in optimizers:
@@ -288,9 +314,8 @@ def train():
         # Gradient clipping
         grad_norm = None
         if train_cfg.grad_clip > 0:
-            scaler.unscale_(optimizers[0][0])
-            scaler.unscale_(optimizers[1][0])
-            scaler.unscale_(optimizers[2][0])
+            for opt, _, _ in optimizers:
+                scaler.unscale_(opt)
             raw_model = model._orig_mod if hasattr(model, "_orig_mod") else model
             grad_norm = torch.nn.utils.clip_grad_norm_(raw_model.parameters(), train_cfg.grad_clip)
 
@@ -308,6 +333,9 @@ def train():
             elapsed = time.time() - t0
             print(f"  step {step+1}/{train_cfg.total_steps} loss={loss_val:.4f} "
                   f"({elapsed:.1f}s)", flush=True)
+            # Reset time budget AFTER first step so compile time doesn't count
+            if train_cfg.max_time_seconds > 0:
+                train_start = time.time()
 
         if (step + 1) % train_cfg.log_interval == 0:
             avg_loss = running_loss / log_steps

@@ -82,34 +82,27 @@ class ProbeRowDataSource(grain.RandomAccessDataSource):
         self._length = state['_length']
         self._reader = None  # Will be recreated on first access
 
-    def _deserialize_measurements(self, measurements_bytes: bytes) -> List[dict]:
-        """Deserialize measurements from PyArrow IPC format."""
-        reader = ipc.open_stream(measurements_bytes)
-        table = reader.read_all()
-        reader.close()
-        return table.to_pylist()
-
     def _read_row(self, index: int) -> dict:
         """Read and deserialize a row from ArrayRecord."""
-        # Read serialized record
         record_bytes = self.reader.read([index])[0]
 
-        # Deserialize from PyArrow IPC format
         reader = ipc.open_stream(record_bytes)
         batch = reader.read_next_batch()
         reader.close()
 
-        # Convert to dict
-        record = {
+        measurements_bytes = batch.column('measurements')[0].as_py()
+        meas_reader = ipc.open_stream(measurements_bytes)
+        measurements_table = meas_reader.read_all()
+        meas_reader.close()
+
+        return {
             'src_id': batch.column('src_id')[0].as_py(),
-            'measurements': batch.column('measurements')[0].as_py(),  # bytes
-            'n_measurements': batch.column('n_measurements')[0].as_py(),
+            'measurements': measurements_table,
+            'n_measurements': len(measurements_table),
             'time_span_seconds': batch.column('time_span_seconds')[0].as_py(),
             'first_timestamp': batch.column('first_timestamp')[0].as_py(),
             'last_timestamp': batch.column('last_timestamp')[0].as_py(),
         }
-
-        return record
 
     def __getitem__(self, index):
         """
@@ -118,7 +111,7 @@ class ProbeRowDataSource(grain.RandomAccessDataSource):
         Returns:
             Dictionary with:
                 - src_id: int
-                - measurements: List[dict] (deserialized)
+                - measurements: PyArrow Table (deferred to_pylist for efficiency)
                 - n_measurements: int
                 - metadata: dict with time_span, timestamps
         """
@@ -127,12 +120,9 @@ class ProbeRowDataSource(grain.RandomAccessDataSource):
 
         row = self._read_row(index)
 
-        # Deserialize measurements
-        measurements = self._deserialize_measurements(row['measurements'])
-
         return {
             'src_id': row['src_id'],
-            'measurements': measurements,
+            'measurements': row['measurements'],
             'n_measurements': row['n_measurements'],
             'metadata': {
                 'time_span_seconds': row['time_span_seconds'],
@@ -157,13 +147,16 @@ class DeserializeProbeRow(grain.MapTransform):
 
         measurements_bytes = batch.column('measurements')[0].as_py()
         meas_reader = ipc.open_stream(measurements_bytes)
-        measurements = meas_reader.read_all().to_pylist()
+        # Keep as PyArrow table — do NOT call to_pylist() here.
+        # The table can have 100k+ rows; converting eagerly takes ~15s per row.
+        # ProbeRowSampler will slice first, then convert only the needed subset.
+        measurements_table = meas_reader.read_all()
         meas_reader.close()
 
         return {
             'src_id': batch.column('src_id')[0].as_py(),
-            'measurements': measurements,
-            'n_measurements': batch.column('n_measurements')[0].as_py(),
+            'measurements': measurements_table,
+            'n_measurements': len(measurements_table),
             'metadata': {
                 'time_span_seconds': batch.column('time_span_seconds')[0].as_py(),
                 'first_timestamp': batch.column('first_timestamp')[0].as_py(),
@@ -252,21 +245,27 @@ class ProbeRowSampler(grain.experimental.FlatMapTransform):
         return contexts
 
     def _generate_one_context(self, row: dict, rng: random.Random) -> dict:
-        """Generate a single training context from row."""
+        """Generate a single training context from row.
+
+        Measurements may be a PyArrow table (from DeserializeProbeRow) or a list
+        of dicts (from ProbeRowDataSource). We slice the PyArrow table first to
+        avoid the expensive to_pylist() on the full 100k+ row table.
+        """
         measurements = row['measurements']
+        import pyarrow as pa
+        is_arrow = isinstance(measurements, pa.Table)
         n = len(measurements)
 
         # Calculate target measurements for ~crop_size tokens
         target_measurements = self.crop_size // self.avg_tokens_per_meas
 
-        # Branch: small row vs large row
         if n < target_measurements:
             # Small row: use all measurements
-            meas_buffer = measurements
+            meas_buffer = measurements.to_pylist() if is_arrow else measurements
         else:
-            # Large row: sample window
+            # Large row: sample window indices, then convert only the slice
             meas_buffer = self._sample_large_row(
-                measurements, target_measurements, rng
+                measurements, n, target_measurements, rng, is_arrow
             )
 
         # Select timestamp mode
@@ -279,21 +278,14 @@ class ProbeRowSampler(grain.experimental.FlatMapTransform):
         return self._format_output(tokens)
 
     def _sample_large_row(
-        self, measurements: List[dict], target: int, rng
+        self, measurements, n: int, target: int, rng, is_arrow: bool
     ) -> List[dict]:
         """
         Sample measurements from large row using log-uniform window.
 
-        Args:
-            measurements: Full list of measurements
-            target: Target number of measurements
-            rng: Random number generator (numpy or Python random)
-
-        Returns:
-            Sampled and sorted measurements
+        Works with both PyArrow tables (zero-copy slicing) and lists of dicts.
+        Only converts to Python dicts after slicing to the small target size.
         """
-        n = len(measurements)
-
         # Check RNG type and use appropriate methods
         is_numpy = hasattr(rng, 'integers')
 
@@ -316,19 +308,22 @@ class ProbeRowSampler(grain.experimental.FlatMapTransform):
             else:
                 offset = rng.randint(0, n - window_size)
 
-        # Select window
-        window = measurements[offset:offset + window_size]
+        # Slice window (zero-copy for PyArrow)
+        window = measurements.slice(offset, window_size) if is_arrow else measurements[offset:offset + window_size]
+        actual_window_size = len(window)
 
-        # Randomly subsample from window if needed
-        if len(window) <= target:
-            selected = window
+        # Subsample if window larger than target
+        if actual_window_size <= target:
+            selected = window.to_pylist() if is_arrow else list(window)
         else:
-            # Random sample without replacement
             if is_numpy:
-                indices = rng.choice(len(window), size=target, replace=False)
-                selected = [window[i] for i in indices]
+                indices = sorted(rng.choice(actual_window_size, size=target, replace=False))
             else:
-                selected = rng.sample(window, target)
+                indices = sorted(rng.sample(range(actual_window_size), target))
+            if is_arrow:
+                selected = window.take(indices).to_pylist()
+            else:
+                selected = [window[i] for i in indices]
 
         # Sort by timestamp
         selected.sort(key=lambda m: m['event_time'])
