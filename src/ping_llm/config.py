@@ -17,12 +17,12 @@ class ModelConfig:
     softcap: float = 15.0
     activation: str = "relu_sq"  # relu_sq, gelu, silu
 
-    # Nanochat architecture flags (all default OFF = original baseline)
-    use_fused_qkv: bool = False     # fused Q/K/V projection (1 matmul vs 3)
-    use_zero_init: bool = False     # zero init for output projections + lm_head
-    use_resid_scalars: bool = False # per-layer residual scalars + x0 injection
-    use_value_embeds: bool = False  # ResFormer-style value embeddings
-    embed_init_scale: float = 0.02  # embedding init std (0.02=baseline, 0=auto sqrt(3/n_embd))
+    # Nanochat architecture flags (autoresearch-validated winners enabled by default)
+    use_fused_qkv: bool = True      # fused Q/K/V projection (1 matmul vs 3) — kept: -0.15 loss
+    use_zero_init: bool = False     # zero init for output projections + lm_head — discarded at 5min
+    use_resid_scalars: bool = False # per-layer residual scalars + x0 injection — discarded at 5min
+    use_value_embeds: bool = False  # ResFormer-style value embeddings — discarded at 5min
+    embed_init_scale: float = 0     # embedding init std (0=auto sqrt(3/n_embd)) — kept: -0.49 loss
 
     @property
     def mlp_dim(self) -> int:
