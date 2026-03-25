@@ -185,6 +185,7 @@ def train():
 
     # Resume from checkpoint
     start_step = 0
+    wandb_run_id = None
     latest_ckpt = ckpt_dir / "latest.pt"
     if latest_ckpt.exists():
         print(f"Resuming from {latest_ckpt}")
@@ -195,15 +196,19 @@ def train():
         for (opt, name, _), opt_state in zip(optimizers, ckpt["optimizers"]):
             opt.load_state_dict(opt_state)
         start_step = ckpt["step"]
+        wandb_run_id = ckpt.get("wandb_run_id")
         print(f"  Resumed at step {start_step}, loss={ckpt.get('loss', '?')}")
+        if wandb_run_id:
+            print(f"  Wandb run ID: {wandb_run_id}")
 
-    # Wandb
+    # Wandb (resume same run across preemptions via saved run ID)
     wandb_run = None
     if train_cfg.wandb_mode != "disabled":
         import wandb
         wandb_run = wandb.init(
             project=train_cfg.wandb_project,
             name=train_cfg.run_name,
+            id=wandb_run_id,  # None on first run (new ID generated), saved ID on resume
             config={
                 "model": asdict(model_cfg),
                 "train": asdict(train_cfg),
@@ -238,6 +243,7 @@ def train():
         interrupted = True
         print("\nInterrupted. Saving checkpoint...")
     signal.signal(signal.SIGINT, sigint_handler)
+    signal.signal(signal.SIGTERM, sigint_handler)  # SLURM sends SIGTERM on preemption
 
     # Training loop
     accum_steps = train_cfg.gradient_accumulation_steps
@@ -384,7 +390,8 @@ def train():
         # --- Checkpoint ---
         if (step + 1) % train_cfg.checkpoint_interval == 0:
             save_checkpoint(model, optimizers, step + 1, model_cfg, train_cfg,
-                            loss_val, ckpt_dir)
+                            loss_val, ckpt_dir,
+                            wandb_run_id=wandb_run.id if wandb_run else None)
 
     # Final checkpoint
     save_checkpoint(model, optimizers, step + 1, model_cfg, train_cfg,
@@ -431,7 +438,8 @@ def run_eval(model, train_cfg: TrainConfig, model_cfg: ModelConfig,
     return total_loss / max(count, 1)
 
 
-def save_checkpoint(model, optimizers, step, model_cfg, train_cfg, loss, ckpt_dir):
+def save_checkpoint(model, optimizers, step, model_cfg, train_cfg, loss, ckpt_dir,
+                    wandb_run_id=None):
     """Save model checkpoint."""
     raw_model = model._orig_mod if hasattr(model, "_orig_mod") else model
     ckpt = {
@@ -441,6 +449,7 @@ def save_checkpoint(model, optimizers, step, model_cfg, train_cfg, loss, ckpt_di
         "model_config": asdict(model_cfg),
         "train_config": asdict(train_cfg),
         "loss": loss,
+        "wandb_run_id": wandb_run_id,
     }
     path = ckpt_dir / f"step_{step:06d}.pt"
     torch.save(ckpt, path)
