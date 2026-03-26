@@ -24,8 +24,9 @@
 
 set -euo pipefail
 
-SCRIPT_DIR="$(cd -- "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-PROJECT_DIR="${PROJECT_DIR:-$(cd "$SCRIPT_DIR/../.." && pwd)}"
+# SLURM copies the script to a spool dir, so BASH_SOURCE won't point back
+# to the repo. Use SLURM_SUBMIT_DIR (the directory where sbatch was called).
+PROJECT_DIR="${PROJECT_DIR:-${SLURM_SUBMIT_DIR:-.}}"
 VENV_DIR="${VENV_DIR:-${PROJECT_DIR}/.slurm_venv}"
 DATA_DIR="${DATA_DIR:-${PROJECT_DIR}/data/probe_rows}"
 RUN_NAME="${RUN_NAME:-95m-14k-preempt}"
