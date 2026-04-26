@@ -66,6 +66,10 @@ class TrainConfig:
     matrix_lr: float = 0.02
     weight_decay: float = 0.1
 
+    # RTT-aware Wasserstein loss (ordinal awareness for RTT byte tokens)
+    rtt_was_lambda1: float = 0.0  # weight for byte 1 (exponent + high mantissa); 0.5 recommended
+    rtt_was_lambda2: float = 0.0  # weight for byte 2 (low mantissa); 0.1 recommended
+
     # Muon
     muon_momentum: float = 0.95
     muon_nesterov_warmup_steps: int = 300
@@ -79,6 +83,7 @@ class TrainConfig:
     checkpoint_dir: str = "outputs/checkpoints"
     checkpoint_interval: int = 200
     run_name: str = "default"
+    init_checkpoint: str = ""  # Load weights only (no optimizer/step), for warm-starting new runs
 
     # Logging
     wandb_project: str = "ping-llm"
@@ -140,9 +145,13 @@ def parse_args() -> tuple[ModelConfig, TrainConfig]:
     parser.add_argument("--unembedding-lr", type=float, default=None)
     parser.add_argument("--matrix-lr", type=float, default=None)
     parser.add_argument("--weight-decay", type=float, default=None)
+    parser.add_argument("--rtt-was-lambda1", type=float, default=None)
+    parser.add_argument("--rtt-was-lambda2", type=float, default=None)
     parser.add_argument("--muon-momentum", type=float, default=None)
     parser.add_argument("--checkpoint-dir", type=str, default=None)
     parser.add_argument("--checkpoint-interval", type=int, default=None)
+    parser.add_argument("--init-checkpoint", type=str, default=None,
+                        help="Load weights only (no optimizer/step) from this checkpoint")
     parser.add_argument("--run-name", type=str, default=None)
     parser.add_argument("--wandb-project", type=str, default=None)
     parser.add_argument("--wandb-mode", type=str, default=None)
@@ -172,8 +181,9 @@ def parse_args() -> tuple[ModelConfig, TrainConfig]:
         "warmup_ratio",
         "warmdown_ratio", "dtype", "grad_clip", "gradient_accumulation_steps",
         "embedding_lr",
-        "unembedding_lr", "matrix_lr", "weight_decay", "muon_momentum",
-        "checkpoint_dir", "checkpoint_interval", "run_name", "wandb_project",
+        "unembedding_lr", "matrix_lr", "weight_decay",
+        "rtt_was_lambda1", "rtt_was_lambda2", "muon_momentum",
+        "checkpoint_dir", "checkpoint_interval", "init_checkpoint", "run_name", "wandb_project",
         "wandb_mode", "log_interval", "eval_interval", "eval_steps",
     }
     for f in train_fields:

@@ -21,6 +21,10 @@ dependencies = [
 cuda = [
     "torch>=2.4",
 ]
+eval = [
+    "pandas",
+    "matplotlib",
+]
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/ping_llm"]

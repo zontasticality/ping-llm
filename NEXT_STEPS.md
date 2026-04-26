@@ -1,95 +1,251 @@
 # NEXT STEPS
 
-Prioritized steps to get ping-llm training for real.
+Current focus: paper-ready evaluation infrastructure and baseline comparison.
 
 ---
 
-## Phase 1: 95M Validation Run on 1×A100-40GB (immediate, ~$25)
+## Phase 1: Eval/Analysis Pipeline Architecture
 
-### 1.1 Set model defaults to 95M
-Change `ModelConfig` defaults to the small model:
-- n_layer=20, n_embd=640, n_head=10, head_dim=64
+Split evaluation into three stages so baseline training (expensive) doesn't re-run
+for every new model checkpoint.
 
-### 1.2 Smoke test compiled at BS=32
-```bash
-modal run scripts/train/modal_wrapper.py::run \
-  --steps 20 --run-name smoke-95m --batch-size 32
+### Stage 1 — Test Harness (`python -m ping_llm.eval.harness`)
+
+Runs **once per test dataset**. Extracts ground truth, trains all baselines, caches
+predictions. Re-run only when test data, baseline hyperparams, or extraction logic change.
+
+**Inputs:** test.arrayrecord, baseline config
+**Outputs:** `outputs/eval_harness/{harness_id}/`
+  - `observations.parquet` — one row per RTT prediction position:
+    `(seq_idx, meas_idx, src_key, dst_key, actual_rtt_ms, timestamp, global_median_pred,
+     ema_pred, vivaldi_pred, mf_pred, trmf_pred)`
+  - `baselines_meta.json` — hyperparams, training time, IP vocab size, etc.
+  - `trmf_model.npz` — saved TRMF matrices (F, X, W) for inspection
+
+**What it does:**
+1. Load test sequences, extract (src_key, dst_key, rtt_ms, timestamp) at every RTT position
+2. Compute simple baselines inline (global median, EMA, last-seen, window-mean)
+3. Train Vivaldi (4D+height, ~5 epochs, seconds)
+4. Train static biased MF (r=16, 10 epochs, seconds)
+5. Train TRMF (restructure into time-indexed matrix, alternating GD, minutes)
+6. Record each baseline's prediction at every position
+7. Save to parquet
+
+### Stage 2 — Model Eval (`python -m ping_llm.eval.model_eval`)
+
+Runs **once per checkpoint**. Forward pass on test sequences, extract model predictions.
+
+**Inputs:** checkpoint .pt, test.arrayrecord (or harness observations.parquet for position alignment)
+**Outputs:** `outputs/eval_harness/{harness_id}/model_preds/{run_name}.parquet`
+  - `(seq_idx, meas_idx, model_top1_pred, rtt_byte1_logprobs, rtt_byte2_logprobs)`
+
+**What it does:**
+1. Load model checkpoint
+2. Forward pass on each test sequence
+3. At each RTT position (keyed by seq_idx, meas_idx to match harness), extract model's top-1 RTT prediction
+4. Save to parquet
+
+For transformer w/ vs w/o timestamps: run model_eval twice — once on standard test
+sequences, once on sequences tokenized without timestamps. Both produce separate
+parquet files under the same harness.
+
+### Stage 3 — Analysis (`python -m ping_llm.eval.analysis`)
+
+Runs **locally, no GPU, fast**. Joins harness + model predictions, generates figures
+and tables.
+
+**Inputs:** harness parquet + one or more model_preds parquets
+**Outputs:** `outputs/figures/` and `outputs/tables/`
+  - `cdf_comparison.pdf` — main CDF figure, all methods
+  - `cdf_comparison_log.pdf` — log-scale x-axis variant
+  - `percentile_table.csv` — p50, p75, p90, p95 relative error per method
+  - `loss_breakdown.csv` — per-token-type CE and accuracy
+  - Additional figures as needed for paper
+
+**What it does:**
+1. Load harness observations + model predictions, join on (seq_idx, meas_idx)
+2. Compute relative error per method per observation
+3. Generate CDF figure (one curve per method)
+4. Generate percentile table
+5. Optionally stratify by pair volatility, time-of-day, IP version, etc.
+
+### File layout
+
 ```
-**Validates**: 95M model fits in A100-40GB at BS=32 compiled, loss decreases.
-
-### 1.3 Full training run (14k steps)
-```bash
-modal run scripts/train/modal_wrapper.py::run \
-  --run-name 95m-full --batch-size 32 --total-steps 14000
+src/ping_llm/eval/
+    harness.py          # stage 1: extract ground truth + train/run all baselines
+    model_eval.py       # stage 2: per-checkpoint forward pass
+    analysis.py         # stage 3: join data, compute metrics, generate figures
+    vivaldi.py          # Vivaldi NCS implementation
+    trmf.py             # TRMF implementation
+    mf_baseline.py      # biased MF (exists)
+    baselines.py        # simple baselines: global median, EMA, etc. (refactor from existing)
+    token_classify.py   # token type classification (exists)
+    loss_breakdown.py   # per-type loss analysis (exists)
+    history_ping.py     # live ping eval (exists)
+    run_all.py          # legacy unified runner (keep working, wraps new stages)
+outputs/
+    eval_harness/
+        default/                        # harness_id = hash of test data + config
+            observations.parquet        # ground truth + baseline predictions
+            baselines_meta.json
+            trmf_model.npz
+            model_preds/
+                deep60-60k.parquet      # model predictions per checkpoint
+                deep60-was-60k.parquet
+                680m-131k.parquet
+    figures/                            # generated by analysis.py
+    tables/
+paper/
+    analysis.typ                        # typst, includes figures/ and tables/
 ```
-~8h, ~$17. Monitor on wandb. Should see clean WSD loss curve.
 
-### 1.4 Run evaluation
-```bash
-python scripts/eval_paper_metrics.py \
-  --checkpoint <path> --output-dir outputs/paper_metrics_95m/
+### Documentation
+
+After implementation, write `docs/EVAL_GUIDE.md` documenting:
+- How the three-stage pipeline works
+- When to re-run each stage (test data changes → harness; new checkpoint → model_eval; any change → analysis)
+- How to add a new baseline method
+- How to add a new analysis figure
+- File formats and column schemas for parquet files
+- How the typst report pulls in generated figures
+
+---
+
+## Phase 2: Baseline Implementations
+
+### 2.1 Vivaldi (~80 lines, `src/ping_llm/eval/vivaldi.py`)
+
+Spring-force coordinate system. Each IP gets a coordinate vector (R^d) + height scalar.
+
+- `predicted_rtt(i, j) = ||coord_i - coord_j|| + height_i + height_j`
+- Adaptive timestep: `delta = c_c * e_i / (e_i + e_j)`, c_c=0.25
+- Error estimate: EMA of relative prediction error
+- Symmetric update: on each (src, dst, rtt), update both nodes
+- Parameters: dim=4, height=yes, n_epochs=5
+- Interface: `fit_vivaldi(measurements) -> dict[ip_key -> (coord, height, error)]`
+
+### 2.2 TRMF (~250 lines, `src/ping_llm/eval/trmf.py`)
+
+Temporal Regularized Matrix Factorization. Y = F @ X with AR regularization on X.
+
+**Data restructuring** (the real complexity):
+- Convert (src_key, dst_key, rtt_ms, timestamp) → sparse matrix Y of shape (n_pairs, n_timebins)
+- Bin width: 15-minute bins (RIPE Atlas ~4 min interval → ~3-4 obs/bin)
+- Observation mask: 1 where measured, 0 where missing
+- Z-score normalize each row before fitting
+
+**Core algorithm** (alternating gradient descent):
+```
+Objective:
+  ||mask * (Y - F @ X)||² + λ_f||F||² + λ_x * AR_penalty(X, W) + η||X||² + λ_w||W||² + α * sum_to_one(W)
+  AR_penalty: Σ_t ||x_t - Σ_l W_l · x_{t-l}||²
+
+Updates per iteration:
+  F -= lr * grad_F
+  X -= lr * grad_X    (must accumulate across lags — known bug in reference impl)
+  W -= lr * grad_W
+```
+
+- Lag set for 15-min bins: {1, 2, 4, 96, 672} (15m, 30m, 1h, 1day, 1week)
+- K=20, λ_f=1.0, λ_x=100, η=0.5, α=500, lr=1e-4, 10k iters
+- Interface: `fit_trmf(measurements_with_timestamps) -> predict(src_key, dst_key, timestamp)`
+- Cold-start fallback: if pair unseen, defer to static MF prediction
+
+### 2.3 Timestamp Extraction (~25 lines, extend `extract_rtt_positions`)
+
+Decode TIMESTAMP_ABS/DELTA1/DELTA4 tokens to recover Unix timestamps per measurement.
+Currently skipped in baselines.py — falls through to `ROLE_BYTE_COUNTS` skip. Need:
+- `current_time_sec: Optional[int]` accumulator before the loop
+- TIMESTAMP_ABS: `struct.unpack(">Q", ...)` → 8-byte uint64 (absolute seconds)
+- TIMESTAMP_DELTA1: `token_to_byte(data[0])` → 1-byte delta added to previous
+- TIMESTAMP_DELTA4: `struct.unpack(">I", ...)` → 4-byte delta added to previous
+- No timestamp: leave as None (30% of training data has no timestamps)
+- Add `"timestamp": current_time_sec` to each position dict
+
+**Field shuffling caveat:** `encode_measurement` randomizes field order within each
+measurement, so the timestamp block may appear before or after RTT_START. Buffer
+per-measurement: store timestamp when seen, attach to RTT entry at next
+MEASUREMENT_START boundary (reconcile). ~5 extra lines for the buffering.
+
+### 2.4 CDF Plotting (~50 lines, `src/ping_llm/eval/analysis.py`)
+
+```python
+def plot_error_cdf(observations_df, model_preds_df, output_dir):
+    # Join on (seq_idx, meas_idx)
+    # Compute relative_error = |pred - actual| / actual for each method
+    # Plot empirical CDF per method
+    # Also: log-scale variant, percentile table
 ```
 
 ---
 
-## Phase 2: Add DDP for Multi-GPU (before scaling to 680M)
+## Phase 3: RTT-Aware Loss Evaluation
 
-### 2.1 Add DDP to train.py
-- `torch.distributed.init_process_group()`
-- Wrap model in `DistributedDataParallel`
-- Shard data across ranks
-- Only save checkpoints / log on rank 0
+### 3.1 A/B comparison: deep60-60k (CE only) vs deep60-was-60k (CE + Wasserstein)
 
-### 2.2 Update modal_wrapper.py for multi-GPU
-- Change `gpu="A100"` to configurable (e.g. `gpu="H100:8"`)
-- Launch training with `torchrun --nproc_per_node=8`
-- Increase CPU count for 8-GPU instance
+**deep60 architecture:** 60L/384E/6H/64HD = ~106M params. Deep-narrow variant at roughly
+the same param budget as the default 95M (20L/640E/10H/64HD). Defined in
+`scripts/train/slurm_deep60_was.sh`.
 
-### 2.3 Smoke test DDP on 2×A100
-```bash
-# Quick DDP validation before burning $90 on 8×H100
-modal run scripts/train/modal_wrapper.py::run \
-  --steps 20 --run-name smoke-ddp --batch-size 32 --gpu "A100:2"
-```
+Both jobs submitted to Unity cluster (same architecture, same data, same steps):
+- `deep60-60k` — baseline, plain cross-entropy (COMPLETED)
+- `deep60-was-60k` — CE + λ₁=0.5 byte1 WAS + λ₂=0.1 byte2 WAS (SUBMITTED, job 56254030)
 
----
+Compare via analysis pipeline:
+- Overall CE loss and per-token-type CE
+- RTT byte accuracy: byte 1 (exponent) vs byte 2 (mantissa) separately
+- RTT prediction MAE/median vs all baselines
+- Does Wasserstein improve RTT accuracy without hurting other token types?
 
-## Phase 3: 680M Production Run on 8×H100 (~$90)
+### 3.2 Tune Wasserstein hyperparameters (if promising)
 
-### 3.1 Full training
-```bash
-modal run scripts/train/modal_wrapper.py::run \
-  --run-name 680m-full --batch-size 16 \
-  --n-layer 24 --n-embd 1536 --n-head 12 --head-dim 128 \
-  --total-steps 14000 --gpu "H100:8"
-```
-~2h, ~$90. Device BS=16 per GPU, 8 GPUs = 128 per step, 2 accum = 256 effective.
-
-### 3.2 Monitor + evaluate
-- Watch wandb for loss curve health
-- Run eval suite on final checkpoint
-- Compare 95M vs 680M results
+Test λ₁ ∈ {0.1, 0.3, 0.5, 1.0} and λ₂ ∈ {0.0, 0.05, 0.1, 0.3} via autoresearch.
 
 ---
 
-## Phase 4: Evaluation & Analysis
+## Phase 4: Scale Up
 
-### 4.1 Key metrics
-- RTT prediction accuracy (MAE, calibration)
-- Timestamp prediction (delta accuracy)
-- IP prediction (byte-level accuracy)
-- Conditional generation: P(RTT | src_ip, dst_ip)
-- Live ping comparison
+### 4.1 680M with best loss function
 
-### 4.2 Ablations (if results warrant)
-- Model size: 95M vs 680M
-- Timestamp mode: full vs mixed
-- Window size: fixed vs log-uniform
+Train 680M (24L/1536E/12H/128HD) with winning loss config for 200k steps.
+Current 680m-200k (plain CE, 131k steps): MAE 48.2ms, log₂ median 0.435.
+
+### 4.2 DDP for multi-GPU (if wall-clock is a bottleneck)
+
+Not blocking — preemptible single A100 has worked.
 
 ---
 
-## Future Work
-- **FP8 training**: H100 supports FP8, ~2× matmul speedup (nanochat-style)
-- **Flash Attention 3**: H100-only, another 30-40% speedup
-- **Data scaling**: More RIPE Atlas data, additional probe rows
-- **Larger models**: Scale beyond 680M if results justify it
+## Phase 5: Paper Figures
+
+### Main figures
+- **Figure 1**: CDF of relative prediction error — all methods on one plot
+- **Figure 2**: Loss breakdown by token type across model sizes
+- **Figure 3**: RTT accuracy vs training steps (learning curve)
+- **Figure 4**: Wasserstein loss effect on RTT byte 1 vs byte 2
+- **Figure 5**: Live ping — model predicted RTT distribution vs actual
+
+### Tables
+- **Table 1**: Baseline comparison (MAE, median AE, p50/p75/p90 relative error)
+- **Table 2**: Per-token-type accuracy across models (95M, 106M deep60, 680M)
+- **Table 3**: Wasserstein hyperparameter ablation
+
+All generated by `analysis.py`, output to `outputs/figures/` and `outputs/tables/`,
+included by typst report at `paper/analysis.typ`.
+
+---
+
+## Implementation Order
+
+1. **Eval pipeline skeleton** — harness.py, model_eval.py, analysis.py with parquet I/O
+2. **Vivaldi** — easy, ~1 hour
+3. **Timestamp extraction** — needed by TRMF and transformer w/o timestamps eval
+4. **TRMF** — ~1-2 days, bug-fixed gradient computation
+5. **CDF plotting + analysis** — ~30 min
+6. **Wire into harness** — integrate all baselines into stage 1
+7. **Transformer no-timestamp eval** — tokenize test data without timestamps, run model_eval
+8. Wasserstein A/B analysis (when cluster jobs complete)
+9. Paper figures and tables via analysis.py
+10. **Write `docs/EVAL_GUIDE.md`** — document the three-stage pipeline, file formats,
+    how to add new baselines/figures, when to re-run each stage

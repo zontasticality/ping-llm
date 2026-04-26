@@ -67,6 +67,12 @@ mkdir -p "$TORCHINDUCTOR_CACHE_DIR"
 STEPS="${STEPS:-14000}"
 BATCH_SIZE="${BATCH_SIZE:-32}"
 WANDB_PROJECT="${WANDB_PROJECT:-ping-llm}"
+INIT_CHECKPOINT="${INIT_CHECKPOINT:-}"
+# Model architecture (empty = use defaults from config.py = 95M)
+N_LAYER="${N_LAYER:-}"
+N_EMBD="${N_EMBD:-}"
+N_HEAD="${N_HEAD:-}"
+HEAD_DIM="${HEAD_DIM:-}"
 
 # Build train data path (4 shards)
 TRAIN_DATA=""
@@ -95,12 +101,21 @@ echo "  Batch size: $BATCH_SIZE"
 echo "  Run name: $RUN_NAME"
 echo "  Checkpoint dir: $CHECKPOINT_DIR"
 echo "  Checkpoint interval: 200"
+[ -n "$INIT_CHECKPOINT" ] && echo "  Init checkpoint: $INIT_CHECKPOINT"
+[ -n "$N_LAYER" ] && echo "  Architecture: n_layer=$N_LAYER n_embd=$N_EMBD n_head=$N_HEAD head_dim=$HEAD_DIM"
 echo ""
 
 echo "Starting training..."
 echo "========================================"
 
 cd "$PROJECT_DIR"
+
+EXTRA_ARGS=""
+[ -n "$INIT_CHECKPOINT" ] && EXTRA_ARGS="$EXTRA_ARGS --init-checkpoint $INIT_CHECKPOINT"
+[ -n "$N_LAYER" ] && EXTRA_ARGS="$EXTRA_ARGS --n-layer $N_LAYER"
+[ -n "$N_EMBD" ] && EXTRA_ARGS="$EXTRA_ARGS --n-embd $N_EMBD"
+[ -n "$N_HEAD" ] && EXTRA_ARGS="$EXTRA_ARGS --n-head $N_HEAD"
+[ -n "$HEAD_DIM" ] && EXTRA_ARGS="$EXTRA_ARGS --head-dim $HEAD_DIM"
 
 python -m ping_llm.train \
     --run-name "$RUN_NAME" \
@@ -110,7 +125,8 @@ python -m ping_llm.train \
     --eval-data "$EVAL_DATA" \
     --checkpoint-dir "$CHECKPOINT_DIR" \
     --checkpoint-interval 200 \
-    --wandb-project "$WANDB_PROJECT"
+    --wandb-project "$WANDB_PROJECT" \
+    $EXTRA_ARGS
 
 echo ""
 echo "========================================"

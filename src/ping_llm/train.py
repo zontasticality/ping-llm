@@ -31,6 +31,7 @@ from ping_llm.config import ModelConfig, TrainConfig, parse_args
 from ping_llm.model import GPT
 from ping_llm.data.loader import create_loader
 from ping_llm.muon import Muon
+from ping_llm.rtt_loss import compute_rtt_wasserstein
 
 
 # ---------------------------------------------------------------------------
@@ -170,6 +171,18 @@ def train():
     print(f"  Embedding: {model.wte.weight.numel():,}")
     print(f"  Non-embedding: {model.num_params_non_embedding:,}")
 
+    # Warm-init from another checkpoint (weights only, fresh optimizer/step)
+    # Skip if a resume checkpoint already exists (takes precedence)
+    ckpt_dir_check = Path(train_cfg.checkpoint_dir) / train_cfg.run_name / "latest.pt"
+    if train_cfg.init_checkpoint and not ckpt_dir_check.exists():
+        print(f"Loading weights from {train_cfg.init_checkpoint} (weights only, fresh schedule)")
+        init_ckpt = torch.load(train_cfg.init_checkpoint, map_location=device, weights_only=False)
+        model.load_state_dict(init_ckpt["model"])
+        del init_ckpt
+        print(f"  Loaded. Optimizer state and step counter will start fresh.")
+    elif train_cfg.init_checkpoint and ckpt_dir_check.exists():
+        print(f"Skipping init-checkpoint (resume checkpoint exists, takes precedence)")
+
     # Optimizers (must be created before compile wrapping)
     optimizers = create_optimizers(model, train_cfg, model_cfg)
 
@@ -303,6 +316,7 @@ def train():
         for opt, _, _ in optimizers:
             opt.zero_grad(set_to_none=True)
 
+        use_was = train_cfg.rtt_was_lambda1 > 0 or train_cfg.rtt_was_lambda2 > 0
         accumulated_loss = 0.0
         for _micro in range(accum_steps):
             batch = next(train_iter)
@@ -311,8 +325,16 @@ def train():
             targets_mask = batch["targets_segmentation"]
 
             with torch.amp.autocast(device_type=device, dtype=amp_dtype, enabled=use_amp):
-                _, loss = model(inputs, targets, targets_mask)
-                loss = loss / accum_steps
+                logits, ce_loss = model(inputs, targets, targets_mask)
+                if use_was:
+                    was_loss = compute_rtt_wasserstein(
+                        logits, targets, targets_mask, inputs,
+                        lambda1=train_cfg.rtt_was_lambda1,
+                        lambda2=train_cfg.rtt_was_lambda2,
+                    )
+                    loss = (ce_loss + was_loss) / accum_steps
+                else:
+                    loss = ce_loss / accum_steps
 
             scaler.scale(loss).backward()
             accumulated_loss += loss.item()
@@ -371,6 +393,11 @@ def train():
                     log_dict["gpu/allocated_gb"] = torch.cuda.memory_allocated() / 1e9
                     log_dict["gpu/peak_allocated_gb"] = torch.cuda.max_memory_allocated() / 1e9
                     torch.cuda.reset_peak_memory_stats()
+                # Estimate cumulative wall time (survives preemption restarts)
+                if tokens_sec > 0:
+                    log_dict["train/cumulative_hours"] = round(
+                        (step + 1) * tokens_per_step / tokens_sec / 3600, 2
+                    )
                 wandb.log(log_dict, step=step + 1)
 
             running_loss = 0.0
