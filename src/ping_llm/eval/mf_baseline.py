@@ -11,20 +11,8 @@ are strongly low-rank: r=16 captures ~95% of spectral energy.
 
 import math
 import numpy as np
-from collections import defaultdict
 
-from ping_llm.data.tokenization import (
-    MEASUREMENT_START, RTT_START, FAILED,
-    SRC_IPV4, SRC_IPV6, DST_IPV4, DST_IPV6,
-    token_to_byte, BYTE_TOKEN_OFFSET,
-    decode_rtt_exponent_mantissa,
-)
-from ping_llm.eval.token_classify import ROLE_BYTE_COUNTS
-
-
-def _decode_ip_from_tokens(role_token, byte_tokens):
-    """Decode IP address from role token + byte tokens to a hashable tuple."""
-    return (role_token, tuple(int(t) for t in byte_tokens))
+from ping_llm.eval.baselines import extract_rtt_positions
 
 
 def extract_measurements_from_sequences(sequences):
@@ -36,61 +24,9 @@ def extract_measurements_from_sequences(sequences):
     """
     measurements = []
     for tokens in sequences:
-        tokens = [int(t) for t in tokens]
-        i = 0
-        n = len(tokens)
-        current_src = None
-        current_dst = None
-        current_rtt = None
-
-        while i < n:
-            t = tokens[i]
-            if t == MEASUREMENT_START:
-                if current_src is not None and current_dst is not None and current_rtt is not None and current_rtt > 0:
-                    measurements.append((current_src, current_dst, current_rtt))
-                current_src = None
-                current_dst = None
-                current_rtt = None
-                i += 1
-                continue
-
-            if t in (SRC_IPV4, SRC_IPV6):
-                nbytes = 4 if t == SRC_IPV4 else 16
-                if i + nbytes < n:
-                    current_src = _decode_ip_from_tokens(t, tokens[i+1:i+1+nbytes])
-                i += 1 + nbytes
-                continue
-
-            if t in (DST_IPV4, DST_IPV6):
-                nbytes = 4 if t == DST_IPV4 else 16
-                if i + nbytes < n:
-                    current_dst = _decode_ip_from_tokens(t, tokens[i+1:i+1+nbytes])
-                i += 1 + nbytes
-                continue
-
-            if t == RTT_START and i + 2 < n:
-                try:
-                    b1 = token_to_byte(tokens[i+1])
-                    b2 = token_to_byte(tokens[i+2])
-                    current_rtt = decode_rtt_exponent_mantissa(b1, b2)
-                except Exception:
-                    pass
-                i += 3
-                continue
-
-            if t == FAILED:
-                current_rtt = -1.0
-                i += 1
-                continue
-
-            if t in ROLE_BYTE_COUNTS:
-                i += 1 + ROLE_BYTE_COUNTS[t]
-            else:
-                i += 1
-
-        if current_src is not None and current_dst is not None and current_rtt is not None and current_rtt > 0:
-            measurements.append((current_src, current_dst, current_rtt))
-
+        for p in extract_rtt_positions(tokens):
+            if p["rtt_ms"] > 0 and p["src_key"] is not None and p["dst_key"] is not None:
+                measurements.append((p["src_key"], p["dst_key"], p["rtt_ms"]))
     return measurements
 
 

@@ -102,8 +102,6 @@ def run_baselines(model, sequences, device, args):
     results = eval_baselines(
         model, sequences, device=device,
         max_sequences=args.baseline_sequences,
-        model_samples=args.baseline_model_samples,
-        temperature=args.temperature,
     )
     print_baselines(results)
     return results
@@ -134,8 +132,6 @@ def main():
     # Test 3 options
     parser.add_argument("--baseline-sequences", type=int, default=100,
                         help="Number of sequences for baseline comparison")
-    parser.add_argument("--baseline-model-samples", type=int, default=30,
-                        help="RTT samples per prediction for baselines (lower for speed)")
 
     args = parser.parse_args()
     selected_tests = set(args.tests.split(","))

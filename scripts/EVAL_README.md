@@ -1,293 +1,110 @@
-# Local Model Evaluation Guide
+# Evaluation Guide
 
-This guide explains how to download your trained checkpoint and run local evaluations.
+## Three-Stage Pipeline (primary)
 
-## Step 1: Download Checkpoint from Modal
+The main evaluation workflow is a three-stage pipeline. Each stage can be
+re-run independently.
+
+### Stage 1: Harness (baselines)
+
+Runs once per test dataset. Extracts ground truth, trains all baselines
+(MF, Vivaldi, TRMF), caches predictions to parquet.
 
 ```bash
-# Download checkpoint step 2000 (adjust as needed)
-bash scripts/download_checkpoint.sh 2000 checkpoints/full_run
-
-# Or with custom Modal volume name:
-MODAL_VOLUME=my-volume bash scripts/download_checkpoint.sh 2000 checkpoints/full_run
+python -m ping_llm.eval.harness \
+    --test-data data/probe_rows/test.arrayrecord \
+    --output-dir outputs/eval_harness/default \
+    --num-sequences 200
 ```
 
-This downloads the checkpoint to: `checkpoints/full_run/checkpoints/2000/`
+On SLURM (GPU node, also runs stages 2+3):
+```bash
+sbatch scripts/train/slurm_eval_pipeline.sh
+```
 
-## Step 2A: Evaluate Field Ordering Likelihood
+### Stage 2: Model eval (per checkpoint)
 
-This script tests how well the model learned different slices of the joint distribution by trying all possible orderings of fields.
+Forward pass on test sequences, extracts top-1 RTT predictions, logprobs,
+and per-token-type loss breakdown.
+
+```bash
+python -m ping_llm.eval.model_eval \
+    --checkpoint outputs/checkpoints/deep60-60k/latest.pt \
+    --test-data data/probe_rows/test.arrayrecord \
+    --harness-dir outputs/eval_harness/default \
+    --run-name deep60-60k
+```
+
+No-timestamp ablation (strips timestamps before forward pass):
+```bash
+python -m ping_llm.eval.model_eval \
+    --checkpoint outputs/checkpoints/deep60-60k/latest.pt \
+    --test-data data/probe_rows/test.arrayrecord \
+    --harness-dir outputs/eval_harness/default \
+    --run-name deep60-60k-nots \
+    --strip-timestamps
+```
+
+### Stage 3: Analysis (local, no GPU)
+
+Joins harness + model predictions, generates CDF figures, context curves,
+and percentile tables.
+
+```bash
+python -m ping_llm.eval.analysis \
+    --harness-dir outputs/eval_harness/default \
+    --model-runs deep60-60k,680m-200k,deep60-60k-nots,680m-200k-nots
+```
+
+Outputs:
+- `outputs/figures/cdf_rel_err.pdf` / `cdf_rel_err_log.pdf` — relative error CDFs
+- `outputs/figures/cdf_abs_err_ms.pdf` / `cdf_abs_err_ms_log.pdf` — absolute error CDFs
+- `outputs/figures/context_curve.pdf` — accuracy vs prior context
+- `outputs/tables/percentile_table.csv`
+- `outputs/tables/loss_breakdown.csv`
+
+### When to re-run each stage
+
+| Change | Re-run |
+|--------|--------|
+| Test data or baseline config | Stage 1 + 2 + 3 |
+| New model checkpoint | Stage 2 + 3 |
+| New figure or metric | Stage 3 only |
+
+## Legacy Scripts (supplemental)
+
+These scripts predate the pipeline and provide interactive/diagnostic tools:
+
+- `scripts/eval_ordering_likelihood.py` — test field-ordering preferences
+- `scripts/eval_next_token_predictions.py` — pretty-print predicted vs actual tokens
+- `scripts/eval_paper_metrics.py` — archived to `archive/scripts/` (superseded by pipeline)
+- `scripts/eval_live_ping.py` — removed (superseded by `ping_llm.eval.history_ping`)
+
+### Field ordering likelihood
 
 ```bash
 python scripts/eval_ordering_likelihood.py \
-    --checkpoint checkpoints/full_run/checkpoints/2000 \
+    --checkpoint path/to/latest.pt \
     --data data/training_data.parquet \
     --num-samples 100
 ```
 
-**What it does:**
-- Samples 100 random measurements from training data
-- For each measurement, creates all possible field orderings:
-  - Without timestamp: 6 orderings (src→dst→rtt, src→rtt→dst, etc.)
-  - With timestamp: 24 orderings (4! = 24 permutations)
-- Measures model's log-likelihood for predicting the final tokens in each ordering
-- Reports which orderings the model prefers
+### Next-token prediction display
 
-**Example output:**
-```
-WITHOUT TIMESTAMP:
-  src → dst → rtt                Mean: -2.3456  Std: 1.2345  (n=100)
-  src → rtt → dst                Mean: -3.4567  Std: 1.3456  (n=100)
-  ...
-
-WITH TIMESTAMP:
-  src → dst → rtt → timestamp    Mean: -2.1234  Std: 1.1234  (n=100)
-  ...
-
-INTERPRETATION:
-  - 'src → dst → rtt' tests P(rtt | src, dst) - predicting latency from endpoints
-  - 'src → rtt → dst' tests P(dst | src, rtt) - predicting destination from source+latency
-  - Higher likelihood = model learned that conditional better
-```
-
-## Step 2B: Evaluate Next-Token Predictions (Pretty-Printed)
-
-This script shows exactly what the model predicts vs actual tokens at each position, helping you understand where the model succeeds and fails.
-
-**Local CPU:**
 ```bash
 python scripts/eval_next_token_predictions.py \
-    --checkpoint checkpoints/full_run/checkpoints/2000 \
+    --checkpoint path/to/latest.pt \
     --data data/probe_rows/test.arrayrecord \
-    --num-sequences 5 \
-    --max-length 100
+    --num-sequences 5
 ```
 
-**Modal GPU (faster):**
-```bash
-modal run scripts/eval_next_token_predictions.py::eval_on_modal \
-    --num-sequences 10 \
-    --max-length 150
-```
+## Unified runner (legacy)
 
-**What it does:**
-- Loads evaluation sequences from arrayrecord data
-- For each position in the sequence, predicts the next token
-- Shows predicted vs actual tokens in color-coded format
-- Reports accuracy metrics
-
-**Example output:**
-```
-SEQUENCE 1/5
-Length: 89 tokens
-
-Sequence: MEASUREMENT_START SRC_IPV4 Byte(0xC0/192) Byte(0xA8/168) ...
-
-Evaluating next-token predictions...
-
-Accuracy: 87.5% (77/88 correct)
-
-First 20 predictions:
-  ✓ Pos   0: Actual=SRC_IPV4             | Predicted=SRC_IPV4
-  ✓ Pos   1: Actual=Byte(0xC0/192)       | Predicted=Byte(0xC0/192)
-  ✗ Pos   2: Actual=Byte(0xA8/168)       | Predicted=Byte(0xA9/169)
-  ✓ Pos   3: Actual=Byte(0x01/  1)       | Predicted=Byte(0x01/  1)
-  ...
-
-SUMMARY
-Sequences evaluated: 5
-Average accuracy: 85.3%
-Min accuracy: 78.9%
-Max accuracy: 91.2%
-```
-
-**Benefits:**
-- **Track training progress:** Run on different checkpoints to see improvement
-- **Identify failure modes:** See which token types (IPs, RTTs, timestamps) are hard to predict
-- **Debug model behavior:** Understand exactly where predictions go wrong
-- **Validate field shuffling:** Confirm model isn't just memorizing positions
-
-**Quick demo (no model required):**
-```bash
-python scripts/test_eval_format.py
-```
-
-## Step 2C: Evaluate with Live Pings (KL Divergence)
-
-This script pings random IPs and compares the model's predicted latency distribution with real measurements.
-
-**⚠️ Note:** This requires network access and will send ICMP pings. Start with small numbers for testing.
+The old `python -m ping_llm.eval.run_all` still works for quick checks:
 
 ```bash
-python scripts/eval_live_ping.py \
-    --checkpoint checkpoints/full_run/checkpoints/2000 \
-    --num-ips 10 \
-    --pings-per-ip 20 \
-    --model-samples 100 \
-    --temperature 1.0
+python -m ping_llm.eval.run_all \
+    --checkpoint path/to/latest.pt \
+    --test-data data/probe_rows/test.arrayrecord \
+    --tests loss_breakdown,baselines
 ```
-
-**What it does:**
-- Generates 10 random public IPv4 addresses
-- Pings each address 20 times to get empirical latency distribution
-- For each address:
-  - Conditions model on (src_ip, dst_ip)
-  - Samples 100 latency predictions from model's 2-gram distribution
-  - Computes KL divergence between real and predicted distributions
-- Tests both WITH and WITHOUT timestamp conditioning
-
-**Example output:**
-```
-[1/10] Testing 8.8.8.8...
-  Pinging 20 times...
-  Real pings: 18/20 successful
-  Sampling model (no timestamp)...
-  Sampling model (with timestamp)...
-  KL divergence (no timestamp):   0.3456
-  KL divergence (with timestamp):  0.2345
-
-SUMMARY RESULTS:
-KL Divergence (lower is better):
-  WITHOUT timestamp:
-    Mean: 0.4567
-    Std:  0.1234
-
-  WITH timestamp:
-    Mean: 0.3456
-    Std:  0.0987
-
-✓ Model performs better WITH timestamp (lower KL)
-```
-
-## Step 2D: Latency-Conditioned Destination Sampling (Delta Grid)
-
-This script samples destination IPs conditioned on a target RTT (with timestamp
-conditioning), then pings those IPs to see how close the observed median RTT is
-to the target.
-
-```bash
-python scripts/eval_paper_metrics.py \
-    --only latency_sampling \
-    --latency-targets 1,10,50,100,500,1000,timeout \
-    --latency-samples-per-target 15 \
-    --pings-per-ip 10
-```
-
-**What it does:**
-- For each target latency bucket, sample 15 destination IPs (mixed IPv4/IPv6)
-  using P(dst | src, rtt, timestamp)
-- Ping each sampled IP N times and compute median RTT
-- Compute error = abs(log2(median_rtt / target_rtt)) (Timeout uses ping timeout)
-- Saves metrics to `metrics/latency_sampling_metrics.json`
-
-**Plot the delta grids:**
-```bash
-python scripts/eval_paper_metrics_plot.py \
-    --run-dir outputs/paper_metrics/default \
-    --only latency_sampling
-```
-
-Default layout is a 3x2 grid per page (seven buckets means two pages).
-The plotter defaults to `1,10,100,500,1000,timeout` (omits 50ms) so it fits on one page,
-unless you set `--latency-sampling-targets`.
-
-Interpretation:
-- Each point is a sampled destination (median RTT) in sampling order
-- The dashed line is the target RTT; points show how close each sample lands
-- Timeout markers are plotted on the target line
-
-## Tips
-
-### Fast Testing
-For quick tests, use smaller numbers:
-```bash
-# Ordering evaluation (quick test)
-python scripts/eval_ordering_likelihood.py \
-    --checkpoint checkpoints/full_run/checkpoints/2000 \
-    --num-samples 10
-
-# Live ping evaluation (quick test)
-python scripts/eval_live_ping.py \
-    --checkpoint checkpoints/full_run/checkpoints/2000 \
-    --num-ips 5 \
-    --pings-per-ip 10
-```
-
-### CPU vs GPU
-These scripts default to CPU inference (for laptop use). If you have a GPU:
-- Edit the scripts to change `hardware=cpu` to `hardware=gpu` in `load_model_and_params()`
-
-### Understanding Results
-
-**Ordering Likelihood:**
-- Higher log-likelihood = better
-- Compare orderings to see which conditionals the model learned best
-- E.g., if "src → dst → rtt" has highest likelihood, model is best at P(RTT | src, dst)
-
-**KL Divergence:**
-- Lower KL = better match to reality
-- KL = 0 means perfect match (impossible in practice)
-- KL < 0.5 is generally good
-- Compare with/without timestamp to see if temporal info helps
-
-## Paper Metrics Plots
-
-Use the two-step workflow below to generate PNG figures for:
-- Timestamp vs no-timestamp delta logP summary (`timestamp_logprob_hist.png`)
-- Timestamp histogram with overlaid CDFs (`timestamp_logprob_hist_cdf.png`)
-- Timestamp continuous threshold curve (`timestamp_logprob_cdf.png`)
-- Timestamp bucket breakdown by RTT magnitude and time-of-day (`timestamp_logprob_buckets.png`)
-- Prediction-mode accuracy bars (per-token accuracy)
-- Live ping distribution matches with KL labels
-- Latency-conditioned destination sampling delta grids
-
-By default it uses the latest param-only checkpoint from `outputs/latency_network/param_only_checkpoint`.
-
-Step 1: collect metrics (no plots). Defaults to `outputs/paper_metrics/default` and overwrites existing JSONs.
-```bash
-python scripts/eval_paper_metrics.py \
-    --timestamp-contexts 200 \
-    --mode-samples 200 \
-    --pings-per-ip 20 \
-    --model-samples 100
-```
-Metrics JSONs are saved under `outputs/paper_metrics/default/metrics/`.
-
-Step 2: render plots from metrics
-```bash
-python scripts/eval_paper_metrics_plot.py \
-    --run-dir outputs/paper_metrics/default
-```
-
-One-shot helper (Modal → local → plot):
-```bash
-./modal_measure_and_local_plot.sh
-# or pass extra Modal args after --
-./modal_measure_and_local_plot.sh -- --only ping
-```
-
-## Troubleshooting
-
-**"Permission denied" for pings:**
-- The script uses `ping` command (no root needed)
-- If it fails, check network connectivity
-
-**"Checkpoint not found":**
-- Verify the param-only checkpoint exists in `outputs/latency_network/param_only_checkpoint`
-- Check Modal volume contents: `modal volume ls ping-llm outputs/latency_network/`
-
-**Out of memory:**
-- Reduce `--num-samples` or `--model-samples`
-- The scripts are designed for CPU inference on a laptop
-
-**Model predictions are all the same:**
-- Check `--temperature` (try 1.0 for stochastic sampling)
-- Verify checkpoint loaded correctly
-
-## Next Steps
-
-After running these evaluations, you can:
-1. Compare different checkpoint steps to see training progress
-2. Swap the ping targets with `--regular-domains` and `--anchor-ips`
-3. Analyze which field orderings work best for your use case
-4. Export results for visualization (scripts print to stdout, pipe to file)
