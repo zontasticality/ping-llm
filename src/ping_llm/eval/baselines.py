@@ -62,6 +62,8 @@ def extract_rtt_positions(tokens):
         ts = current_time_sec if meas_had_timestamp else None
         for pos in meas_buf:
             pos["timestamp"] = ts
+            pos["src_key"] = cur_src
+            pos["dst_key"] = cur_dst
             positions.append(pos)
         meas_buf = []
         meas_had_timestamp = False
@@ -211,9 +213,9 @@ def eval_baselines(model, sequences, device="cpu", max_sequences=100, **kwargs):
     print(f"  Global median RTT: {global_median:.2f}ms (from {len(all_rtts)} measurements)")
 
     # Train MF baseline on all test data
-    from ping_llm.eval.mf_baseline import BiasedMF, extract_measurements_from_sequences
+    from ping_llm.eval.mf_baseline import DMFSGD, extract_measurements_from_sequences
     mf_measurements = extract_measurements_from_sequences(sequences[:max_sequences])
-    mf_model = BiasedMF(embed_dim=16, lr=0.01, reg=0.1)
+    mf_model = DMFSGD(embed_dim=10, lr=0.01, reg=1.0)
     if mf_measurements:
         print(f"  Training MF baseline on {len(mf_measurements)} measurements...")
         mf_model.train(mf_measurements, epochs=10, verbose=True)

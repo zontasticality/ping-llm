@@ -52,15 +52,17 @@ def fit_vivaldi(measurements, dim=4, n_epochs=5, cc=0.25, ce=0.5):
             total_rel_err += rel_err
             count += 1
 
-            errors[src] = ce * rel_err + (1 - ce) * errors[src]
-            errors[dst] = ce * rel_err + (1 - ce) * errors[dst]
-
             e_sum = errors[src] + errors[dst]
             if e_sum < 1e-10:
                 continue
 
-            delta_src = cc * errors[src] / e_sum
-            delta_dst = cc * errors[dst] / e_sum
+            w_src = errors[src] / e_sum
+            w_dst = errors[dst] / e_sum
+            errors[src] = ce * w_src * rel_err + (1 - ce * w_src) * errors[src]
+            errors[dst] = ce * w_dst * rel_err + (1 - ce * w_dst) * errors[dst]
+
+            delta_src = cc * w_src
+            delta_dst = cc * w_dst
 
             if dist > 1e-10:
                 unit = diff / dist

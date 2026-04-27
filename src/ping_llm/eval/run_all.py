@@ -38,7 +38,7 @@ def load_test_sequences(arrayrecord_path, num_sequences=200, seed=42):
     sequences = []
     random.seed(seed)
     n_rows = len(datasource)
-    row_indices = random.sample(range(n_rows), min(num_sequences * 2, n_rows))
+    row_indices = random.sample(range(n_rows), min(max(num_sequences * 2, n_rows), n_rows))
 
     for idx in row_indices:
         if len(sequences) >= num_sequences:

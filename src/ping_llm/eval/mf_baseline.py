@@ -1,45 +1,107 @@
 """
-Biased Matrix Factorization baseline for RTT prediction.
+Matrix Factorization baselines for RTT prediction.
 
-Each IP gets separate source and destination embedding vectors (handles
-asymmetric latency). Predicted log(RTT) = dot(X[src], Y[dst]) + bias_src
-+ bias_dst + global_bias.
-
-Based on DMFSGD (Liao et al., IEEE/ACM ToN 2013). Internet RTT matrices
-are strongly low-rank: r=16 captures ~95% of spectral energy.
+Two variants:
+  DMFSGD  - paper-faithful (L1 loss, raw space, NMF). Liao et al., ToN 2013.
+  BiasedMF - recommender-style (L2 loss, log-space, per-node biases).
 """
 
 import math
 import numpy as np
 
-from ping_llm.eval.baselines import extract_rtt_positions
 
+class DMFSGD:
+    """DMFSGD: asymmetric NMF with L1 loss, line-search LR."""
 
-def extract_measurements_from_sequences(sequences):
-    """
-    Extract (src_ip_key, dst_ip_key, rtt_ms) triples from token sequences.
+    def __init__(self, embed_dim=10, lr=0.01, reg=1.0):
+        self.embed_dim = embed_dim
+        self.lr = lr
+        self.reg = reg
+        self.ip_to_idx = {}
+        self.X = None
+        self.Y = None
+        self._scale = 1.0
 
-    Returns list of (src_key, dst_key, rtt_ms) where keys are hashable
-    tuples of (role_token, byte_tuple).
-    """
-    measurements = []
-    for tokens in sequences:
-        for p in extract_rtt_positions(tokens):
-            if p["rtt_ms"] > 0 and p["src_key"] is not None and p["dst_key"] is not None:
-                measurements.append((p["src_key"], p["dst_key"], p["rtt_ms"]))
-    return measurements
+    def _get_idx(self, ip_key):
+        if ip_key not in self.ip_to_idx:
+            self.ip_to_idx[ip_key] = len(self.ip_to_idx)
+        return self.ip_to_idx[ip_key]
+
+    def train(self, measurements, epochs=20, verbose=True):
+        if not measurements:
+            return
+
+        for src, dst, _ in measurements:
+            self._get_idx(src)
+            self._get_idx(dst)
+
+        self._scale = max(m[2] for m in measurements)
+        normed = [(s, d, r / self._scale) for s, d, r in measurements]
+
+        n_ips = len(self.ip_to_idx)
+        d = self.embed_dim
+        rng = np.random.RandomState(42)
+        self.X = rng.uniform(0, 1, (n_ips, d)).astype(np.float64)
+        self.Y = rng.uniform(0, 1, (n_ips, d)).astype(np.float64)
+
+        indices = list(range(len(normed)))
+        eta = self.lr
+
+        for epoch in range(epochs):
+            rng.shuffle(indices)
+            total_ae = 0.0
+
+            for idx in indices:
+                src_key, dst_key, rtt_n = normed[idx]
+                si = self.ip_to_idx[src_key]
+                di = self.ip_to_idx[dst_key]
+
+                pred = np.dot(self.X[si], self.Y[di])
+                error = rtt_n - pred
+                sign_e = 1.0 if error > 0 else (-1.0 if error < 0 else 0.0)
+                total_ae += abs(error)
+
+                x_old = self.X[si].copy()
+                y_old = self.Y[di].copy()
+
+                step_eta = eta
+                for _ in range(5):
+                    x_new = x_old + step_eta * (sign_e * y_old - self.reg * x_old)
+                    y_new = y_old + step_eta * (sign_e * x_old - self.reg * y_old)
+                    np.maximum(x_new, 0, out=x_new)
+                    np.maximum(y_new, 0, out=y_new)
+                    if abs(rtt_n - np.dot(x_new, y_new)) <= abs(error):
+                        break
+                    step_eta *= 0.5
+
+                self.X[si] = x_new
+                self.Y[di] = y_new
+
+            mae_normed = total_ae / len(normed)
+            if verbose and (epoch == 0 or epoch == epochs - 1):
+                mae_ms = mae_normed * self._scale
+                print(f"    DMFSGD epoch {epoch+1}/{epochs}: "
+                      f"MAE={mae_ms:.2f} ms, eta={step_eta:.6f}")
+
+    def predict_rtt(self, src_key, dst_key):
+        """Predict RTT in ms for a (src, dst) pair. Returns None if unknown."""
+        if src_key not in self.ip_to_idx or dst_key not in self.ip_to_idx:
+            return None
+        si = self.ip_to_idx[src_key]
+        di = self.ip_to_idx[dst_key]
+        return max(float(np.dot(self.X[si], self.Y[di])) * self._scale, 0.001)
 
 
 class BiasedMF:
-    """Biased matrix factorization for RTT prediction in log-space."""
+    """Log-space biased MF with L2 loss (recommender-style)."""
 
     def __init__(self, embed_dim=16, lr=0.01, reg=0.1):
         self.embed_dim = embed_dim
         self.lr = lr
         self.reg = reg
         self.ip_to_idx = {}
-        self.X = None  # source embeddings
-        self.Y = None  # dest embeddings
+        self.X = None
+        self.Y = None
         self.bias_src = None
         self.bias_dst = None
         self.global_bias = 0.0
@@ -50,9 +112,6 @@ class BiasedMF:
         return self.ip_to_idx[ip_key]
 
     def train(self, measurements, epochs=10, verbose=True):
-        """
-        Train on list of (src_key, dst_key, rtt_ms) triples.
-        """
         if not measurements:
             return
 
@@ -95,12 +154,9 @@ class BiasedMF:
                 self.bias_src[si] += self.lr * (error - self.reg * self.bias_src[si])
                 self.bias_dst[di] += self.lr * (error - self.reg * self.bias_dst[di])
 
-                np.maximum(self.X[si], 0, out=self.X[si])
-                np.maximum(self.Y[di], 0, out=self.Y[di])
-
             rmse = math.sqrt(total_se / len(measurements))
             if verbose and (epoch == 0 or epoch == epochs - 1):
-                print(f"    MF epoch {epoch+1}/{epochs}: log-RMSE={rmse:.4f}")
+                print(f"    BiasedMF epoch {epoch+1}/{epochs}: log-RMSE={rmse:.4f}")
 
     def predict_rtt(self, src_key, dst_key):
         """Predict RTT in ms for a (src, dst) pair. Returns None if unknown."""

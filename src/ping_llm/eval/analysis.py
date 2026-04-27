@@ -24,16 +24,16 @@ from pathlib import Path
 # ── Visual hierarchy ──────────────────────────────────────────────────────────
 
 SIMPLE_BASELINES = {"global_median", "last_seen", "window_mean", "ema"}
-STRUCTURED_BASELINES = {"trmf", "vivaldi", "mf"}
+STRUCTURED_BASELINES = {"vivaldi", "dmfsgd", "biased_mf"}
 
 _MODEL_COLORS = [
     "#000000", "#2c2c2c", "#555555", "#777777",
 ]
 
 STRUCTURED_STYLES = {
-    "trmf":    {"color": "#d62728", "linestyle": "--", "linewidth": 1.8},
-    "vivaldi": {"color": "#9467bd", "linestyle": "--", "linewidth": 1.8},
-    "mf":      {"color": "#8c564b", "linestyle": "--", "linewidth": 1.8},
+    "vivaldi":   {"color": "#9467bd", "linestyle": "--", "linewidth": 1.8},
+    "dmfsgd":    {"color": "#8c564b", "linestyle": "--", "linewidth": 1.8},
+    "biased_mf": {"color": "#d62728", "linestyle": "--", "linewidth": 1.8},
 }
 
 SIMPLE_STYLES = {
@@ -161,26 +161,54 @@ def plot_cdf(df, pred_cols, output_dir, log_scale=False, metric="rel_err",
     return path
 
 
+def _bootstrap_median_ci(series, n_boot=1000, ci=0.95, rng=None):
+    """Bootstrap confidence interval for the median."""
+    if rng is None:
+        rng = np.random.RandomState(42)
+    vals = series.dropna().values
+    if len(vals) < 3:
+        m = float(np.median(vals)) if len(vals) else np.nan
+        return m, m, m
+    medians = np.array([
+        np.median(rng.choice(vals, size=len(vals), replace=True))
+        for _ in range(n_boot)
+    ])
+    alpha = (1 - ci) / 2
+    return float(np.percentile(medians, 100 * alpha)), \
+           float(np.median(vals)), \
+           float(np.percentile(medians, 100 * (1 - alpha)))
+
+
 def plot_context_curve(df, pred_cols, output_dir, max_k=10):
     """Median absolute error (ms) vs number of prior RTT observations."""
     _reset_model_colors()
     df = df.copy()
-    df["prior_rtts"] = df.groupby("seq_idx").cumcount()
+    if "prior_rtts" not in df.columns:
+        df["prior_rtts"] = df.groupby("seq_idx").cumcount()
     df["prior_rtts_bin"] = df["prior_rtts"].clip(upper=max_k)
 
     fig, ax = plt.subplots(figsize=(8, 5))
     ordered = _draw_order(pred_cols)
+    rng = np.random.RandomState(42)
 
     for col in ordered:
         label = col.replace("_pred", "")
         err_col = f"{col}__abs_err_ms"
         if err_col not in df.columns:
             continue
-        grouped = df.groupby("prior_rtts_bin")[err_col].median()
+
+        bins = sorted(df["prior_rtts_bin"].unique())
+        lo, med, hi = [], [], []
+        for b in bins:
+            mask = df["prior_rtts_bin"] == b
+            l, m, h = _bootstrap_median_ci(df.loc[mask, err_col], rng=rng)
+            lo.append(l); med.append(m); hi.append(h)
+
         style = _style_for(label)
         marker = "o" if label not in SIMPLE_BASELINES else ""
-        ax.plot(grouped.index, grouped.values, label=label, marker=marker,
-                markersize=4, **style)
+        fill_alpha = style.pop("alpha", 1.0) * 0.15
+        ax.plot(bins, med, label=label, marker=marker, markersize=4, **style)
+        ax.fill_between(bins, lo, hi, color=style["color"], alpha=fill_alpha)
 
     ax.set_xlabel("Prior RTT observations in context")
     ax.set_ylabel("Median Absolute Error (ms)")
