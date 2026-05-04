@@ -67,7 +67,7 @@ def _meas_row_to_dict(row):
         "src_addr": row["src_addr"],
         "dst_addr": row["dst_addr"],
         "ip_version": ip_version,
-        "rtt": float(row["rtt"]),
+        "rtt": float(row["rtt"] if "rtt" in row else row["actual_rtt_ms"]),
         "event_time": row["event_time"],
     }
 
@@ -109,25 +109,43 @@ def build_sequence(context_rows, test_row, strip_ts=False):
 
 
 def run_model_eval(checkpoint, eval_dir, run_name, num_context_list,
-                   device=None, strip_ts=False, max_test=10000, batch_size=1):
+                   device=None, strip_ts=False, max_test=10000, batch_size=1,
+                   dtype="bfloat16"):
     t0 = time.time()
     eval_dir = Path(eval_dir)
 
     if device is None:
         device = "cuda" if torch.cuda.is_available() else "cpu"
-    print(f"Loading model from {checkpoint} → {device}")
-    model, _ = load_model(checkpoint, device=device)
+    dtype_map = {
+        "bfloat16": torch.bfloat16,
+        "float16": torch.float16,
+        "float32": torch.float32,
+    }
+    torch_dtype = dtype_map[dtype]
+    print(f"Loading model from {checkpoint} → {device} ({dtype})")
+    model, _ = load_model(checkpoint, device=device, dtype=torch_dtype)
     model.eval()
 
     train_df = pd.read_parquet(eval_dir / "train_measurements.parquet")
-    test_df = pd.read_parquet(eval_dir / "test_measurements.parquet")
+    observations_path = eval_dir / "observations.parquet"
+    if observations_path.exists():
+        test_df = pd.read_parquet(observations_path)
+        if "obs_id" not in test_df.columns:
+            test_df = test_df.copy()
+            test_df["obs_id"] = np.arange(len(test_df), dtype=np.int64)
+        test_df["rtt"] = test_df["actual_rtt_ms"]
+    else:
+        test_df = pd.read_parquet(eval_dir / "test_measurements.parquet")
+        test_df = test_df.copy()
+        test_df = test_df.sort_values(["src_addr", "event_time"]).reset_index(drop=True)
+        test_df["obs_id"] = np.arange(len(test_df), dtype=np.int64)
 
     # Build per-src train index: for each src, its train measurements sorted by time
     train_by_src = {}
     for src, group in train_df.sort_values("event_time").groupby("src_addr"):
         train_by_src[src] = group
 
-    # Sample test measurements (can't run all 2M+)
+    # Sample test measurements (can't run all 1M+ for every checkpoint/context).
     if len(test_df) > max_test:
         test_df = test_df.sample(n=max_test, random_state=42)
     test_df = test_df.sort_values(["src_addr", "event_time"]).reset_index(drop=True)
@@ -187,11 +205,12 @@ def run_model_eval(checkpoint, eval_dir, run_name, num_context_list,
 
         for j in range(len(test_df)):
             results.append({
+                "obs_id": int(test_df.iloc[j]["obs_id"]),
                 "src_addr": test_df.iloc[j]["src_addr"],
                 "dst_addr": test_df.iloc[j]["dst_addr"],
                 "actual_rtt_ms": actuals[j],
                 "num_context": n_ctx,
-                "model_pred": preds[j],
+                "model_top1_pred": preds[j],
             })
 
     results_df = pd.DataFrame(results)
@@ -212,6 +231,7 @@ def main():
                    help="Comma-separated context sizes to evaluate")
     p.add_argument("--device", default=None)
     p.add_argument("--max-test", type=int, default=10000)
+    p.add_argument("--dtype", choices=("bfloat16", "float16", "float32"), default="bfloat16")
     p.add_argument("--strip-timestamps", action="store_true")
     args = p.parse_args()
 
@@ -220,6 +240,7 @@ def main():
         args.checkpoint, args.eval_dir, args.run_name,
         num_context_list, args.device,
         strip_ts=args.strip_timestamps, max_test=args.max_test,
+        dtype=args.dtype,
     )
 
 

@@ -230,6 +230,16 @@ def train():
             resume="allow",
         )
 
+    if train_cfg.total_steps > 0 and start_step >= train_cfg.total_steps:
+        print(
+            f"\nCheckpoint is already at target step "
+            f"{start_step}/{train_cfg.total_steps}. Nothing to train."
+        )
+        if wandb_run:
+            import wandb
+            wandb.finish()
+        return
+
     # Data loaders
     print("Creating data loaders...", flush=True)
     train_loader = create_loader(

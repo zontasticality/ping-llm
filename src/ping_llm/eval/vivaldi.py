@@ -3,16 +3,25 @@
 import numpy as np
 
 
-def fit_vivaldi(measurements, dim=4, n_epochs=5, cc=0.25, ce=0.5):
+def _unpack_measurement(measurement):
+    if len(measurement) >= 4:
+        return measurement[0], measurement[1], measurement[2], measurement[3]
+    return measurement[0], measurement[1], measurement[2], None
+
+
+def fit_vivaldi(measurements, dim=4, n_epochs=5, cc=0.25, ce=0.5,
+                shuffle=True):
     """
     Fit Vivaldi coordinates from RTT measurements.
 
     Args:
-        measurements: list of (src_key, dst_key, rtt_ms)
+        measurements: list of (src_key, dst_key, rtt_ms[, event_time])
         dim: coordinate dimension
         n_epochs: passes over data
         cc: coordinate correction factor
         ce: error estimate EMA factor
+        shuffle: shuffle every epoch; if false, process timestamped data in
+            chronological order
 
     Returns:
         dict mapping ip_key -> (coord, height, error_estimate)
@@ -21,6 +30,15 @@ def fit_vivaldi(measurements, dim=4, n_epochs=5, cc=0.25, ce=0.5):
     heights = {}
     errors = {}
     rng = np.random.RandomState(42)
+    unpacked = [_unpack_measurement(m) for m in measurements]
+    has_time = any(t is not None for _, _, _, t in unpacked)
+    if has_time and not shuffle:
+        def order_key(indexed_measurement):
+            idx, measurement = indexed_measurement
+            timestamp = measurement[3]
+            return (timestamp is None, timestamp if timestamp is not None else 0, idx)
+
+        unpacked = [m for _, m in sorted(enumerate(unpacked), key=order_key)]
 
     def ensure(key):
         if key not in coords:
@@ -29,13 +47,14 @@ def fit_vivaldi(measurements, dim=4, n_epochs=5, cc=0.25, ce=0.5):
             errors[key] = 1.0
 
     for epoch in range(n_epochs):
-        order = list(range(len(measurements)))
-        rng.shuffle(order)
+        order = list(range(len(unpacked)))
+        if shuffle:
+            rng.shuffle(order)
         total_rel_err = 0.0
         count = 0
 
         for idx in order:
-            src, dst, rtt = measurements[idx]
+            src, dst, rtt, _ = unpacked[idx]
             if rtt <= 0:
                 continue
 

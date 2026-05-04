@@ -22,6 +22,7 @@ cuda = [
     "torch>=2.4",
 ]
 eval = [
+    "duckdb",
     "pandas",
     "matplotlib",
 ]
