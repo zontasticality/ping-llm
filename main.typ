@@ -227,6 +227,8 @@ The primary metric during training is token-level cross-entropy on held-out meas
 
 Evaluation focuses on three core checks that should intuitively communicate the utility of the transformer approach. This includes a visualization of the hypothesis that including timestamps makes for better predictions, and a comparison of model predictions to real-world sampling from a held-out source IP not seen in training. Additional baselines, metrics, and robustness tests are part of the evaluation plan and ongoing work.
 
+The current model-vs-baseline analysis report is maintained in `paper/analysis.typ`. It collects the time-clean CDFs, absolute-error CDFs, context curve, and percentile table generated under `outputs/eval_timeclean_models/`.
+
 *Timestamp vs no-timestamp RTT likelihood:* compare the log-probability of the correct RTT tokens with and without timestamp context. This is meaningful because it isolates whether temporal information actually sharpens the RTT distribution without changing the IP conditioning.
 
 #figure(

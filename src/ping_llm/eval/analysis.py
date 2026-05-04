@@ -12,59 +12,170 @@ Usage:
 
 import argparse
 import json
+import re
 
 import numpy as np
 import pandas as pd
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+from matplotlib.lines import Line2D
 from pathlib import Path
 
 
 # ── Visual hierarchy ──────────────────────────────────────────────────────────
 
 SIMPLE_BASELINES = {"global_median", "last_seen", "window_mean", "ema"}
-STRUCTURED_BASELINES = {"vivaldi", "dmfsgd", "biased_mf"}
+STRUCTURED_BASELINES = {
+    "vivaldi", "vivaldi_time", "dmfsgd", "dmfsgd_time",
+    "dmfsgd_paper", "dmfsgd_paper_time", "biased_mf",
+}
 
-_MODEL_COLORS = [
-    "#000000", "#2c2c2c", "#555555", "#777777",
-]
+MODEL_STYLES = {
+    "680m-200k-timeclean": {"label": "680m-200k", "color": "#0072B2"},
+    "deep60-was-60k-timeclean": {"label": "deep60-was-60k", "color": "#D55E00"},
+    "deep60-60k-timeclean": {"label": "deep60-60k", "color": "#009E73"},
+}
+
+_MODEL_COLORS = ["#0072B2", "#D55E00", "#009E73", "#CC79A7", "#56B4E9"]
+_MODEL_COLOR_BY_BASE = {}
+_model_color_idx = 0
+
+CONTEXT_LINEWIDTHS = {
+    0: 1.0,
+    1: 1.45,
+    2: 1.9,
+    5: 2.45,
+    10: 3.1,
+}
+DEFAULT_MODEL_LINEWIDTH = 2.2
 
 STRUCTURED_STYLES = {
-    "vivaldi":   {"color": "#9467bd", "linestyle": "--", "linewidth": 1.8},
-    "dmfsgd":    {"color": "#8c564b", "linestyle": "--", "linewidth": 1.8},
-    "biased_mf": {"color": "#d62728", "linestyle": "--", "linewidth": 1.8},
+    "dmfsgd": {"color": "#000000", "linestyle": "--", "linewidth": 2.2},
+    "dmfsgd_time": {"color": "#000000", "linestyle": "-.", "linewidth": 2.0},
+    "vivaldi": {"color": "#CC79A7", "linestyle": "--", "linewidth": 2.1},
+    "vivaldi_time": {"color": "#CC79A7", "linestyle": "-.", "linewidth": 1.9},
+    "biased_mf": {"color": "#E69F00", "linestyle": "--", "linewidth": 2.0},
+    "dmfsgd_paper": {"color": "#7f7f7f", "linestyle": "--", "linewidth": 1.6},
+    "dmfsgd_paper_time": {"color": "#7f7f7f", "linestyle": "-.", "linewidth": 1.5},
 }
 
 SIMPLE_STYLES = {
-    "global_median": {"color": "#98df8a", "linestyle": ":", "linewidth": 1.0, "alpha": 0.55},
-    "last_seen":     {"color": "#ffbb78", "linestyle": ":", "linewidth": 1.0, "alpha": 0.55},
-    "ema":           {"color": "#aec7e8", "linestyle": ":", "linewidth": 1.0, "alpha": 0.55},
-    "window_mean":   {"color": "#c7c7c7", "linestyle": ":", "linewidth": 1.0, "alpha": 0.55},
+    "global_median": {"color": "#6B6B6B", "linestyle": ":", "linewidth": 1.7, "alpha": 1.0},
+    "last_seen": {"color": "#A6761D", "linestyle": ":", "linewidth": 1.7, "alpha": 1.0},
+    "ema": {"color": "#7570B3", "linestyle": ":", "linewidth": 1.7, "alpha": 1.0},
+    "window_mean": {"color": "#66A61E", "linestyle": ":", "linewidth": 1.7, "alpha": 1.0},
 }
 
-_model_color_idx = 0
+_CTX_RE = re.compile(r"^(?P<base>.+)_ctx(?P<context>\d+)$")
+
+
+def _split_model_context(method_name):
+    match = _CTX_RE.match(method_name)
+    if not match:
+        return method_name, None
+    return match.group("base"), int(match.group("context"))
+
+
+def _model_style_for(base_name):
+    global _model_color_idx
+    if base_name in MODEL_STYLES:
+        return MODEL_STYLES[base_name]
+    if base_name not in _MODEL_COLOR_BY_BASE:
+        _MODEL_COLOR_BY_BASE[base_name] = _MODEL_COLORS[_model_color_idx % len(_MODEL_COLORS)]
+        _model_color_idx += 1
+    return {"label": base_name, "color": _MODEL_COLOR_BY_BASE[base_name]}
 
 
 def _style_for(method_name):
-    global _model_color_idx
     if method_name in SIMPLE_STYLES:
-        return SIMPLE_STYLES[method_name]
+        return dict(SIMPLE_STYLES[method_name])
     if method_name in STRUCTURED_STYLES:
-        return STRUCTURED_STYLES[method_name]
-    nots = method_name.endswith("-nots")
-    c = _MODEL_COLORS[_model_color_idx % len(_MODEL_COLORS)]
-    _model_color_idx += 1
+        return dict(STRUCTURED_STYLES[method_name])
+
+    base_name, context = _split_model_context(method_name)
+    model_style = _model_style_for(base_name)
     return {
-        "color": c,
-        "linestyle": "--" if nots else "-",
-        "linewidth": 2.5,
+        "color": model_style["color"],
+        "linestyle": "-",
+        "linewidth": CONTEXT_LINEWIDTHS.get(context, DEFAULT_MODEL_LINEWIDTH),
+        "alpha": 0.95,
     }
 
 
 def _reset_model_colors():
-    global _model_color_idx
+    global _model_color_idx, _MODEL_COLOR_BY_BASE
     _model_color_idx = 0
+    _MODEL_COLOR_BY_BASE = {}
+
+
+def _legend_label(method_name):
+    if method_name in SIMPLE_BASELINES or method_name in STRUCTURED_BASELINES:
+        return method_name
+    base_name, _ = _split_model_context(method_name)
+    return _model_style_for(base_name)["label"]
+
+
+def _cdf_legend_handles(pred_cols):
+    bases = []
+    for col in pred_cols:
+        label = col.replace("_pred", "")
+        if label in SIMPLE_BASELINES or label in STRUCTURED_BASELINES:
+            continue
+        base, _ = _split_model_context(label)
+        if base not in bases:
+            bases.append(base)
+
+    handles = []
+    for base in bases:
+        model_style = _model_style_for(base)
+        handles.append(Line2D(
+            [0], [0],
+            color=model_style["color"],
+            linestyle="-",
+            linewidth=2.4,
+            label=model_style["label"],
+        ))
+
+    baseline_order = [
+        "dmfsgd", "vivaldi", "biased_mf", "dmfsgd_time", "vivaldi_time",
+        "dmfsgd_paper", "dmfsgd_paper_time",
+        "ema", "last_seen", "window_mean", "global_median",
+    ]
+    for name in baseline_order:
+        if f"{name}_pred" not in pred_cols:
+            continue
+        style = _style_for(name)
+        handles.append(Line2D(
+            [0], [0],
+            color=style["color"],
+            linestyle=style["linestyle"],
+            linewidth=style["linewidth"],
+            label=name,
+            alpha=style.get("alpha", 1.0),
+        ))
+    return handles
+
+
+def _context_legend_handles(pred_cols):
+    contexts = sorted({
+        context
+        for col in pred_cols
+        for _, context in [_split_model_context(col.replace("_pred", ""))]
+        if context is not None
+    })
+    if not contexts:
+        return []
+    return [
+        Line2D(
+            [0], [0],
+            color="#333333",
+            linestyle="-",
+            linewidth=CONTEXT_LINEWIDTHS.get(context, DEFAULT_MODEL_LINEWIDTH),
+            label=f"ctx {context}",
+        )
+        for context in contexts
+    ]
 
 
 # ── Data loading ──────────────────────────────────────────────────────────────
@@ -72,15 +183,47 @@ def _reset_model_colors():
 def load_and_merge(harness_dir, model_run_names=None):
     harness_dir = Path(harness_dir)
     obs = pd.read_parquet(harness_dir / "observations.parquet")
+    if "obs_id" not in obs.columns:
+        obs = obs.copy()
+        obs["obs_id"] = np.arange(len(obs), dtype=np.int64)
 
     if model_run_names:
         for name in model_run_names:
             path = harness_dir / "model_preds" / f"{name}.parquet"
             if path.exists():
                 mpreds = pd.read_parquet(path)
-                mpreds = mpreds.rename(columns={"model_top1_pred": f"{name}_pred"})
-                obs = obs.merge(mpreds, on=["seq_idx", "meas_idx"], how="left")
-                print(f"Joined {name}: {mpreds.shape[0]} predictions")
+                pred_col = (
+                    "model_top1_pred" if "model_top1_pred" in mpreds.columns else
+                    "model_pred" if "model_pred" in mpreds.columns else
+                    None
+                )
+                if pred_col is None:
+                    print(f"Warning: {path} has no model prediction column, skipping")
+                    continue
+
+                if "obs_id" in mpreds.columns:
+                    if "num_context" in mpreds.columns and mpreds["num_context"].nunique() > 1:
+                        wide = mpreds.pivot_table(
+                            index="obs_id",
+                            columns="num_context",
+                            values=pred_col,
+                            aggfunc="first",
+                        )
+                        wide.columns = [f"{name}_ctx{int(c)}_pred" for c in wide.columns]
+                        wide = wide.reset_index()
+                    else:
+                        out_col = f"{name}_pred"
+                        if "num_context" in mpreds.columns and not mpreds.empty:
+                            out_col = f"{name}_ctx{int(mpreds['num_context'].iloc[0])}_pred"
+                        wide = mpreds[["obs_id", pred_col]].rename(columns={pred_col: out_col})
+                    obs = obs.merge(wide, on="obs_id", how="left")
+                    print(f"Joined {name}: {mpreds.shape[0]} predictions")
+                elif {"seq_idx", "meas_idx"}.issubset(mpreds.columns):
+                    mpreds = mpreds.rename(columns={pred_col: f"{name}_pred"})
+                    obs = obs.merge(mpreds, on=["seq_idx", "meas_idx"], how="left")
+                    print(f"Joined legacy {name}: {mpreds.shape[0]} predictions")
+                else:
+                    print(f"Warning: {path} has no supported join key, skipping")
             else:
                 print(f"Warning: {path} not found, skipping")
 
@@ -116,7 +259,7 @@ def _draw_order(pred_cols):
 def plot_cdf(df, pred_cols, output_dir, log_scale=False, metric="rel_err",
              xlabel=None, xlim=None, suffix_extra=""):
     _reset_model_colors()
-    fig, ax = plt.subplots(figsize=(8, 5))
+    fig, ax = plt.subplots(figsize=(8.8, 5.4))
 
     err_suffix = f"__{metric}"
     ordered = _draw_order(pred_cols)
@@ -128,7 +271,7 @@ def plot_cdf(df, pred_cols, output_dir, log_scale=False, metric="rel_err",
             continue
         cdf = np.arange(1, len(err) + 1) / len(err)
         style = _style_for(label)
-        ax.plot(err, cdf, label=label, **style)
+        ax.plot(err, cdf, label=_legend_label(label), **style)
 
     if xlabel is None:
         if metric == "rel_err":
@@ -138,7 +281,6 @@ def plot_cdf(df, pred_cols, output_dir, log_scale=False, metric="rel_err",
     ax.set_xlabel(xlabel)
     ax.set_ylabel("CDF")
 
-    ax.legend(fontsize=8, loc="lower right")
     ax.grid(True, alpha=0.25)
 
     if log_scale:
@@ -152,6 +294,30 @@ def plot_cdf(df, pred_cols, output_dir, log_scale=False, metric="rel_err",
         ax.set_xlim(*xlim)
 
     ax.set_ylim(0, 1.02)
+
+    method_handles = _cdf_legend_handles(pred_cols)
+    context_handles = _context_legend_handles(pred_cols)
+    if method_handles:
+        method_legend = ax.legend(
+            handles=method_handles,
+            fontsize=7.5,
+            loc="lower right",
+            framealpha=0.92,
+            ncol=2,
+            title="Method / model family",
+            title_fontsize=8,
+        )
+        ax.add_artist(method_legend)
+    if context_handles:
+        ax.legend(
+            handles=context_handles,
+            fontsize=7.5,
+            loc="center right",
+            bbox_to_anchor=(1.0, 0.52),
+            framealpha=0.92,
+            title="Model context\n(line width)",
+            title_fontsize=8,
+        )
 
     output_dir.mkdir(parents=True, exist_ok=True)
     suffix = "_log" if log_scale else ""
@@ -187,7 +353,7 @@ def plot_context_curve(df, pred_cols, output_dir, max_k=10):
         df["prior_rtts"] = df.groupby("seq_idx").cumcount()
     df["prior_rtts_bin"] = df["prior_rtts"].clip(upper=max_k)
 
-    fig, ax = plt.subplots(figsize=(8, 5))
+    fig, ax = plt.subplots(figsize=(8.8, 5.4))
     ordered = _draw_order(pred_cols)
     rng = np.random.RandomState(42)
 
@@ -207,12 +373,34 @@ def plot_context_curve(df, pred_cols, output_dir, max_k=10):
         style = _style_for(label)
         marker = "o" if label not in SIMPLE_BASELINES else ""
         fill_alpha = style.pop("alpha", 1.0) * 0.15
-        ax.plot(bins, med, label=label, marker=marker, markersize=4, **style)
+        ax.plot(bins, med, label=_legend_label(label), marker=marker, markersize=4, **style)
         ax.fill_between(bins, lo, hi, color=style["color"], alpha=fill_alpha)
 
     ax.set_xlabel("Prior RTT observations in context")
     ax.set_ylabel("Median Absolute Error (ms)")
-    ax.legend(fontsize=8)
+    method_handles = _cdf_legend_handles(pred_cols)
+    context_handles = _context_legend_handles(pred_cols)
+    if method_handles:
+        method_legend = ax.legend(
+            handles=method_handles,
+            fontsize=7.5,
+            loc="upper right",
+            framealpha=0.92,
+            ncol=2,
+            title="Method / model family",
+            title_fontsize=8,
+        )
+        ax.add_artist(method_legend)
+    if context_handles:
+        ax.legend(
+            handles=context_handles,
+            fontsize=7.5,
+            loc="center right",
+            bbox_to_anchor=(1.0, 0.48),
+            framealpha=0.92,
+            title="Model context\n(line width)",
+            title_fontsize=8,
+        )
     ax.grid(True, alpha=0.25)
 
     ticks = list(range(max_k + 1))

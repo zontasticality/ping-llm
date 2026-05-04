@@ -1,198 +1,111 @@
-#set page(margin: 2.5cm)
-#set text(font: "New Computer Modern", size: 11pt)
+#set page(margin: 2cm)
+#set text(font: "New Computer Modern", size: 10.5pt)
 #set heading(numbering: "1.1")
 #set math.equation(numbering: "(1)")
 
+// Compile from the repository root with:
+// typst compile --root . paper/analysis.typ paper/analysis.pdf
+
 #align(center)[
-  #text(size: 16pt, weight: "bold")[RTT Prediction Evaluation Report]
-  #v(0.5em)
-  #text(size: 11pt)[Ping-LLM Baseline Comparison and Methodology]
-  #v(1em)
+  #text(size: 16pt, weight: "bold")[RTT Prediction Analysis]
+  #v(0.35em)
+  #text(size: 11pt)[Time-clean model-vs-baseline evaluation]
+  #v(0.8em)
 ]
 
-= Evaluation Pipeline
+= Summary
 
-The evaluation follows a three-stage architecture designed so that expensive baseline training (Stage 1) runs once per test dataset, while model evaluation (Stage 2) runs cheaply per checkpoint, and analysis (Stage 3) runs locally without a GPU.
-
-/ Stage 1 --- Harness: Loads test sequences from ArrayRecord, extracts ground-truth RTT values at every prediction position, trains all baseline methods, and caches per-position predictions to `observations.parquet`.
-
-/ Stage 2 --- Model Eval: Loads a model checkpoint, runs a single forward pass per test sequence, and extracts the model's top-1 RTT prediction at each position. Saves to `model_preds/{run_name}.parquet`.
-
-/ Stage 3 --- Analysis: Joins harness observations with one or more model prediction files on `(seq_idx, meas_idx)`, computes error metrics, and generates CDF figures and percentile tables.
-
-== Test Data
-
-200 sequences sampled from the RIPE Atlas test split (`test.arrayrecord`, seed\=42). Each sequence is a 1024-token crop from a probe-centric row: all measurements within a sequence share the same source--destination IP pair and are ordered temporally.
+This report collects the current analysis figures and percentile table in one place. The underlying split is the time-clean evaluation in `data/eval_timeclean`: the graph used by the structured baselines is selected only from first-half measurements, while the test rows are sampled from the second half.
 
 #table(
   columns: 2,
-  [Observations], [3,793],
-  [With timestamps], [2,323 (61%)],
-  [Unique (src, dst) pairs], [1,831],
-  [Global median RTT], [80.64 ms],
+  [Evaluation directory], [`data/eval_timeclean`],
+  [Analysis output], [`outputs/eval_timeclean_models`],
+  [Graph-selection window], [First half only (`graph_window=train`)],
+  [Train measurements], [5,000,000],
+  [Test observations], [1,000,000],
+  [Model sample], [10,000 observations x 5 context sizes],
+  [Context sizes], [`0, 1, 2, 5, 10`],
 )
 
-= Baseline Methods
+The structured baselines are trained transductively on the 5M first-half training rows. Model evaluations are out-of-sample checkpoint evaluations on a deterministic 10k sample of the 1M test observations. The model rows in the table therefore have count 10k, while baseline rows have count 1M.
 
-All baselines are trained _in-sample_ on the test sequences. The transformer models are trained on a separate training set and evaluated _out-of-sample_. This gives baselines a structural advantage; if the transformer still outperforms them, it is a conservative result.
-
-== Simple Baselines
-
-*Global median.* A single constant prediction for all positions:
-
-$ hat(r) = op("median")({r_i : i in D}) $
-
-*Last-seen.* The most recent RTT observation for the same pair within the sequence:
-
-$ hat(r)^((t)) = r^((t-1)) $
-
-*Window mean.* Average of the last $w=3$ observations:
-
-$ hat(r)^((t)) = 1/w sum_(s=t-w)^(t-1) r^((s)) $
-
-*Exponential moving average (EMA).* With smoothing factor $alpha = 0.3$:
-
-$ hat(r)^((t)) = alpha r^((t-1)) + (1 - alpha) hat(r)^((t-1)) $
-
-For the first observation in each sequence, all simple baselines fall back to the global median.
-
-== Biased Matrix Factorization
-
-Each IP address receives separate source and destination embedding vectors. Prediction is in log-space:
-
-$ log hat(r)_(i,j) = bold(x)_i^top bold(y)_j + b_i^s + b_j^d + mu $
-
-where $bold(x)_i, bold(y)_j in RR^r$ ($r=16$), $b_i^s, b_j^d$ are per-IP biases, and $mu$ is the global mean log-RTT. The model is trained via SGD on the squared error in log-space with $ell_2$ regularization ($lambda = 0.1$) and non-negativity constraints on embeddings. Based on DMFSGD (Liao et al., IEEE/ACM ToN 2013).
-
-== Vivaldi Network Coordinate System
-
-Each IP is assigned a coordinate vector $bold(c)_i in RR^d$ ($d=4$) and a height scalar $h_i >= 0$. The predicted RTT is:
-
-$ hat(r)_(i,j) = ||bold(c)_i - bold(c)_j||_2 + h_i + h_j $
-
-On each observation $(i, j, r)$, define the prediction error $e = r - hat(r)$ and relative error $epsilon = |e| slash r$. The error estimates are updated via EMA:
-
-$ epsilon_i <- c_e dot epsilon + (1 - c_e) dot epsilon_i $
-
-Coordinates are updated with an adaptive step size:
-
-$ delta_i = c_c dot epsilon_i / (epsilon_i + epsilon_j), quad c_c = 0.25 $
-
-$ bold(c)_i <- bold(c)_i + delta_i dot e dot bold(u)(bold(c)_i - bold(c)_j) $
-
-$ h_i <- max(0, h_i + delta_i dot e) $
-
-Both endpoints are updated symmetrically per observation. Parameters: $d=4$, $c_c=0.25$, $c_e=0.5$, 5 epochs.
-
-== Temporal Regularized Matrix Factorization (TRMF)
-
-TRMF factorizes a time-indexed RTT matrix with autoregressive temporal regularization. Measurements $(i, j, r, t)$ are binned into 15-minute intervals to form a sparse matrix $bold(Y) in RR^(n times T)$ (in log-RTT space, z-score normalized per pair). The observation mask $bold(M)$ is 1 where data exists and 0 otherwise.
-
-The factorization is $bold(Y) approx bold(F) bold(X)$ where $bold(F) in RR^(n times K)$ captures spatial structure and $bold(X) in RR^(K times T)$ captures temporal dynamics. The temporal factors are regularized by an autoregressive model:
-
-$ bold(x)_t approx sum_(l in cal(L)) bold(W)_l circle.tiny bold(x)_(t-l) $
-
-where $cal(L) = {1, 2, 4, 96, 672}$ corresponds to lags of 15m, 30m, 1h, 1 day, and 1 week. Each $bold(W)_l in RR^K$ is a diagonal lag coefficient vector. The full objective minimized via gradient descent is:
-
-$ cal(L) = underbrace(||bold(M) circle.tiny (bold(Y) - bold(F) bold(X))||_F^2, "reconstruction") + lambda_f ||bold(F)||_F^2 + lambda_x underbrace(sum_t ||bold(x)_t - sum_l bold(W)_l circle.tiny bold(x)_(t-l)||^2, "AR penalty") + eta ||bold(X)||_F^2 + lambda_w ||bold(W)||^2 + alpha sum_k (sum_l W_(l,k) - 1)^2 $ <trmf-objective>
-
-The sum-to-one penalty on $bold(W)$ encourages the lag coefficients to form a convex combination. Gradients are accumulated across all lags for $bold(X)$ (a known pitfall in reference implementations that update lag-by-lag). Parameters: $K=20$, $lambda_f=1$, $lambda_x=100$, $eta=0.5$, $alpha=500$, $lambda_w=1$, $"lr"=10^(-4)$, 10k iterations.
-
-Prediction: $hat(r)_(i,j)(t) = exp(sigma_i dot (bold(f)_i^top bold(x)_t) + mu_i)$ where $mu_i, sigma_i$ are the per-pair z-score parameters. Unseen pairs fall back to the biased MF prediction.
-
-= Transformer Models
-
-Two decoder-only GPT models trained on the RIPE Atlas training split with cross-entropy loss on next-token prediction. Both use RoPE, RMSNorm, $"ReLU"^2$ activations, and logit softcapping at 15.
-
-#table(
-  columns: (auto, auto, auto, auto, auto, auto, auto),
-  align: center,
-  table.header[Name][Layers][Emb dim][Heads][Head dim][Params][Steps],
-  [deep60-60k], [60], [384], [6], [64], [106M], [60k],
-  [680m-200k], [24], [1536], [12], [128], [680M], [200k],
-)
-
-The deep60 architecture is a narrow-deep variant at roughly the same parameter count as the default 95M model (20L/640E), testing whether depth is more important than width for this task.
-
-= Metrics
-
-== Relative Error
-
-For each prediction position with actual RTT $r$ and predicted RTT $hat(r)$:
-
-$ epsilon_"rel" = (|hat(r) - r|) / r $
-
-This metric is scale-invariant: a 10ms error on a 100ms RTT and a 1ms error on a 10ms RTT both give $epsilon_"rel" = 0.1$.
-
-== Empirical CDF
-
-The CDF at threshold $x$ is the fraction of predictions with relative error at most $x$:
-
-$ F(x) = 1/N |{i : epsilon_"rel"^((i)) <= x}| $
-
-A curve further to the left (higher CDF at lower error) indicates a better method. The log-scale variant reveals behavior at very small errors.
-
-== Percentile Table
-
-Reports $p$-th percentile of the relative error distribution for each method, along with mean absolute error (MAE) and median absolute error.
-
-= Results
+= Figure Gallery
 
 #figure(
-  image("../outputs/figures/cdf_rel_err_log.pdf", width: 95%),
-  caption: [CDF of relative prediction error (log scale). Solid black lines: transformer models. Dashed colored lines: structured baselines. Dotted faint lines: simple baselines. TRMF (in-sample, red) dominates at low error; 680m-200k is the best out-of-sample method.],
-) <fig-cdf>
+  image("../outputs/eval_timeclean_models/figures/cdf_rel_err.pdf", width: 96%),
+  caption: [CDF of relative prediction error on a linear x-axis. Structured graph baselines dominate the low-error region; model curves improve substantially once any context is available.],
+) <fig-rel-cdf>
 
 #figure(
-  image("../outputs/figures/cdf_abs_err_ms_log.pdf", width: 95%),
-  caption: [CDF of absolute prediction error in milliseconds (log scale). 80% of transformer predictions are within 100ms of the true RTT. TRMF achieves 50% of predictions within 10ms.],
-) <fig-cdf-abs>
+  image("../outputs/eval_timeclean_models/figures/cdf_rel_err_log.pdf", width: 96%),
+  caption: [CDF of relative prediction error on a log x-axis. This view separates the low-error portion of the graph baselines from the transformer and simple-history baselines.],
+) <fig-rel-cdf-log>
 
 #figure(
-  table(
-    columns: (auto, auto, auto, auto, auto, auto, auto, auto),
-    align: (left, right, right, right, right, right, right, right),
-    table.header[Method][Count][MAE (ms)][Med. AE][p50 rel][p75 rel][p90 rel][p95 rel],
-    [*TRMF*#super[\*]], [3793], [41.90], [17.23], [0.327], [0.727], [1.985], [4.766],
-    [*680m-200k*], [3793], [51.81], [23.81], [0.327], [0.848], [5.358], [14.47],
-    [*680m-200k-nots*], [3793], [52.24], [25.02], [0.326], [0.852], [5.358], [14.54],
-    [*deep60-60k*], [3793], [55.24], [32.06], [0.397], [0.894], [4.801], [13.28],
-    [*deep60-60k-nots*], [3793], [55.49], [32.64], [0.395], [0.898], [4.962], [14.28],
-    [Vivaldi], [3793], [62.17], [51.06], [0.611], [1.991], [6.424], [16.00],
-    [EMA], [3793], [66.45], [53.87], [0.625], [1.961], [5.998], [10.99],
-    [Window mean], [3793], [69.03], [55.18], [0.633], [1.865], [5.819], [11.03],
-    [Biased MF#super[\*]], [3793], [69.43], [57.47], [0.638], [1.718], [5.685], [12.62],
-    [Last-seen], [3793], [79.05], [61.06], [0.677], [1.245], [6.246], [12.56],
-    [Global median], [3793], [78.13], [64.34], [0.687], [2.592], [7.744], [18.54],
-  ),
-  caption: [Percentile table of relative prediction error. Methods marked #super[\*] are trained in-sample. Bold methods are transformers (out-of-sample). Suffix "-nots" denotes evaluation with timestamps stripped from the input.],
-) <tab-percentile>
+  image("../outputs/eval_timeclean_models/figures/cdf_abs_err_ms.pdf", width: 96%),
+  caption: [CDF of absolute error in milliseconds on a linear x-axis.],
+) <fig-abs-cdf>
 
 #figure(
-  image("../outputs/figures/context_curve.pdf", width: 95%),
-  caption: [Median absolute error vs.\ number of prior RTT observations in context. Transformers (solid black) drop sharply from \~62ms at cold start to \~22ms after 2--3 prior measurements, matching TRMF. Simple baselines (dotted) remain flat. This is in-context learning: the model identifies the pair's RTT regime from a few examples.],
+  image("../outputs/eval_timeclean_models/figures/cdf_abs_err_ms_log.pdf", width: 96%),
+  caption: [CDF of absolute error in milliseconds on a log x-axis. This makes the 5--50ms range easier to inspect.],
+) <fig-abs-cdf-log>
+
+#figure(
+  image("../outputs/eval_timeclean_models/figures/context_curve.pdf", width: 96%),
+  caption: [Median absolute error versus available prior RTT observations. The transformer models improve sharply from cold start to one or two context measurements, then mostly plateau.],
 ) <fig-context>
 
-== Key Observations
+= Percentile Table
 
-+ *TRMF dominates at all percentiles*, but it is trained in-sample. Its near-zero errors at low percentiles (@fig-cdf) reflect partial memorization of the sparse observation matrix (1,702 of 3.45M entries filled).
+#figure(
+  text(size: 7.4pt)[
+    #table(
+      columns: (2.9cm, 1.2cm, 1.25cm, 1.25cm, 1.05cm, 1.05cm, 1.05cm, 1.05cm),
+      align: (left, right, right, right, right, right, right, right),
+      table.header[Method][Count][MAE][Med. AE][p50 rel][p75 rel][p90 rel][p95 rel],
+      [`dmfsgd`], [1M], [16.57], [8.58], [0.0838], [0.1711], [0.3258], [0.4658],
+      [`vivaldi`], [1M], [17.63], [9.45], [0.0928], [0.1918], [0.3508], [0.5043],
+      [`dmfsgd_time`], [1M], [17.56], [9.85], [0.0935], [0.1939], [0.3747], [0.5388],
+      [`biased_mf`], [1M], [25.84], [12.60], [0.1232], [0.2313], [0.3772], [0.4996],
+      [`vivaldi_time`], [1M], [21.36], [12.66], [0.1172], [0.2470], [0.4927], [0.7874],
+      [`680m-200k ctx0`], [10k], [54.41], [30.91], [0.2288], [0.5515], [2.6157], [5.9618],
+      [`680m-200k ctx1`], [10k], [44.08], [17.74], [0.1563], [0.4214], [0.9242], [4.2394],
+      [`680m-200k ctx2`], [10k], [44.57], [17.95], [0.1591], [0.4251], [0.9270], [4.0797],
+      [`680m-200k ctx5`], [10k], [44.00], [17.83], [0.1599], [0.4131], [0.9233], [4.0203],
+      [`680m-200k ctx10`], [10k], [44.19], [17.94], [0.1601], [0.4146], [0.9307], [4.2035],
+      [`deep60-was ctx0`], [10k], [56.33], [32.15], [0.3278], [0.6582], [1.1749], [2.4075],
+      [`deep60-was ctx1`], [10k], [42.30], [18.48], [0.1867], [0.5387], [0.8247], [1.2437],
+      [`deep60-was ctx2`], [10k], [42.50], [18.33], [0.1880], [0.5405], [0.8253], [1.1961],
+      [`deep60-was ctx5`], [10k], [42.34], [18.24], [0.1868], [0.5397], [0.8263], [1.2098],
+      [`deep60-was ctx10`], [10k], [41.97], [17.98], [0.1842], [0.5326], [0.8228], [1.2038],
+      [`deep60 ctx0`], [10k], [64.33], [53.41], [0.3639], [0.7432], [2.5505], [5.0207],
+      [`deep60 ctx1`], [10k], [57.73], [38.95], [0.3043], [0.6241], [1.5797], [3.8093],
+      [`deep60 ctx2`], [10k], [56.96], [36.22], [0.2935], [0.6103], [1.2205], [3.4329],
+      [`deep60 ctx5`], [10k], [54.85], [33.79], [0.2747], [0.5701], [1.1968], [3.6787],
+      [`deep60 ctx10`], [10k], [53.98], [33.11], [0.2612], [0.5492], [1.1967], [3.9923],
+      [`dmfsgd_paper`], [1M], [139.79], [138.11], [0.9707], [0.9799], [0.9851], [0.9876],
+      [`dmfsgd_paper_time`], [1M], [139.83], [138.16], [0.9706], [0.9800], [0.9853], [0.9878],
+      [`ema`], [1M], [65.83], [55.43], [0.4126], [0.9254], [3.3455], [5.5632],
+      [`last_seen`], [1M], [81.72], [66.97], [0.4849], [0.8959], [3.2381], [6.4685],
+      [`window_mean`], [1M], [69.35], [57.19], [0.4265], [0.8880], [3.3439], [5.7434],
+      [`global_median`], [1M], [104.92], [92.82], [0.7112], [0.8069], [1.0931], [2.1305],
+    )
+  ],
+  caption: [Percentile table for the time-clean evaluation. Lower is better. Model rows are evaluated on the 10k deterministic model sample; baseline rows are evaluated on the full 1M observations.],
+) <tab-percentiles>
 
-+ *680m-200k matches TRMF at the median* ($p_50 = 0.327$ for both) despite being evaluated out-of-sample. It leads all out-of-sample methods by a clear margin (MAE 51.8 vs next-best deep60 at 55.2).
+= Notes
 
-+ *Scale helps*: 680m-200k beats deep60-60k across the board (MAE, median AE, $p_50$ through $p_75$). The deep60 architecture (narrow-deep at 106M params) is competitive but does not outperform the wider 680M model.
++ The best structured baseline remains `dmfsgd` with 8.58ms median absolute error and 0.0838 median relative error.
 
-+ *Timestamps do not improve RTT prediction.* Stripping timestamps from the input changes median absolute error by less than 1ms for both models (@tab-percentile, "-nots" rows). The RTT byte cross-entropy is also nearly identical (4.134 vs 4.133 for deep60, 4.064 vs 4.061 for 680m). The model's RTT predictions come from IP pair identity and within-sequence RTT history, not temporal conditioning.
++ The strongest model result is `680m-200k` with one context measurement: 17.74ms median absolute error and 0.1563 median relative error. Additional context does not materially improve it on this sample.
 
-+ *In-context learning is the key mechanism.* @fig-context shows that transformers improve sharply with 1--3 prior measurements, dropping from 62ms to 22ms median error. After 3 observations, they match TRMF. Simple baselines remain flat. This suggests the model rapidly identifies the pair's RTT regime from a few examples.
++ The latest WAS model, `deep60-was-60k`, improves sharply with context: 32.15ms median absolute error at cold start, about 18ms once context is available.
 
-+ *Transformers have heavy right tails*: at $p_90$ and $p_95$, both models are _worse_ than simple baselines like EMA. This suggests the models make confidently wrong predictions on a subset of measurements --- likely rare pairs or highly volatile RTTs. The Wasserstein loss (pending evaluation) may improve this tail behavior by penalizing predictions that are far from the true RTT in ordinal space.
++ The previous deep run, `deep60-60k`, is clearly weaker than both `deep60-was-60k` and `680m-200k` across all context sizes.
 
-+ *Simple baselines cluster together*: EMA, window mean, last-seen, biased MF, and Vivaldi all perform similarly ($p_50$ relative error 0.61--0.69). Vivaldi coordinates offer minimal benefit in this setup because each test sequence covers a single src--dst pair, limiting cross-pair leverage.
++ The paper-style DMFSGD variants remain poor because max-scaling collapses the normalized target distribution on this outlier-heavy RTT corpus.
 
-= Methodological Notes
-
-*In-sample vs.\ out-of-sample.* Biased MF, Vivaldi, and TRMF are trained on the _test_ sequences and then evaluated on the same data. The transformer models were trained on a separate training split and have never seen the test sequences. This design is intentionally conservative: if the transformer outperforms in-sample baselines, the result is more compelling. A fairer comparison would hold out a temporal split within the test data, training baselines on earlier measurements and predicting later ones.
-
-*Probe-centric sequences.* Each test sequence comes from a single probe row (one src--dst pair over time). Within-sequence baselines (EMA, last-seen, window mean) are therefore predicting the _next RTT for the same pair_, which is their strongest use case. Cross-pair methods (MF, Vivaldi, TRMF) can leverage structure across sequences but operate on a relatively small test set (1,831 unique pairs).
-
-*First-observation fallback.* The first RTT observation in each sequence has no history, so all history-based baselines predict the global median at that position. The transformer also has limited context at the first position (just IP fields, no prior RTTs). This position is included in all metrics.
++ The structured baselines are transductive graph-completion methods with persistent per-node fitted state. The transformer model receives only a small local context at eval time, so this evaluation currently favors Vivaldi/DMFSGD-style baselines.
