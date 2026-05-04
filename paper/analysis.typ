@@ -30,6 +30,8 @@ This report collects the current analysis figures and percentile table in one pl
 
 The structured baselines are trained transductively on the 5M first-half training rows. Model evaluations are out-of-sample checkpoint evaluations on a deterministic 10k sample of the 1M test observations. The model rows in the table therefore have count 10k, while baseline rows have count 1M.
 
+For the token-position analysis, the 680M checkpoint was evaluated with greedily max-packed same-source context. With the 1024-token model window, the observed maximum was 62 context measurements, median capacity was 59, and the median packed sequence length was 1,014 tokens. Capacity is lower for IPv6-heavy contexts because each IPv6 address consumes 16 byte tokens instead of 4.
+
 = Figure Gallery
 
 #figure(
@@ -56,6 +58,21 @@ The structured baselines are trained transductively on the 5M first-half trainin
   image("../outputs/eval_timeclean_models/figures/context_curve.pdf", width: 96%),
   caption: [Median absolute error versus available prior RTT observations. The transformer models improve sharply from cold start to one or two context measurements, then mostly plateau.],
 ) <fig-context>
+
+#figure(
+  image("../outputs/eval_timeclean_models/figures/context_capacity.pdf", width: 92%),
+  caption: [Maximum number of same-source context measurements that fit in the 1024-token model window when greedily packing recent train measurements before the query. Capacity varies mainly with IPv4/IPv6 length and timestamp delta encoding.],
+) <fig-context-capacity>
+
+#figure(
+  image("../outputs/eval_timeclean_models/figures/token_position_accuracy_heatmap.pdf", width: 98%),
+  caption: [Top-1 token accuracy by semantic token type and measurement offset from the query. Offset 0 is the query measurement; -1 is the most recent context measurement.],
+) <fig-token-heatmap>
+
+#figure(
+  image("../outputs/eval_timeclean_models/figures/token_position_accuracy_relative.pdf", width: 98%),
+  caption: [Token accuracy by context position, centered relative to each token type's own mean accuracy. This separates whether a token type improves or degrades near the query from the baseline difficulty of that token type.],
+) <fig-token-relative>
 
 = Percentile Table
 
@@ -109,3 +126,5 @@ The structured baselines are trained transductively on the 5M first-half trainin
 + The paper-style DMFSGD variants remain poor because max-scaling collapses the normalized target distribution on this outlier-heavy RTT corpus.
 
 + The structured baselines are transductive graph-completion methods with persistent per-node fitted state. The transformer model receives only a small local context at eval time, so this evaluation currently favors Vivaldi/DMFSGD-style baselines.
+
++ The token-position figures (@fig-context-capacity, @fig-token-heatmap, and @fig-token-relative) use the 680M checkpoint with max-packed same-source context. They measure general next-token accuracy across all tokens in the packed sequence, not just RTT-byte point prediction at the query.
